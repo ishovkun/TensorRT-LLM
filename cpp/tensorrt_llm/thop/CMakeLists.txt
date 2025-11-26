@@ -93,6 +93,7 @@ add_library(
   dsv3RouterGemmOp.cpp
   customMoeRoutingOp.cpp
   selectiveScanOp.cpp
+  selectiveStateUpdateOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp

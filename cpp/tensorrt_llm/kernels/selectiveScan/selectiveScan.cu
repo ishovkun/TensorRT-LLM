@@ -19,13 +19,13 @@
 #include <cooperative_groups/memcpy_async.h>
 #include <cuda/pipeline>
 
-#include <cuda.h>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
+// #include <cuda.h>
+// #include <cuda_bf16.h>
+// #include <cuda_fp16.h>
 
-#ifdef ENABLE_FP8
-#include <cuda_fp8.h>
-#endif
+// #ifdef ENABLE_FP8
+// #include <cuda_fp8.h>
+// #endif
 
 #include "selectiveScan.h"
 
@@ -35,43 +35,44 @@
 #include "chunkscan.h"
 #include "chunkstate.h"
 #include "statepassing.h"
+#include "conversion.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
 
-__device__ float toFloat(float f)
-{
-    return f;
-}
+// __device__ float toFloat(float f)
+// {
+//     return f;
+// }
 
-__device__ float toFloat(__half h)
-{
-    return __half2float(h);
-}
-#ifdef ENABLE_BF16
-__device__ float toFloat(__nv_bfloat16 val)
-{
-    return __bfloat162float(val);
-}
-#endif
+// __device__ float toFloat(__half h)
+// {
+//     return __half2float(h);
+// }
+// #ifdef ENABLE_BF16
+// __device__ float toFloat(__nv_bfloat16 val)
+// {
+//     return __bfloat162float(val);
+// }
+// #endif
 
-__device__ void convertAndStore(float* output, float input)
-{
-    *output = input;
-}
+// __device__ void convertAndStore(float* output, float input)
+// {
+//     *output = input;
+// }
 
-__device__ void convertAndStore(__half* output, float input)
-{
-    *output = __float2half(input);
-}
-#ifdef ENABLE_BF16
-__device__ void convertAndStore(__nv_bfloat16* output, float input)
-{
-    *output = __float2bfloat16(input);
-}
-#endif
+// __device__ void convertAndStore(__half* output, float input)
+// {
+//     *output = __float2half(input);
+// }
+// #ifdef ENABLE_BF16
+// __device__ void convertAndStore(__nv_bfloat16* output, float input)
+// {
+//     *output = __float2bfloat16(input);
+// }
+// #endif
 
 #pragma nv_diag_suppress static_var_with_dynamic_init
 
