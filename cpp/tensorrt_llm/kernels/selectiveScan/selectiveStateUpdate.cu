@@ -31,6 +31,7 @@ __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
     auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);
     auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
     auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
+    auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
     bool const dt_softplus = params.dt_softplus;
 
     int const nheads = params.nheads;
@@ -68,9 +69,14 @@ __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
         dt_value = (dt_value <= 20.f) ? softplus(dt_value) : dt_value;
     }
 
-    if (params.state_batch_indices && threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0)
+    // adjust state pointer within the cache
+    if (state_batch_indices)
     {
-        printf("state indices are not supported yet\n");
+        // state_batch_indices: (batch,)
+        state += state_batch_indices[batch] * nheads * dim * DSTATE;
+    }
+    else {
+        state += batch * nheads * dim * DSTATE;
     }
 
     // Load matrices
@@ -87,7 +93,8 @@ __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
         // C: (batch, ngroups, dstate)
         rC[i] = toFloat(C[batch * ngroups * DSTATE + group * DSTATE + i]);
         // state: (batch, nheads, dim, dstate)
-        rState[i] = toFloat(state[batch * nheads * dim * DSTATE + head * dim * DSTATE + idx_dim * DSTATE + i]);
+        // rState[i] = toFloat(state[batch * nheads * dim * DSTATE + head * dim * DSTATE + idx_dim * DSTATE + i]);
+        rState[i] = toFloat(state[head * dim * DSTATE + idx_dim * DSTATE + i]);
     }
 
     // Update sate and compute output

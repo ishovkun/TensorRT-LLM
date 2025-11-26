@@ -60,7 +60,6 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
         _dt_bias = dt_bias.unsqueeze(0);
 
     // auto const state_shape = _state.sizes();
-    // auto [_, nheads, dim, dstate] = {state_shape[0], state_shape[1], state_shape[2], state_shape[3]};
     auto const batch = _x.size(0);
     auto const nheads = _state.size(1);
     auto const dim = _state.size(2);
@@ -81,8 +80,6 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
     TORCH_CHECK(D.size(0) == nheads && D.size(1) == dim, "D.shape must be (", nheads, ", ", dim, ")");
     // TORCH_CHECK(z.sizes() == x.sizes(), "z.shape must match x.shape");
     TORCH_CHECK(dt_bias.size(0) == nheads && dt_bias.size(1) == dim, "dt_bias.shape must be (", nheads, ", ", dim, ")");
-
-    // }
 
     using namespace tensorrt_llm::kernels;
     SelectiveStateUpdateParams p;
@@ -109,8 +106,6 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
     }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    // there will be data type switch whatever
-    // invokeSelectiveStateUpdate();
 
     auto dtype = x.scalar_type();
     switch (dtype)
