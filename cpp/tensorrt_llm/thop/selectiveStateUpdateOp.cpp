@@ -7,26 +7,26 @@ namespace th = torch;
 namespace torch_ext
 {
 
-auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate) of (batch, nheads, dim, dstate)
-    th::Tensor const& x,                                 // (batch, dim) or (batch, nheads, dim)
-    th::Tensor const& dt,                                // (batch, dim) or (batch, nheads, dim)
-    th::Tensor const& A,                                 // (dim, dstate) or (nheads, dim, dstate)
-    th::Tensor const& B,                                 // (batch, dstate) or (batch, ngroups, dstate)
-    th::Tensor const& C,                                 // (batch, dstate) or (batch, ngroups, dstate)
-    th::Tensor const& D,                                 // (dim,) or (nheads, dim)
-    // th::Tensor const& z,                                 // (batch, dim) or (batch, nheads, dim)
-    th::Tensor const& dt_bias, // (dim,) or (nheads, dim)
-    bool dt_softplus,
-    // th::Tensor const& state_batch_indices, // (batch,)
+auto run_selective_state_update(                   //
+    th::Tensor const& state,                       // (state_cache_size, nheads, dim, dstate)
+    th::Tensor const& x,                           // (batch, nheads, dim)
+    th::Tensor const& dt,                          // (batch, nheads, dim)
+    th::Tensor const& A,                           // (nheads, dim, dstate)
+    th::Tensor const& B,                           // (batch, ngroups, dstate)
+    th::Tensor const& C,                           // (batch, ngroups, dstate)
+    th::Tensor const& D,                           // (nheads, dim)
+    std::optional<th::Tensor> z,                   // (batch, nheads, dim)
+    std::optional<th::Tensor> dt_bias,             // (nheads, dim)
+    bool dt_softplus,                              //
     std::optional<th::Tensor> state_batch_indices, // (batch,)
-    int64_t pad_slot_id                    // if cache_indices is passed, lets the kernel identify padded
-                                           // entries that will not be processed,
+    int64_t pad_slot_id                            // padded entries
+    ) -> th::Tensor                                // out: (batch, dim) or (batch, nheads, dim)
+{
+    /* if cache_indices is passed, lets the kernel identify padded
+    // entries that will not be processed,
     // for example: cache_indices = [pad_slot_id, 1, 20, pad_slot_id]
     // in this case, the kernel will not process entries at
-    // indices 0 and 3
-    ) -> th::Tensor // out: (batch, dim) or batch, nheads, dim
-{
-    // bool has_heads = state.dim() > 3;
+    // indices 0 and 3 */
 
     th::Tensor _state = state;
     th::Tensor _x = x;
@@ -36,7 +36,7 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
     th::Tensor _C = C;
     th::Tensor _D = D;
     // th::Tensor _z = z;
-    th::Tensor _dt_bias = dt_bias;
+    // th::Tensor _dt_bias;
 
     if (state.dim() == 3)
         _state = _state.unsqueeze(1);
@@ -56,8 +56,8 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
 
     // if (z.dim() == 2)
     //     _z = z.unsqueeze(1);
-    if (dt_bias.dim() == 1)
-        _dt_bias = dt_bias.unsqueeze(0);
+    // if (dt_bias && dt_bias.dim() == 1)
+    //     _dt_bias = dt_bias.unsqueeze(0);
 
     // auto const state_shape = _state.sizes();
     auto const batch = _x.size(0);
@@ -79,7 +79,11 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
 
     TORCH_CHECK(D.size(0) == nheads && D.size(1) == dim, "D.shape must be (", nheads, ", ", dim, ")");
     // TORCH_CHECK(z.sizes() == x.sizes(), "z.shape must match x.shape");
-    TORCH_CHECK(dt_bias.size(0) == nheads && dt_bias.size(1) == dim, "dt_bias.shape must be (", nheads, ", ", dim, ")");
+    if (dt_bias)
+    {
+        TORCH_CHECK(
+            dt_bias->size(0) == nheads && dt_bias->size(1) == dim, "dt_bias.shape must be (", nheads, ", ", dim, ")");
+    }
 
     using namespace tensorrt_llm::kernels;
     SelectiveStateUpdateParams p;
@@ -92,16 +96,23 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
     p.state = _state.data_ptr();
     p.x = _x.data_ptr();
     p.dt = _dt.data_ptr();
-    p.dt_bias = _dt_bias.data_ptr();
+    if (dt_bias)
+    {
+        p.dt_bias = dt_bias->data_ptr();
+    }
+    if (z)
+    {
+        p.z = z->data_ptr();
+    }
     p.A = _A.data_ptr();
     p.B = _B.data_ptr();
     p.C = _C.data_ptr();
     p.D = _D.data_ptr();
     auto output = torch::empty_like(x);
     p.output = output.data_ptr();
-    if (state_batch_indices) {
-        TORCH_CHECK(state_batch_indices->size(0) == batch,
-                    "state_batch_indices.shape must be (", batch, ")");
+    if (state_batch_indices)
+    {
+        TORCH_CHECK(state_batch_indices->size(0) == batch, "state_batch_indices.shape must be (", batch, ")");
         p.state_batch_indices = state_batch_indices->data_ptr();
     }
 
@@ -126,11 +137,11 @@ auto run_selective_state_update(th::Tensor const& state, // (batch, dim, dstate)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def(
-        "selective_state_update(Tensor state, Tensor x, Tensor dt, "
+    m.def("selective_state_update("
+        "Tensor state, Tensor x, Tensor dt, "
         "Tensor A, Tensor B, Tensor C, Tensor D, "
-        // "Tensor z, "
-        "Tensor dt_bias,"
+        "Tensor? z, "
+        "Tensor? dt_bias,"
         "bool dt_softplus,"
         "Tensor? state_batch_indices,"
         "int pad_slot_id"

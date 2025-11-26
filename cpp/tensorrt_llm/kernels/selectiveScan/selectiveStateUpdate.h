@@ -1,9 +1,15 @@
 #pragma once
-#include <stdint.h>
 #include "tensorrt_llm/common/cudaUtils.h"
+#include <stdint.h>
 
 namespace tensorrt_llm::kernels
 {
+
+enum class SelectiveStateUpdateKernelType
+{
+    naive,
+    optimized,
+};
 
 struct SelectiveStateUpdateParams
 {
@@ -15,7 +21,7 @@ struct SelectiveStateUpdateParams
     void* __restrict__ state;
     void* __restrict__ x;
     void* __restrict__ dt;
-    void* __restrict__ dt_bias;
+    void* __restrict__ dt_bias{nullptr};
     void* __restrict__ A;
     void* __restrict__ B;
     void* __restrict__ C;
@@ -26,6 +32,7 @@ struct SelectiveStateUpdateParams
 };
 
 template <typename input_t, typename weight_t>
-void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream);
+void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream,
+    SelectiveStateUpdateKernelType = SelectiveStateUpdateKernelType::naive);
 
 } // namespace tensorrt_llm::kernels
