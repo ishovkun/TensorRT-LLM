@@ -14,6 +14,8 @@ __forceinline__ __device__ float softplus(float x)
     return __logf(1.f + __expf(x));
 }
 
+constexpr float SOFTPLUS_THRESHOLD = 20.f;
+
 template <typename input_t, typename weight_t, int DSTATE, int CHANNELS_PER_BLOCK = 128>
 __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
 {
@@ -79,7 +81,6 @@ __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
     }
     if (dt_softplus)
     {
-        constexpr float SOFTPLUS_THRESHOLD = 20.f;
         dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
     }
 
@@ -121,6 +122,10 @@ __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
 
     // output: (batch, nheads, dim)
     convertAndStore(&output[x_offset], out_value);
+}
+
+__device__ inline  auto swizzle_func(int row, int col, int width, int factor) -> int {
+    return (col + factor * row) % width;
 }
 
 template <typename input_t, typename weight_t, int DSTATE, int CHANNELS_PER_BLOCK = 128>
@@ -167,15 +172,14 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
 
     // x: (batch, nheads, dim)
     auto const x_offset = (batch * nheads + head) * dim + idx_dim;
-    auto x_value = toFloat(x[x_offset]);
+    auto x_value = (idx_dim < dim) ? toFloat(x[x_offset]) : 0.f;
 
     // z: (batch, nheads, dim)
-    auto z_value = z ? toFloat(z[batch * nheads * dim + head * dim + idx_dim]) : 0.f;
+    auto z_value = (z && idx_dim < dim) ? toFloat(z[batch * nheads * dim + head * dim + idx_dim]) : 0.f;
 
     // dt: (batch, nheads, dim)
-    // auto const dt_offset = (batch * nheads + head) * dim + idx_dim;
     auto const dt_offset = x_offset;
-    auto dt_value = toFloat(dt[dt_offset]);
+    auto dt_value = (idx_dim < dim) ? toFloat(dt[dt_offset]) : 0.f;
 
     if (dt_bias)
     {
@@ -183,7 +187,6 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     }
     if (dt_softplus)
     {
-        constexpr float SOFTPLUS_THRESHOLD = 20.f;
         dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
     }
 
@@ -193,33 +196,106 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     __shared__ weight_t sState[CHANNELS_PER_BLOCK][DSTATE];
 
     // Copy A
-    for (int channel = 0; channel < CHANNELS_PER_BLOCK; channel++)
-        for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
-        {
-            sA[channel][i] = A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + i];
+    // for (int channel = 0; channel < CHANNELS_PER_BLOCK; channel++)
+    //     for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
+    //     {
+    //         auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
+    //         sA[channel][i] = inBounds
+    //             ? A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + i]
+    //             : (input_t) 0.f;
+    //     }
+
+    static constexpr auto warpSize = 32;
+    static constexpr auto kVecSizeWeight = sizeof(float4) / sizeof(weight_t);
+    static constexpr auto kVecSizeInput = sizeof(float4) / sizeof(weight_t);
+    static constexpr auto kInputElementsPerBank = sizeof(float) / sizeof(input_t);
+
+    for (int pos = threadIdx.x * kVecSizeWeight; pos < CHANNELS_PER_BLOCK * DSTATE; pos += blockDim.x * kVecSizeWeight) {
+        auto state_idx = pos % DSTATE;
+        auto channel = pos / DSTATE;
+        auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
+        auto const *src = reinterpret_cast<float4 const*>(&A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
+        float4 val = inBounds ? *src : make_float4(0.f, 0.f, 0.f, 0.f);
+        // auto state_idx_sw = swizzle_func(channel, state_idx, DSTATE, kInputElementsPerBank);
+        auto const *rSrc = reinterpret_cast<input_t*>(&val);
+        for (int i = 0; i < kVecSizeInput; i++) {
+            auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kInputElementsPerBank);
+            // auto const state_idx_sw = state_idx + i;
+            sA[channel][state_idx_sw] = rSrc[i];
         }
 
-    for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
-    {
-        sB[i] = B[batch * ngroups * DSTATE + group * DSTATE + i];
+        // auto *dst = reinterpret_cast<float4*>(&sA[channel][state_idx]);
+        // *dst = val;
     }
-    for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
-    {
-        sC[i] = C[batch * ngroups * DSTATE + group * DSTATE + i];
-    }
-    for (int channel = 0; channel < CHANNELS_PER_BLOCK; channel++)
-        for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
-        {
-            sState[channel][i] = state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + i];
+
+    // for (int pos = threadIdx.x; pos < CHANNELS_PER_BLOCK * DSTATE; pos += blockDim.x) {
+    //     auto state_idx = pos % DSTATE;
+    //     auto channel = pos / DSTATE;
+    //     auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
+    //     sA[channel][state_idx] = inBounds
+    //         ? A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]
+    //         : (input_t) 0.f;
+    // }
+
+    auto warp = threadIdx.x / warpSize;
+    auto lane = threadIdx.x % warpSize;
+    if (warp == 0) {
+        for (int i = lane * kVecSizeInput; i < DSTATE; i += warpSize * kVecSizeInput) {
+            auto const *src = reinterpret_cast<float4 const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
+            auto *dst = reinterpret_cast<float4*>(&sB[i]);
+            *dst = *src;
         }
+    }
+    else if (warp == 1) {
+        for (int i = lane * kVecSizeInput; i < DSTATE; i += warpSize * kVecSizeInput) {
+            auto const *src = reinterpret_cast<float4 const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
+            auto *dst = reinterpret_cast<float4*>(&sC[i]);
+            *dst = *src;
+        }
+    }
+    // for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
+    // {
+    //     sB[i] = B[batch * ngroups * DSTATE + group * DSTATE + i];
+    // }
+    // for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
+    // {
+    //     sC[i] = C[batch * ngroups * DSTATE + group * DSTATE + i];
+    // }
+
+    // for (int channel = 0; channel < CHANNELS_PER_BLOCK; channel++)
+    //     for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
+    //     {
+    //         auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
+    //         sState[channel][i] = inBounds
+    //             ? state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + i]
+    //             : (input_t) 0.f;
+    //     }
+
+    for (int pos = threadIdx.x * kVecSizeInput; pos < CHANNELS_PER_BLOCK * DSTATE; pos += blockDim.x * kVecSizeInput) {
+        auto state_idx = pos % DSTATE;
+        auto channel = pos / DSTATE;
+        auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
+        auto const *src = reinterpret_cast<float4 const*>(&state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
+        float4 val = inBounds ? *src : make_float4(0.f, 0.f, 0.f, 0.f);
+        auto *dst = reinterpret_cast<float4*>(&sState[channel][state_idx]);
+        *dst = val;
+    }
 
     __syncthreads();
 
-    float out_value = D ? toFloat(D[head * dim + idx_dim]) * x_value : 0.f;
+    // if (idx_dim >= dim)
+    //     return;
+
+    float out_value = (D && idx_dim < dim) ? toFloat(D[head * dim + idx_dim]) * x_value : 0.f;
     for (int i = 0; i < DSTATE; i++)
     {
         // load from smem + convert to float
-        auto const A_value = toFloat(sA[threadIdx.x][i]);
+        if (threadIdx.x >= CHANNELS_PER_BLOCK)
+            continue;
+
+        auto i_sw = swizzle_func(threadIdx.x, i, DSTATE, kInputElementsPerBank);
+        // auto const A_value = toFloat(sA[threadIdx.x][i]);
+        auto const A_value = toFloat(sA[threadIdx.x][i_sw]);
         auto const B_value = toFloat(sB[i]);
         auto const C_value = toFloat(sC[i]);
         auto const state_value = toFloat(sState[threadIdx.x][i]);
@@ -227,8 +303,7 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
         auto const dA = __expf(A_value * dt_value);
         auto const dB = B_value * dt_value;
         auto const new_state = state_value * dA + dB * x_value;
-        // store
-        convertAndStore(&state[head * dim * DSTATE + idx_dim * DSTATE + i], new_state);
+        convertAndStore(&sState[threadIdx.x][i], new_state);
         out_value += new_state * C_value;
     }
 
@@ -240,13 +315,44 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     }
 
     // output: (batch, nheads, dim)
-    convertAndStore(&output[x_offset], out_value);
+    if (idx_dim < dim)
+        convertAndStore(&output[x_offset], out_value);
+
+    // Store state
+
+    // NOTE: I do not use __syncthreads here because I make sure that
+    // only warps that processed a particular range of tokens write this to
+    // the global output from shmem
+    auto firstWarpIdx = threadIdx.x - lane;
+    for (int channel = firstWarpIdx; channel < firstWarpIdx + 32; channel++)
+    {
+        auto channel_glob = blockIdx.x * CHANNELS_PER_BLOCK + channel;
+        if (channel_glob < dim)
+        {
+            for (int i = lane; i < DSTATE; i += 32)
+            {
+                state[head * dim * DSTATE + channel_glob * DSTATE + i] = sState[channel][i];
+            }
+        }
+    }
+
+    // Idea: we can get rid of this block if we a warp only writes the indices that it processed.
+    // __syncthreads();
+
+    // for (int channel = 0; (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim; channel++)
+    //     for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
+    //     {
+    //         state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + i] =
+    //         sState[channel][i];
+    //     }
 }
 
 template <typename input_t, typename weight_t>
-void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType)
+void invokeSelectiveStateUpdate(
+    SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType)
 {
-    if (kernelType == SelectiveStateUpdateKernelType::naive) {
+    if (kernelType == SelectiveStateUpdateKernelType::naive)
+    {
         constexpr int channels_per_block = 128;
         int const blocks_per_dim = (params.dim + channels_per_block - 1) / channels_per_block;
         dim3 block(channels_per_block, 1);
@@ -256,25 +362,33 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
 
         constexpr int DSTATE = 128;
         TLLM_CHECK(params.dstate == DSTATE);
-        selective_state_update_kernel<input_t, weight_t, DSTATE, channels_per_block><<<grid, block, 0, stream>>>(params);
+        selective_state_update_kernel<input_t, weight_t, DSTATE, channels_per_block>
+            <<<grid, block, 0, stream>>>(params);
     }
-    else if (kernelType == SelectiveStateUpdateKernelType::optimized) {
-        constexpr int channels_per_block = 128;
+    else if (kernelType == SelectiveStateUpdateKernelType::optimized)
+    {
+        constexpr int channels_per_block = 64;
+        constexpr int block_size = 128;
         int const blocks_per_dim = (params.dim + channels_per_block - 1) / channels_per_block;
-        dim3 block(channels_per_block, 1);
+        dim3 block(block_size, 1);
         dim3 grid(blocks_per_dim, params.batch, params.nheads);
 
         TLLM_CHECK(params.dstate % 16 == 0);
         constexpr int DSTATE = 128;
         TLLM_CHECK(params.dstate == DSTATE);
-        selective_state_update_kernel_opt<input_t, weight_t, DSTATE, channels_per_block><<<grid, block, 0, stream>>>(params);
+        selective_state_update_kernel_opt<input_t, weight_t, DSTATE, channels_per_block>
+            <<<grid, block, 0, stream>>>(params);
     }
-    else {
+    else
+    {
         TLLM_CHECK(false);
     }
 }
 
-template void invokeSelectiveStateUpdate<half, half>(SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType);
-template void invokeSelectiveStateUpdate<float, float>(SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType);
+// we should focus on BF16, FP16 and even FP32 where the Mamba states are involved.
+template void invokeSelectiveStateUpdate<half, half>(
+    SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType);
+template void invokeSelectiveStateUpdate<float, float>(
+    SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType);
 
 } // end namespace tensorrt_llm::kernels
