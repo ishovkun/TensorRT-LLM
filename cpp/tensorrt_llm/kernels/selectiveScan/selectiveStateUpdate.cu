@@ -128,6 +128,7 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
 {
     auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
     auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);
+
     auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);
     auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt);
     auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);
@@ -176,6 +177,16 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     auto const dt_offset = x_offset;
     auto dt_value = toFloat(dt[dt_offset]);
 
+    if (dt_bias)
+    {
+        dt_value += toFloat(dt_bias[head * dim + idx_dim]);
+    }
+    if (dt_softplus)
+    {
+        constexpr float SOFTPLUS_THRESHOLD = 20.f;
+        dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
+    }
+
     __shared__ weight_t sA[CHANNELS_PER_BLOCK][DSTATE];
     __shared__ weight_t sB[DSTATE];
     __shared__ weight_t sC[DSTATE];
@@ -209,7 +220,7 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     {
         // load from smem + convert to float
         auto const A_value = toFloat(sA[threadIdx.x][i]);
-        auto const B_value = toFlaot(sB[i]);
+        auto const B_value = toFloat(sB[i]);
         auto const C_value = toFloat(sC[i]);
         auto const state_value = toFloat(sState[threadIdx.x][i]);
         // compute
@@ -246,6 +257,17 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, cudaStream_t
         constexpr int DSTATE = 128;
         TLLM_CHECK(params.dstate == DSTATE);
         selective_state_update_kernel<input_t, weight_t, DSTATE, channels_per_block><<<grid, block, 0, stream>>>(params);
+    }
+    else if (kernelType == SelectiveStateUpdateKernelType::optimized) {
+        constexpr int channels_per_block = 128;
+        int const blocks_per_dim = (params.dim + channels_per_block - 1) / channels_per_block;
+        dim3 block(channels_per_block, 1);
+        dim3 grid(blocks_per_dim, params.batch, params.nheads);
+
+        TLLM_CHECK(params.dstate % 16 == 0);
+        constexpr int DSTATE = 128;
+        TLLM_CHECK(params.dstate == DSTATE);
+        selective_state_update_kernel_opt<input_t, weight_t, DSTATE, channels_per_block><<<grid, block, 0, stream>>>(params);
     }
     else {
         TLLM_CHECK(false);

@@ -109,8 +109,8 @@ auto run_selective_state_update_naive(th::Tensor const& state, th::Tensor const&
     std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
     int64_t pad_slot_id) -> th::Tensor
 {
-   return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, pad_slot_id,
-       SelectiveStateUpdateKernelType::naive);
+    return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
+        pad_slot_id, SelectiveStateUpdateKernelType::naive);
 }
 
 auto run_selective_state_update_opt(th::Tensor const& state, th::Tensor const& x, th::Tensor const& dt,
@@ -118,8 +118,8 @@ auto run_selective_state_update_opt(th::Tensor const& state, th::Tensor const& x
     std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
     int64_t pad_slot_id) -> th::Tensor
 {
-   return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, pad_slot_id,
-       SelectiveStateUpdateKernelType::optimized);
+    return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
+        pad_slot_id, SelectiveStateUpdateKernelType::optimized);
 }
 
 } // end namespace torch_ext
@@ -128,6 +128,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "selective_state_update("
+        "Tensor state, Tensor x, Tensor dt, "
+        "Tensor A, Tensor B, Tensor C, Tensor D, "
+        "Tensor? z, "
+        "Tensor? dt_bias,"
+        "bool dt_softplus,"
+        "Tensor? state_batch_indices,"
+        "int pad_slot_id"
+        ") -> Tensor");
+    m.def(
+        "selective_state_update_opt("
         "Tensor state, Tensor x, Tensor dt, "
         "Tensor A, Tensor B, Tensor C, Tensor D, "
         "Tensor? z, "
