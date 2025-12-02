@@ -7,6 +7,8 @@ namespace th = torch;
 namespace torch_ext
 {
 
+using namespace tensorrt_llm::kernels;
+
 auto run_selective_state_update(                   //
     th::Tensor const& state,                       // (state_cache_size, nheads, dim, dstate)
     th::Tensor const& x,                           // (batch, nheads, dim)
@@ -19,7 +21,8 @@ auto run_selective_state_update(                   //
     std::optional<th::Tensor> dt_bias,             // (nheads, dim)
     bool dt_softplus,                              //
     std::optional<th::Tensor> state_batch_indices, // (batch,)
-    int64_t pad_slot_id                            // padded entries
+    int64_t pad_slot_id,                           // padded entries
+    SelectiveStateUpdateKernelType kernel_type     // kernel type
     ) -> th::Tensor                                // out: (batch, dim) or (batch, nheads, dim)
 {
     /* if cache_indices is passed, lets the kernel identify padded
@@ -28,45 +31,13 @@ auto run_selective_state_update(                   //
     // in this case, the kernel will not process entries at
     // indices 0 and 3 */
 
-    th::Tensor _state = state;
-    th::Tensor _x = x;
-    th::Tensor _dt = dt;
-    th::Tensor _A = A;
-    th::Tensor _B = B;
-    th::Tensor _C = C;
-    th::Tensor _D = D;
-    // th::Tensor _z = z;
-    // th::Tensor _dt_bias;
+    auto const batch = x.size(0);
+    auto const nheads = state.size(1);
+    auto const dim = state.size(2);
+    auto const dstate = state.size(3);
 
-    if (state.dim() == 3)
-        _state = _state.unsqueeze(1);
-    if (x.dim() == 2)
-        _x = x.unsqueeze(1);
-    if (dt.dim() == 2)
-        _dt = dt.unsqueeze(1);
-    if (A.dim() == 2)
-        _A = A.unsqueeze(0);
-    if (B.dim() == 2)
-        _B = B.unsqueeze(1);
-
-    if (C.dim() == 2)
-        _C = C.unsqueeze(1);
-    if (D.dim() == 1)
-        _D = D.unsqueeze(0);
-
-    // if (z.dim() == 2)
-    //     _z = z.unsqueeze(1);
-    // if (dt_bias && dt_bias.dim() == 1)
-    //     _dt_bias = dt_bias.unsqueeze(0);
-
-    // auto const state_shape = _state.sizes();
-    auto const batch = _x.size(0);
-    auto const nheads = _state.size(1);
-    auto const dim = _state.size(2);
-    auto const dstate = _state.size(3);
-
-    TORCH_CHECK(_x.size(0) == batch && _x.size(1) == nheads && _x.size(2) == dim, "x.shape must be (", batch, ", ",
-        nheads, ", ", dim, ")");
+    TORCH_CHECK(x.size(0) == batch && x.size(1) == nheads && x.size(2) == dim, "x.shape must be (", batch, ", ", nheads,
+        ", ", dim, ")");
     TORCH_CHECK(dt.sizes() == x.sizes(), "dt.shape must match x.shape");
     TORCH_CHECK(A.size(0) == nheads && A.size(1) == dim && A.size(2) == dstate, "A.shape must be (", nheads, ", ", dim,
         ", ", dstate, ")");
@@ -93,9 +64,9 @@ auto run_selective_state_update(                   //
     p.dstate = dstate;
     p.ngroups = ngroups;
 
-    p.state = _state.data_ptr();
-    p.x = _x.data_ptr();
-    p.dt = _dt.data_ptr();
+    p.state = state.data_ptr();
+    p.x = x.data_ptr();
+    p.dt = dt.data_ptr();
     if (dt_bias)
     {
         p.dt_bias = dt_bias->data_ptr();
@@ -104,12 +75,13 @@ auto run_selective_state_update(                   //
     {
         p.z = z->data_ptr();
     }
-    p.A = _A.data_ptr();
-    p.B = _B.data_ptr();
-    p.C = _C.data_ptr();
-    p.D = _D.data_ptr();
+    p.A = A.data_ptr();
+    p.B = B.data_ptr();
+    p.C = C.data_ptr();
+    p.D = D.data_ptr();
     auto output = torch::empty_like(x);
     p.output = output.data_ptr();
+
     if (state_batch_indices)
     {
         TORCH_CHECK(state_batch_indices->size(0) == batch, "state_batch_indices.shape must be (", batch, ")");
@@ -121,11 +93,10 @@ auto run_selective_state_update(                   //
     auto dtype = x.scalar_type();
     switch (dtype)
     {
-    case torch::kFloat32: invokeSelectiveStateUpdate<float, float>(p, stream); break;
-    case torch::kFloat16: invokeSelectiveStateUpdate<half, half>(p, stream); break;
+    case torch::kFloat32: invokeSelectiveStateUpdate<float, float>(p, stream, kernel_type); break;
+    case torch::kFloat16: invokeSelectiveStateUpdate<half, half>(p, stream, kernel_type); break;
     default:
         // Handle other data types
-        // throw std::invalid_argument("Invalid dtype, only supports float16, float32, and bfloat16");
         throw std::invalid_argument(
             "Invalid dtype: " + std::string(torch::toString(dtype)) + ". Only supports float16, float32, and bfloat16");
     }
@@ -133,11 +104,30 @@ auto run_selective_state_update(                   //
     return output;
 }
 
+auto run_selective_state_update_naive(th::Tensor const& state, th::Tensor const& x, th::Tensor const& dt,
+    th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D, std::optional<th::Tensor> z,
+    std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
+    int64_t pad_slot_id) -> th::Tensor
+{
+   return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, pad_slot_id,
+       SelectiveStateUpdateKernelType::naive);
+}
+
+auto run_selective_state_update_opt(th::Tensor const& state, th::Tensor const& x, th::Tensor const& dt,
+    th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D, std::optional<th::Tensor> z,
+    std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
+    int64_t pad_slot_id) -> th::Tensor
+{
+   return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices, pad_slot_id,
+       SelectiveStateUpdateKernelType::optimized);
+}
+
 } // end namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("selective_state_update("
+    m.def(
+        "selective_state_update("
         "Tensor state, Tensor x, Tensor dt, "
         "Tensor A, Tensor B, Tensor C, Tensor D, "
         "Tensor? z, "
@@ -150,5 +140,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("selective_state_update", &torch_ext::run_selective_state_update);
+    m.impl("selective_state_update", &torch_ext::run_selective_state_update_naive);
+    m.impl("selective_state_update_opt", &torch_ext::run_selective_state_update_opt);
 }
