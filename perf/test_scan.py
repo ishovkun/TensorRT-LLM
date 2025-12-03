@@ -299,18 +299,8 @@ def benchmark_performance(
     return mean_time
 
 
-def main():
+def main(batch_size, repeats, warmup, skip_test):
     """Main test function."""
-    parser = argparse.ArgumentParser(description="Selective State Update Test Suite")
-    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations (default: 10)")
-    parser.add_argument("--repeat", type=int, default=100, help="Number of benchmark iterations (default: 100)")
-    parser.add_argument("--batch-size", type=int, default=10, help="Batch size during benchmark")
-    parser.add_argument("--skip-test", action="store_true", default=False, help="Skip correctness tests (default: False)")
-    args = parser.parse_args()
-
-    warmup = args.warmup
-    repeats = args.repeat
-    skip_test = args.skip_test
 
     print("Selective State Update Test Suite")
     print(f"{'=' * 80}")
@@ -318,7 +308,7 @@ def main():
     # Check CUDA availability
     if not torch.cuda.is_available():
         print("Error: CUDA is not available!")
-        return
+        return {}
 
     print(f"Device: {torch.cuda.get_device_name(0)}")
     print(f"CUDA Version: {torch.version.cuda}")
@@ -357,7 +347,7 @@ def main():
             print("✓ All correctness tests PASSED")
         else:
             print("✗ Some correctness tests FAILED")
-            return False
+            return {}
     else:
         print("\n" + "=" * 80)
         print("SKIPPING CORRECTNESS TESTS")
@@ -366,7 +356,6 @@ def main():
     # Run performance benchmark
     # batch_size = 2
     # batch_size = 10
-    batch_size = args.batch_size
 
     print("\n" + "=" * 80)
     print("PERFORMANCE BENCHMARK")
@@ -375,14 +364,38 @@ def main():
     print(f"Benchmark iterations: {repeats}")
     print("=" * 80)
 
-    benchmark_performance(selective_state_update, batch_size, nheads, dim, ngroups, dstate, repeats, warmup)
-    benchmark_performance(torch.ops.trtllm.selective_state_update, batch_size, nheads, dim, ngroups, dstate, repeats, warmup)
-    benchmark_performance(torch.ops.trtllm.selective_state_update_opt, batch_size, nheads, dim, ngroups, dstate, repeats, warmup)
+    results = {}
+
+    kernels = [
+        selective_state_update,
+        torch.ops.trtllm.selective_state_update,
+        torch.ops.trtllm.selective_state_update_opt
+    ]
+
+    for kernel in kernels:
+        kernel_name = f"{kernel.__module__}.{kernel.__name__}"
+        avg_time = benchmark_performance(kernel, batch_size, nheads, dim, ngroups, dstate, repeats, warmup)
+        results[kernel_name] = avg_time
 
     print("=" * 80)
 
-    return True
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Selective State Update Test Suite")
+    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations (default: 10)")
+    parser.add_argument("--repeat", type=int, default=100, help="Number of benchmark iterations (default: 100)")
+    parser.add_argument("--batch-size", type=int, default=10, help="Batch size during benchmark")
+    parser.add_argument("--skip-test", action="store_true", default=False, help="Skip correctness tests (default: False)")
+    args = parser.parse_args()
+
+    results = main(args.batch_size, args.repeat, args.warmup, args.skip_test)
+
+    if results:
+        # print("\nBenchmark Results:")
+        # for kernel_name, avg_time in results.items():
+        #     print(f"  {kernel_name}: {avg_time:.3f} ms")
+        exit(0)
+    else:
+        exit(1)
