@@ -3,6 +3,7 @@
 #include "tensorrt_llm/kernels/selectiveScan/selectiveStateUpdate.h"
 #include <cooperative_groups/memcpy_async.h>
 #include <cstdint>
+#include <cuda/barrier>
 #include <cuda_runtime_api.h>
 #include <iostream>
 
@@ -196,6 +197,7 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     __shared__ weight_t sB[DSTATE];
     __shared__ weight_t sC[DSTATE];
     __shared__ weight_t sState[CHANNELS_PER_BLOCK][DSTATE];
+    // __shared__ cuda::barrier<cuda::thread_scope_block> bar;
 
     // Copy A
     // for (int channel = 0; channel < CHANNELS_PER_BLOCK; channel++)
@@ -208,40 +210,50 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     //     }
 
     static constexpr auto warpSize = 32;
-    static constexpr auto kVecSizeWeight = sizeof(float4) / sizeof(weight_t);
-    static constexpr auto kVecSizeInput = sizeof(float4) / sizeof(weight_t);
-    static constexpr auto kInputElementsPerBank = sizeof(float) / sizeof(input_t);
-    static constexpr auto kWeightElementsPerBank = sizeof(float) / sizeof(input_t);
+    using load_t = float4;
+    static constexpr auto kVecSizeWeight = sizeof(load_t) / sizeof(weight_t);
+    static constexpr auto kVecSizeInput = sizeof(load_t) / sizeof(weight_t);
+    // static constexpr auto kInputElementsPerBank = sizeof(float) / sizeof(input_t);
+    // static constexpr auto kWeightElementsPerBank = sizeof(float) / sizeof(input_t);
 
-    for (int pos = threadIdx.x * kVecSizeWeight; pos < CHANNELS_PER_BLOCK * DSTATE; pos += blockSize * kVecSizeWeight)
+#pragma unroll
+    for (int offset = 0; offset < CHANNELS_PER_BLOCK * DSTATE; offset += blockSize * kVecSizeWeight)
     {
-        auto state_idx = pos % DSTATE;
-        auto channel = pos / DSTATE;
+        auto const pos = offset + threadIdx.x * kVecSizeWeight;
+        auto const state_idx = pos % DSTATE;
+        auto const channel = pos / DSTATE;
         auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
-        auto const* src = reinterpret_cast<float4 const*>(
-            &A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
-        float4 val = inBounds ? *src : make_float4(0.f, 0.f, 0.f, 0.f);
-        // auto state_idx_sw = swizzle_func(channel, state_idx, DSTATE, kInputElementsPerBank);
-        auto const* rSrc = reinterpret_cast<input_t*>(&val);
-        for (int i = 0; i < kVecSizeWeight; i++)
+        if (inBounds)
         {
-            auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kWeightElementsPerBank);
-            // auto const state_idx_sw = state_idx + i;
-            sA[channel][state_idx_sw] = rSrc[i];
+            auto const* src = reinterpret_cast<load_t const*>(
+                &A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
+            auto state_idx_sw = swizzle_func(channel, state_idx, DSTATE, kVecSizeWeight);
+            // state_idx_sw = state_idx;
+            auto* dst = reinterpret_cast<load_t*>(&sA[channel][state_idx_sw]);
+            *dst = *src;
+            // *dst = make_float4(0.f, 0.f, 0.f, 0.f);
         }
-
-        // auto *dst = reinterpret_cast<float4*>(&sA[channel][state_idx]);
-        // *dst = val;
     }
 
-    // for (int pos = threadIdx.x; pos < CHANNELS_PER_BLOCK * DSTATE; pos += blockDim.x) {
-    //     auto state_idx = pos % DSTATE;
-    //     auto channel = pos / DSTATE;
-    //     auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
-    //     sA[channel][state_idx] = inBounds
-    //         ? A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]
-    //         : (input_t) 0.f;
-    // }
+    // #pragma unroll
+    //     for (int offset = 0; offset < CHANNELS_PER_BLOCK * DSTATE; offset += blockSize * kVecSizeInput)
+    //     {
+    //         int pos = offset + threadIdx.x * kVecSizeWeight;
+    //         auto state_idx = pos % DSTATE;
+    //         auto channel = pos / DSTATE;
+    //         auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
+    //         auto const* src = reinterpret_cast<float4 const*>(
+    //             &A[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
+
+    //         float4 val = inBounds ? *src : make_float4(0.f, 0.f, 0.f, 0.f);
+    //         auto const* rSrc = reinterpret_cast<input_t*>(&val);
+    // #pragma unroll
+    //         for (int i = 0; i < kVecSizeWeight; i++)
+    //         {
+    //             auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kWeightElementsPerBank);
+    //             sA[channel][state_idx_sw] = rSrc[i];
+    //         }
+    //     }
 
     auto warp = threadIdx.x / warpSize;
     auto lane = threadIdx.x % warpSize;
@@ -249,8 +261,8 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     {
         for (int i = lane * kVecSizeInput; i < DSTATE; i += warpSize * kVecSizeInput)
         {
-            auto const* src = reinterpret_cast<float4 const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
-            auto* dst = reinterpret_cast<float4*>(&sB[i]);
+            auto const* src = reinterpret_cast<load_t const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
+            auto* dst = reinterpret_cast<load_t*>(&sB[i]);
             *dst = *src;
         }
     }
@@ -258,76 +270,31 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     {
         for (int i = lane * kVecSizeInput; i < DSTATE; i += warpSize * kVecSizeInput)
         {
-            auto const* src = reinterpret_cast<float4 const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
-            auto* dst = reinterpret_cast<float4*>(&sC[i]);
+            auto const* src = reinterpret_cast<load_t const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
+            auto* dst = reinterpret_cast<load_t*>(&sC[i]);
             *dst = *src;
         }
     }
-    // for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
-    // {
-    //     sB[i] = B[batch * ngroups * DSTATE + group * DSTATE + i];
-    // }
-    // for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
-    // {
-    //     sC[i] = C[batch * ngroups * DSTATE + group * DSTATE + i];
-    // }
-
-    // for (int channel = 0; channel < CHANNELS_PER_BLOCK; channel++)
-    //     for (int i = threadIdx.x; i < DSTATE; i += blockDim.x)
-    //     {
-    //         auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
-    //         sState[channel][i] = inBounds
-    //             ? state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + i]
-    //             : (input_t) 0.f;
-    //     }
 
     static_assert((CHANNELS_PER_BLOCK * DSTATE) % (blockSize * kVecSizeInput) == 0, "For proper unrolling");
-    #pragma unroll
-    for (int offset = 0; offset < CHANNELS_PER_BLOCK * DSTATE; offset += blockSize * kVecSizeInput)
-    {
-        int pos = offset + threadIdx.x * kVecSizeInput;
-        auto state_idx = pos % DSTATE;
-        auto channel = pos / DSTATE;
-        auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
-        auto const* src = reinterpret_cast<float4 const*>(
-            &state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
-        float4 val = inBounds ? *src : make_float4(0.f, 0.f, 0.f, 0.f);
-
-        auto const* rSrc = reinterpret_cast<input_t*>(&val);
+    constexpr auto numIterations = (CHANNELS_PER_BLOCK * DSTATE) / (blockSize * kVecSizeInput);
 #pragma unroll
-        for (int i = 0; i < kVecSizeInput; i++)
+    for (int iter = 0; iter < numIterations; iter++)
+    {
+        auto const pos = (iter * blockSize + threadIdx.x) * kVecSizeInput;
+        auto const state_idx = pos % DSTATE;
+        auto const channel = pos / DSTATE;
+        auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
+        if (inBounds)
         {
-            auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kInputElementsPerBank);
-            sState[channel][state_idx_sw] = rSrc[i];
+            auto const* src = reinterpret_cast<load_t const*>(
+                &state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
+            auto state_idx_sw = swizzle_func(channel, state_idx, DSTATE, kVecSizeInput);
+            auto* dst = reinterpret_cast<load_t*>(&sState[channel][state_idx_sw]);
+            *dst = *src;
         }
-
     }
-// #pragma unroll
-//     for (int pos = threadIdx.x * kVecSizeInput; pos < CHANNELS_PER_BLOCK * DSTATE; pos += blockSize * kVecSizeInput)
-//     {
-//         auto state_idx = pos % DSTATE;
-//         auto channel = pos / DSTATE;
-//         auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
-//         auto const* src = reinterpret_cast<float4 const*>(
-//             &state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
-//         float4 val = inBounds ? *src : make_float4(0.f, 0.f, 0.f, 0.f);
-
-//         auto const* rSrc = reinterpret_cast<input_t*>(&val);
-// #pragma unroll
-//         for (int i = 0; i < kVecSizeInput; i++)
-//         {
-//             auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kInputElementsPerBank);
-//             sState[channel][state_idx_sw] = rSrc[i];
-//         }
-
-//         // auto *dst = reinterpret_cast<float4*>(&sState[channel][state_idx]);
-//         // *dst = val;
-//     }
-
     __syncthreads();
-
-    // if (idx_dim >= dim)
-    //     return;
 
     float out_value = (D && idx_dim < dim) ? toFloat(D[head * dim + idx_dim]) * x_value : 0.f;
     for (int i = 0; i < DSTATE; i++)
@@ -336,20 +303,21 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
         if (threadIdx.x >= CHANNELS_PER_BLOCK)
             continue;
 
-        auto i_sw = swizzle_func(threadIdx.x, i, DSTATE, kWeightElementsPerBank);
-        // auto const A_value = toFloat(sA[threadIdx.x][i]);
-        auto const A_value = toFloat(sA[threadIdx.x][i_sw]);
+        auto const i_sw_input = swizzle_func(threadIdx.x, i, DSTATE, kVecSizeInput);
+        auto const i_sw_weight = swizzle_func(threadIdx.x, i, DSTATE, kVecSizeWeight);
+        auto const A_value = toFloat(sA[threadIdx.x][i_sw_weight]);
         auto const B_value = toFloat(sB[i]);
+
         auto const C_value = toFloat(sC[i]);
         // auto const state_value = toFloat(sState[threadIdx.x][i]);
-        auto i_state_sw = swizzle_func(threadIdx.x, i, DSTATE, kInputElementsPerBank);
-        auto const state_value = toFloat(sState[threadIdx.x][i_state_sw]);
+        // auto i_state_sw = swizzle_func(threadIdx.x, i, DSTATE, kInputElementsPerBank);
+        auto const state_value = toFloat(sState[threadIdx.x][i_sw_input]);
         // compute
         auto const dA = __expf(A_value * dt_value);
         auto const dB = B_value * dt_value;
         auto const new_state = state_value * dA + dB * x_value;
         // convertAndStore(&sState[threadIdx.x][i], new_state);
-        convertAndStore(&sState[threadIdx.x][i_sw], new_state);
+        convertAndStore(&sState[threadIdx.x][i_sw_input], new_state);
         out_value += new_state * C_value;
     }
 
@@ -375,23 +343,37 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     {
         auto channel = pos / DSTATE;
         auto state_idx = pos % DSTATE;
-        float4 F4 = make_float4(0.f, 0.f, 0.f, 0.f);
-        input_t* F = reinterpret_cast<input_t*>(&F4);
-        for (int i = 0; i < kVecSizeInput; i++)
-        {
-            auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kInputElementsPerBank);
-            F[i] = sState[channel][state_idx_sw];
-        }
-
-        auto* dst = reinterpret_cast<float4*>(
-            &state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
         if (channel < dim)
         {
-            *dst = F4;
+            auto state_idx_sw = swizzle_func(channel, state_idx, DSTATE, kVecSizeInput);
+            auto const* src = reinterpret_cast<const load_t*>(&sState[channel][state_idx_sw]);
+            auto *dst = reinterpret_cast<load_t*>(
+                &state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
+            *dst = *src;
         }
-        // auto const inBounds = (blockIdx.x * CHANNELS_PER_BLOCK + channel) < dim;
-        // float4 val = *src;
     }
+
+    // for (int pos = firstWarpIdx * DSTATE + threadIdx.x * kVecSizeWeight; pos < (firstWarpIdx + 1) * DSTATE;
+    //      pos += warpSize * kVecSizeWeight)
+    // {
+    //     auto channel = pos / DSTATE;
+    //     auto state_idx = pos % DSTATE;
+    //     load_t F4 = make_float4(0.f, 0.f, 0.f, 0.f);
+    //     input_t* F = reinterpret_cast<input_t*>(&F4);
+    //     for (int i = 0; i < kVecSizeInput; i++)
+    //     {
+    //         auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kVecSizeInput);
+    //         // auto const state_idx_sw = swizzle_func(channel, state_idx + i, DSTATE, kInputElementsPerBank);
+    //         F[i] = sState[channel][state_idx_sw];
+    //     }
+
+    //     auto* dst = reinterpret_cast<float4*>(
+    //         &state[head * dim * DSTATE + (blockIdx.x * CHANNELS_PER_BLOCK + channel) * DSTATE + state_idx]);
+    //     if (channel < dim)
+    //     {
+    //         *dst = F4;
+    //     }
+    // }
 
     // for (int channel = firstWarpIdx; channel < firstWarpIdx + 32; channel++)
     // {
@@ -437,6 +419,7 @@ void invokeSelectiveStateUpdate(
     else if (kernelType == SelectiveStateUpdateKernelType::optimized)
     {
         constexpr int channels_per_block = 64;
+        // constexpr int channels_per_block = 128;
         constexpr int block_size = 128;
         int const blocks_per_dim = (params.dim + channels_per_block - 1) / channels_per_block;
         dim3 block(block_size, 1);
