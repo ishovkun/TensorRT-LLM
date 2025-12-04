@@ -20,15 +20,15 @@ constexpr float SOFTPLUS_THRESHOLD = 20.f;
 template <typename input_t, typename weight_t, int DSTATE, int CHANNELS_PER_BLOCK = 128>
 __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
 {
-    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
-    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);
+    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
+    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);   // state: (batch, nheads, dim, dstate)
 
-    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);
-    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt);
-    auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);
-    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);
-    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);
-    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);
+    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
+    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
+    auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);   // A: (nheads, dim, dstate)
+    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
+    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
+    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
     auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
     auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
     auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
@@ -72,7 +72,6 @@ __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
     auto z_value = z ? toFloat(z[batch * nheads * dim + head * dim + idx_dim]) : 0.f;
 
     // dt: (batch, nheads, dim)
-    // auto const dt_offset = (batch * nheads + head) * dim + idx_dim;
     auto const dt_offset = x_offset;
     auto dt_value = toFloat(dt[dt_offset]);
 
@@ -162,15 +161,15 @@ __device__ inline auto swizzle_func(int row, int col, int width, int factor) -> 
 template <typename input_t, typename weight_t, int DSTATE, int blockSize, int CHANNELS_PER_BLOCK>
 __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams params)
 {
-    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
-    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);
+    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
+    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);   // state: (batch, nheads, dim, dstate)
 
-    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);
-    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt);
-    auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);
-    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);
-    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);
-    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);
+    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
+    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
+    auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);   // A: (nheads, dim, dstate)
+    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
+    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
+    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
     auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
     auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
     auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
@@ -279,7 +278,7 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     }
 
     static_assert((CHANNELS_PER_BLOCK * DSTATE) % (blockSize * kVecSizeInput) == 0, "For proper unrolling");
-    constexpr auto numIterationsState = (CHANNELS_PER_BLOCK * DSTATE) / (blockSize * kVecSizeInput);
+    // constexpr auto numIterationsState = (CHANNELS_PER_BLOCK * DSTATE) / (blockSize * kVecSizeInput);
 #pragma unroll
     // for (int iter = 0; iter < numIterationsState; iter++)
     for (int offset = 0; offset < CHANNELS_PER_BLOCK * DSTATE; offset += blockSize * kVecSizeInput)
@@ -363,6 +362,284 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     }
 }
 
+// template <typename input_t, typename weight_t, int DSTATE, int consumerWarps,  >
+// __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUpdateParams params)
+// {
+// }
+
+template <typename input_t, typename weight_t, int DSTATE>
+__global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params)
+{
+    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
+    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);   // state: (batch, nheads, dim, dstate)
+
+    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
+    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
+    auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);   // A: (nheads, dim, dstate)
+    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
+    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
+    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
+    auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
+    auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
+    auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
+    bool const dt_softplus = params.dt_softplus;
+
+    int const nheads = params.nheads;
+    int const ngroups = params.ngroups;
+    int const dim = params.dim;
+
+    auto const idx_dim = blockIdx.x;
+    auto const batch = blockIdx.y;
+    auto const head = blockIdx.z;
+    auto const group = head / (nheads / ngroups);
+
+    // adjust state pointer within the cache
+    if (state_batch_indices)
+    {
+        // state_batch_indices: (batch,)
+        auto batch_idx = state_batch_indices[batch];
+        if (batch_idx == params.pad_slot_id)
+        {
+            return;
+        }
+        state += batch_idx * nheads * dim * DSTATE;
+    }
+    else
+    {
+        state += batch * nheads * dim * DSTATE;
+    }
+
+    /*
+     *  Idea: each thread just
+     * - separate: somehow load 1d arrays: D, C, x
+     * - loads an element state[m, d], dA[m, d]
+     * - update state[m, d] = state[m, d] * dA[m, d] + dB[M, d] * x[M]
+     * - compute (state[m, d] * C[d]) + reduce along d dimension
+     */
+
+    // x: (batch, nheads, dim)
+    auto const x_offset = (batch * nheads + head) * dim + idx_dim;
+    auto x_value = toFloat(x[x_offset]);
+
+    // z: (batch, nheads, dim)
+    auto z_value = z ? toFloat(z[batch * nheads * dim + head * dim + idx_dim]) : 0.f;
+
+    // dt: (batch, nheads, dim)
+    auto const dt_offset = x_offset;
+    auto dt_value = toFloat(dt[dt_offset]);
+    if (dt_bias)
+    {
+        dt_value += toFloat(dt_bias[head * dim + idx_dim]);
+    }
+    if (dt_softplus)
+    {
+        dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
+    }
+
+    constexpr auto warpSize = 32;
+    auto lane = threadIdx.x % warpSize;
+    float out_value = D ? toFloat(D[head * dim + idx_dim]) * x_value : 0.f;
+    out_value *= int(threadIdx.x == 0);
+
+    using load_t = float4;
+    static_assert(sizeof(weight_t) == sizeof(input_t));
+    static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
+    for (int i = threadIdx.x * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
+    {
+        load_t rA = *reinterpret_cast<load_t const*>(&A[head * dim * DSTATE + idx_dim * DSTATE + i]);
+        load_t rState = *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + idx_dim * DSTATE + i]);
+        load_t rB = *reinterpret_cast<load_t const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
+        load_t rC = *reinterpret_cast<load_t const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
+
+        auto const* A_vals = reinterpret_cast<weight_t const*>(&rA);
+        auto* state_vals = reinterpret_cast<input_t*>(&rState);
+        auto const* B_vals = reinterpret_cast<weight_t const*>(&rB);
+        auto const* C_vals = reinterpret_cast<weight_t const*>(&rC);
+
+        for (int ii = 0; ii < vectorizedLoadSize; ii++)
+        {
+            auto A_value = toFloat(A_vals[ii]);
+            auto state_value = toFloat(state_vals[ii]);
+            auto B_value = toFloat(B_vals[ii]);
+            auto C_value = toFloat(C_vals[ii]);
+
+            auto const dA = __expf(A_value * dt_value);
+            auto const dB = B_value * dt_value;
+            auto const new_state = state_value * dA + dB * x_value;
+
+            out_value += new_state * C_value;
+        }
+        *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + idx_dim * DSTATE + i]) = rState;
+    }
+
+    // warpReduce the out_value
+    for (int s = warpSize / 2; s > 0; s /= 2)
+    {
+        auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
+        if (s >= lane)
+        {
+            out_value += tmp;
+        }
+    }
+    // now lane 0 holds the accumulated out_value
+    if (threadIdx.x == 0)
+    {
+        if (z)
+        {
+            float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+            float silu_z = z_value * sig_z;
+            out_value *= silu_z;
+        }
+
+        convertAndStore(&output[x_offset], out_value);
+    }
+}
+
+template <typename input_t, typename weight_t, int DSTATE>
+__global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams params)
+{
+    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
+    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);   // state: (batch, nheads, dim, dstate)
+
+    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
+    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
+    auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);   // A: (nheads, dim, dstate)
+    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
+    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
+    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
+    auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
+    auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
+    auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
+    bool const dt_softplus = params.dt_softplus;
+
+    int const nheads = params.nheads;
+    int const ngroups = params.ngroups;
+    int const dim = params.dim;
+
+    constexpr auto warpSize = 32;
+    auto const idx_dim = blockIdx.x * warpSize;
+    auto const batch = blockIdx.y;
+    auto const head = blockIdx.z;
+    auto const group = head / (nheads / ngroups);
+
+    // adjust state pointer within the cache
+    if (state_batch_indices)
+    {
+        // state_batch_indices: (batch,)
+        auto batch_idx = state_batch_indices[batch];
+        if (batch_idx == params.pad_slot_id)
+        {
+            return;
+        }
+        state += batch_idx * nheads * dim * DSTATE;
+    }
+    else
+    {
+        state += batch * nheads * dim * DSTATE;
+    }
+
+    /*
+     *  Idea: each thread just
+     * - separate: somehow load 1d arrays: D, C, x
+     * - loads an element state[m, d], dA[m, d]
+     * - update state[m, d] = state[m, d] * dA[m, d] + dB[M, d] * x[M]
+     * - compute (state[m, d] * C[d]) + reduce along d dimension
+     */
+
+    __shared__ input_t sx[warpSize];
+    __shared__ float sdt[warpSize];
+    __shared__ weight_t sz[warpSize];
+    __shared__ input_t sD[warpSize];
+
+    // __shared__ weight_t sC[warpSize];
+
+    if (idx_dim + threadIdx.x < dim)
+    {
+        // x: (batch, nheads, dim)
+        auto const x_offset = (batch * nheads + head) * dim + (idx_dim + threadIdx.x);
+        sx[threadIdx.x] = x[x_offset];
+
+        // dt: (batch, nheads, dim)
+        auto const dt_offset = x_offset;
+        auto dt_value = toFloat(dt[dt_offset]);
+        if (dt_bias) dt_value += toFloat(dt_bias[head * dim + (idx_dim + threadIdx.x)]);
+        if (dt_softplus) dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
+        sdt[threadIdx.x] = dt_value;
+
+        sz[threadIdx.x] = z ? z[batch * nheads * dim + head * dim + (idx_dim + threadIdx.x)] : (weight_t)0.f;
+        sD[threadIdx.x] = D ? D[head * dim + (idx_dim + threadIdx.x)] : (input_t) 0.f;
+    }
+
+    auto lane = threadIdx.x % warpSize;
+
+    using load_t = float4;
+    static_assert(sizeof(weight_t) == sizeof(input_t));
+    static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
+
+    for (auto channel = 0; channel < warpSize; channel++) {
+
+        float dt_value = sdt[channel];
+        float x_value = toFloat(sx[channel]);
+        float out_value = toFloat(sD[channel]) * x_value * int(threadIdx.x == 0); // first lane has the value
+
+        for (int i = threadIdx.x * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
+        {
+            load_t rA = *reinterpret_cast<load_t const*>(&A[head * dim * DSTATE + (idx_dim+channel) * DSTATE + i]);
+            load_t rState = *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (idx_dim+channel) * DSTATE + i]);
+
+            load_t rB = *reinterpret_cast<load_t const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
+            load_t rC = *reinterpret_cast<load_t const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
+
+            auto const* A_vals = reinterpret_cast<weight_t const*>(&rA);
+            auto* state_vals = reinterpret_cast<input_t*>(&rState);
+            auto const* B_vals = reinterpret_cast<weight_t const*>(&rB);
+            auto const* C_vals = reinterpret_cast<weight_t const*>(&rC);
+
+            for (int ii = 0; ii < vectorizedLoadSize; ii++)
+            {
+
+                auto A_value = toFloat(A_vals[ii]);
+                auto state_value = toFloat(state_vals[ii]);
+                auto B_value = toFloat(B_vals[ii]);
+                auto C_value = toFloat(C_vals[ii]);
+
+                auto const dA = __expf(A_value * dt_value);
+                auto const dB = B_value * dt_value;
+                auto const new_state = state_value * dA + dB * x_value;
+
+                out_value += new_state * C_value;
+            }
+            *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (idx_dim+channel) * DSTATE + i]) = rState;
+        }
+
+        // warpReduce the out_value
+        for (int s = warpSize / 2; s > 0; s /= 2)
+        {
+            auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
+            // out_value += tmp * int(s >= lane);
+            if (s >= lane)
+            {
+                out_value += tmp;
+            }
+        }
+
+        // now lane 0 holds the accumulated out_value
+        if (threadIdx.x == 0)
+        {
+            if (z)
+            {
+                float z_value = toFloat(sz[channel]);
+                float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+                float silu_z = z_value * sig_z;
+                out_value *= silu_z;
+            }
+
+            auto const x_offset = (batch * nheads + head) * dim + (idx_dim + channel);
+            convertAndStore(&output[x_offset], out_value);
+        }
+    }
+}
+
 template <typename input_t, typename weight_t>
 void invokeSelectiveStateUpdate(
     SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType)
@@ -395,6 +672,29 @@ void invokeSelectiveStateUpdate(
         TLLM_CHECK(params.dstate == DSTATE);
         selective_state_update_kernel_opt<input_t, weight_t, DSTATE, block_size, channels_per_block>
             <<<grid, block, 0, stream>>>(params);
+    }
+    else if (kernelType == SelectiveStateUpdateKernelType::simple)
+    // {
+    //     int const blocks_per_dim = params.dim;
+    //     dim3 block(32, 1);
+    //     dim3 grid(blocks_per_dim, params.batch, params.nheads);
+
+    //     TLLM_CHECK(params.dstate % 16 == 0);
+    //     constexpr int DSTATE = 128;
+    //     TLLM_CHECK(params.dstate == DSTATE);
+    //     selective_state_update_kernel_simple<input_t, weight_t, DSTATE><<<grid, block, 0, stream>>>(params);
+    // }
+
+    // simple2
+    {
+        int const blocks_per_dim = params.dim / 32;
+        dim3 block(32, 1);
+        dim3 grid(blocks_per_dim, params.batch, params.nheads);
+
+        TLLM_CHECK(params.dstate % 16 == 0);
+        constexpr int DSTATE = 128;
+        TLLM_CHECK(params.dstate == DSTATE);
+        selective_state_update_kernel_simple2<input_t, weight_t, DSTATE><<<grid, block, 0, stream>>>(params);
     }
     else
     {
