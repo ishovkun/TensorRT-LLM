@@ -4,6 +4,7 @@
 #include <cooperative_groups/memcpy_async.h>
 #include <cstdint>
 // #include <cuda/barrier>
+#include <cmath>
 #include <cuda_runtime_api.h>
 #include <iostream>
 
@@ -15,7 +16,45 @@ __forceinline__ __device__ float softplus(float x)
     return __logf(1.f + __expf(x));
 }
 
-constexpr float SOFTPLUS_THRESHOLD = 20.f;
+// Pade approximation or minimax polynomial for exp
+__device__ __forceinline__ float fast_exp_poly(float x)
+{
+    // For x in [-10, 0] range (typical for SSM)
+    // Pade [3/3] approximation
+    float x2 = x * x;
+    float num = 1.0f + x * 0.5f + x2 * 0.08333333f;
+    float den = 1.0f - x * 0.5f + x2 * 0.08333333f;
+    float result = __fdividef(num, den);
+    return result; // or adjust for better accuracy
+}
+
+__device__ __forceinline__ float fast_exp_pade44(float x)
+{
+    // Pade [4/4] approximation - extremely high accuracy
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float x4 = x2 * x2;
+
+    float num = 1.0f + 0.5f * x + 0.083333333333f * x2 + 0.0083333333333f * x3 + 0.00059523809524f * x4;
+    float den = 1.0f - 0.5f * x + 0.083333333333f * x2 - 0.0083333333333f * x3 + 0.00059523809524f * x4;
+
+    return __fdividef(num, den);
+    // Coefficients: 1, 1/2, 1/12, 1/120, 1/1680
+}
+
+__device__ __forceinline__ float fast_exp(float x)
+{
+    constexpr float log2_E = 1.4426950408889634f;
+    float y;
+    asm("ex2.approx.f32 %0,%1;" : "=f"(y) : "f"(x * log2_E));
+    return y;
+}
+
+__device__ __forceinline__ float thresholded_softplus(float dt_value)
+{
+    constexpr float threshold = 20.f;
+    return (dt_value <= threshold) ? softplus(dt_value) : dt_value;
+}
 
 template <typename input_t, typename weight_t, int DSTATE, int CHANNELS_PER_BLOCK = 128>
 __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
@@ -81,7 +120,7 @@ __global__ void selective_state_update_kernel(SelectiveStateUpdateParams params)
     }
     if (dt_softplus)
     {
-        dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
+        dt_value = thresholded_softplus(dt_value);
     }
 
     // Load matrices
@@ -217,7 +256,7 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     }
     if (dt_softplus)
     {
-        dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
+        dt_value = thresholded_softplus(dt_value);
     }
 
     static constexpr auto warpSize = 32;
@@ -433,7 +472,7 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     }
     if (dt_softplus)
     {
-        dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
+        dt_value = thresholded_softplus(dt_value);
     }
 
     constexpr auto warpSize = 32;
@@ -551,8 +590,6 @@ __global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams
     __shared__ weight_t sz[warpSize];
     __shared__ input_t sD[warpSize];
 
-    // __shared__ weight_t sC[warpSize];
-
     if (idx_dim + threadIdx.x < dim)
     {
         // x: (batch, nheads, dim)
@@ -562,21 +599,25 @@ __global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams
         // dt: (batch, nheads, dim)
         auto const dt_offset = x_offset;
         auto dt_value = toFloat(dt[dt_offset]);
-        if (dt_bias) dt_value += toFloat(dt_bias[head * dim + (idx_dim + threadIdx.x)]);
-        if (dt_softplus) dt_value = (dt_value <= SOFTPLUS_THRESHOLD) ? softplus(dt_value) : dt_value;
+        if (dt_bias)
+            dt_value += toFloat(dt_bias[head * dim + (idx_dim + threadIdx.x)]);
+        if (dt_softplus)
+            dt_value = thresholded_softplus(dt_value);
         sdt[threadIdx.x] = dt_value;
 
-        sz[threadIdx.x] = z ? z[batch * nheads * dim + head * dim + (idx_dim + threadIdx.x)] : (weight_t)0.f;
+        sz[threadIdx.x] = z ? z[batch * nheads * dim + head * dim + (idx_dim + threadIdx.x)] : (weight_t) 0.f;
         sD[threadIdx.x] = D ? D[head * dim + (idx_dim + threadIdx.x)] : (input_t) 0.f;
     }
 
     auto lane = threadIdx.x % warpSize;
 
-    using load_t = float4;
+    using load_t = float2;
+    // using load_t = float4;
     static_assert(sizeof(weight_t) == sizeof(input_t));
     static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
 
-    for (auto channel = 0; channel < warpSize; channel++) {
+    for (auto channel = 0; channel < warpSize; channel++)
+    {
 
         float dt_value = sdt[channel];
         float x_value = toFloat(sx[channel]);
@@ -584,9 +625,8 @@ __global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams
 
         for (int i = threadIdx.x * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
         {
-            load_t rA = *reinterpret_cast<load_t const*>(&A[head * dim * DSTATE + (idx_dim+channel) * DSTATE + i]);
-            load_t rState = *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (idx_dim+channel) * DSTATE + i]);
-
+            load_t rA = *reinterpret_cast<load_t const*>(&A[head * dim * DSTATE + (idx_dim + channel) * DSTATE + i]);
+            load_t rState = *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (idx_dim + channel) * DSTATE + i]);
             load_t rB = *reinterpret_cast<load_t const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
             load_t rC = *reinterpret_cast<load_t const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
 
@@ -603,13 +643,16 @@ __global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams
                 auto B_value = toFloat(B_vals[ii]);
                 auto C_value = toFloat(C_vals[ii]);
 
-                auto const dA = __expf(A_value * dt_value);
+                // auto const dA = __expf(A_value * dt_value);
+                auto const dA = fast_exp(A_value * dt_value);
+                // auto const dA = fast_exp_poly(A_value * dt_value);
+                // auto const dA = fast_exp_pade44(A_value * dt_value);
                 auto const dB = B_value * dt_value;
                 auto const new_state = state_value * dA + dB * x_value;
 
                 out_value += new_state * C_value;
             }
-            *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (idx_dim+channel) * DSTATE + i]) = rState;
+            *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (idx_dim + channel) * DSTATE + i]) = rState;
         }
 
         // warpReduce the out_value
@@ -618,25 +661,26 @@ __global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams
             auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
             // out_value += tmp * int(s >= lane);
             if (s >= lane)
-            {
                 out_value += tmp;
-            }
         }
-
-        // now lane 0 holds the accumulated out_value
         if (threadIdx.x == 0)
         {
-            if (z)
-            {
-                float z_value = toFloat(sz[channel]);
-                float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
-                float silu_z = z_value * sig_z;
-                out_value *= silu_z;
-            }
-
-            auto const x_offset = (batch * nheads + head) * dim + (idx_dim + channel);
-            convertAndStore(&output[x_offset], out_value);
+            sdt[channel] = out_value;
         }
+    }
+
+    if (idx_dim + threadIdx.x < dim)
+    {
+        auto out_value = sdt[threadIdx.x];
+        if (z)
+        {
+            float z_value = toFloat(sz[threadIdx.x]);
+            float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+            float silu_z = z_value * sig_z;
+            out_value *= silu_z;
+        }
+        auto const x_offset = (batch * nheads + head) * dim + (idx_dim + threadIdx.x);
+        convertAndStore(&output[x_offset], out_value);
     }
 }
 
