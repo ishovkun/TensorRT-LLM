@@ -108,6 +108,7 @@ def test_correctness(
         torch.ops.trtllm.selective_state_update,
         torch.ops.trtllm.selective_state_update_opt,
         torch.ops.trtllm.selective_state_update_simple,
+        torch.ops.trtllm.selective_state_update_simple3,
     ]
 
     # Run reference implementation once
@@ -332,7 +333,7 @@ def main(batch_size, repeats, warmup, skip_test):
 
     test_passed = True
     if not skip_test:
-        for test_batch_size in [1, 16, 32, 64, 256]:
+        for test_batch_size in [1, 16, 32, 64, 256, 512]:
             passed = test_correctness(test_batch_size, nheads, dim, dstate, ngroups, dtype=dtype)
             if not passed:
                 print(f"✗ Test {batch_size} failed")
@@ -370,7 +371,8 @@ def main(batch_size, repeats, warmup, skip_test):
         selective_state_update,
         # torch.ops.trtllm.selective_state_update,
         torch.ops.trtllm.selective_state_update_opt,
-        torch.ops.trtllm.selective_state_update_simple
+        torch.ops.trtllm.selective_state_update_simple,
+        torch.ops.trtllm.selective_state_update_simple3,
     ]
 
     for kernel in kernels:

@@ -10,6 +10,7 @@ enum class SelectiveStateUpdateKernelType
     naive,
     optimized,
     simple,
+    simple3,
 };
 
 struct SelectiveStateUpdateParams
