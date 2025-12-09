@@ -104,11 +104,12 @@ def test_correctness(
     )
 
     # Define test kernels to compare against reference
-    test_kernels = [
+    kernels = [
         torch.ops.trtllm.selective_state_update,
         torch.ops.trtllm.selective_state_update_opt,
         torch.ops.trtllm.selective_state_update_simple,
         torch.ops.trtllm.selective_state_update_simple3,
+        torch.ops.trtllm.selective_state_update_producer_consumer,
     ]
 
     # Run reference implementation once
@@ -139,7 +140,7 @@ def test_correctness(
 
     # Test each kernel implementation against the reference
     all_passed = True
-    for kernel_func in test_kernels:
+    for kernel_func in kernels:
         # kernel_name = kernel_func.__name__
         kernel_name = f"{kernel_func.__module__}.{kernel_func.__name__}"
         print(f"\n{'-' * 80}")

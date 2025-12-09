@@ -1,12 +1,15 @@
+#include <iostream>
+#include <cstdint>
+#include <cstdint>
+#include <cmath>
+#include "tmaDescriptor.cuh"
 #include "conversion.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/selectiveScan/selectiveStateUpdate.h"
+#include <cooperative_groups.h>
 #include <cooperative_groups/memcpy_async.h>
-#include <cstdint>
-// #include <cuda/barrier>
-#include <cmath>
+#include <cuda/barrier>
 #include <cuda_runtime_api.h>
-#include <iostream>
 
 namespace tensorrt_llm::kernels
 {
@@ -401,11 +404,6 @@ __global__ void selective_state_update_kernel_opt(SelectiveStateUpdateParams par
     }
 }
 
-// template <typename input_t, typename weight_t, int DSTATE, int consumerWarps,  >
-// __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUpdateParams params)
-// {
-// }
-
 template <typename input_t, typename weight_t, int DSTATE>
 __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params)
 {
@@ -714,21 +712,8 @@ __global__ void selective_state_update_kernel_simple3(SelectiveStateUpdateParams
     auto lane = threadIdx.x % warpSize;
     auto warp = threadIdx.y;
 
-    // adjust state pointer within the cache
-    if (state_batch_indices)
-    {
-        // state_batch_indices: (batch,)
-        auto batch_idx = state_batch_indices[batch];
-        if (batch_idx == params.pad_slot_id)
-        {
-            return;
-        }
-        state += batch_idx * nheads * dim * DSTATE;
-    }
-    else
-    {
-        state += batch * nheads * dim * DSTATE;
-    }
+    auto const batch_idx = (state_batch_indices) ? state_batch_indices[batch] : batch;
+    state += batch_idx * nheads * dim * DSTATE;
 
     /*
      *  Idea: each thread just
@@ -764,9 +749,8 @@ __global__ void selective_state_update_kernel_simple3(SelectiveStateUpdateParams
         sD[_d] = D ? D[head * dim + d] : (input_t) 0.f;
     }
 
-
-    using load_t = float2;
-    // using load_t = float4;
+    // using load_t = float2;
+    using load_t = float4;
     static_assert(sizeof(weight_t) == sizeof(input_t));
     static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
 
@@ -802,6 +786,7 @@ __global__ void selective_state_update_kernel_simple3(SelectiveStateUpdateParams
                 // auto const dA = fast_exp_pade44(A_value * dt_value);
                 auto const dB = B_value * dt_value;
                 auto const new_state = state_value * dA + dB * x_value;
+                convertAndStore(&state_vals[ii], new_state);
 
                 out_value += new_state * C_value;
             }
@@ -839,10 +824,216 @@ __global__ void selective_state_update_kernel_simple3(SelectiveStateUpdateParams
     }
 }
 
+
+template <typename input_t, typename weight_t, int rowsPerStage, int DSTATE, uint8_t numStages>
+struct SharedStorage {
+  alignas(128) weight_t A[numStages][rowsPerStage * DSTATE];
+  alignas(128) input_t state[numStages][rowsPerStage * DSTATE];
+  input_t x[64];
+  float dt[64];
+  weight_t z[64];
+  input_t D[64];
+  weight_t B[DSTATE];
+  weight_t C[DSTATE];
+
+  using barrier_t = cuda::barrier<cuda::thread_scope_block>;
+  barrier_t bar_empty[numStages];
+  barrier_t bar_full[numStages];
+  barrier_t bar_consumers;
+};
+
+template <typename input_t, typename weight_t, int DSTATE, int consumerWarps, int rowsPerState, int numStages = 1>
+__global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUpdateParams params,
+    __grid_constant__ CUtensorMap const tensorA,
+    __grid_constant__ CUtensorMap const tensorState)
+{
+    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
+    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);   // state: (batch, nheads, dim, dstate)
+
+    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
+    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
+    // auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);   // A: (nheads, dim, dstate)
+    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
+    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
+    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
+    auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
+    auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
+    auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
+    bool const dt_softplus = params.dt_softplus;
+
+    int const nheads = params.nheads;
+    int const ngroups = params.ngroups;
+    int const dim = params.dim;
+
+    constexpr auto warpSize = 32;
+    constexpr auto rowsPerStage = 1 * consumerWarps;
+    constexpr auto numWarps = 1 + consumerWarps;
+
+    auto const batch = blockIdx.x;
+    auto const head = blockIdx.y;
+    auto const group = head / (nheads / ngroups);
+    auto lane = threadIdx.x % warpSize;
+    auto warp = threadIdx.y;
+
+    auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+
+    if (state_batch == params.pad_slot_id)
+    {
+        return;
+    }
+
+    using sram_t = SharedStorage<input_t, weight_t, rowsPerStage, DSTATE, numStages>;
+    __shared__ sram_t sram;
+
+    namespace cde = cuda::device::experimental;
+    namespace cg = cooperative_groups;
+
+    for (int stage = warp; stage < numStages; stage += numWarps) {
+        if (lane > 0) continue;
+        constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
+        init(&sram.bar_empty[stage], num_arrivals);
+        init(&sram.bar_full[stage], num_arrivals);
+        // signal to async proxy that barriers are initilized
+        cde::fence_proxy_async_shared_cta();
+    }
+    if (lane == 0 && warp == 0) {
+        init(&sram.bar_consumers, warpSize * consumerWarps);
+    }
+    __syncthreads();
+
+    if (warp == consumerWarps) { // producer
+        for (int d = 0, stage = 0; d < dim; d += rowsPerStage, stage = (stage + 1) % numStages) {
+            if (lane == 0) {
+                namespace cg = cooperative_groups;
+                cg::invoke_one(cg::coalesced_threads(), [&]() {
+                    sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
+
+                    auto tma_copy = cde::cp_async_bulk_tensor_2d_global_to_shared;
+                    tma_copy(&sram.A[stage][0], &tensorA, /*x*/ 0, /*y*/ head*dim + d, sram.bar_full[stage]);
+                    uint64_t const state_offset = state_batch * nheads* dim + head*dim;
+                    tma_copy(&sram.state[stage][0], &tensorState, /*x*/ 0, /*y*/ state_offset + d, sram.bar_full[stage]);
+
+                    // Unblock the consumers
+                    auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(input_t);
+                    auto constexpr bytesA = rowsPerStage * DSTATE * sizeof(weight_t);
+                    auto constexpr bytes = bytesState + bytesA;
+                    // auto constexpr bytes = bytesA;
+                    auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytes);
+                });
+            }
+        }
+    }
+    else { // consumers
+
+        // Unblock the producer
+        for (uint8_t stage = 0; stage < numStages; ++stage) {
+           auto const _ = sram.bar_empty[stage].arrive();
+        }
+        // Load x, dt, z, D
+        {
+            auto d = warp*warpSize + lane;
+            if (d < dim)
+            {
+                sram.x[d] = x[(batch*nheads + head) * dim + d];
+                auto dt_value = toFloat(dt[(batch*nheads + head) * dim + d]);
+                if (dt_bias)
+                    dt_value += toFloat(dt_bias[head * dim + d]);
+                if (dt_softplus)
+                    dt_value = thresholded_softplus(dt_value);
+                sram.dt[d] = dt_value;
+                sram.z[d] = z ? z[batch * nheads * dim + head * dim + d] : (weight_t) 0.f;
+                sram.D[d] = D ? D[head * dim + d] : (input_t) 0.f;
+            }
+        }
+        // Load B, C
+        {
+            for (auto i = warp * warpSize + lane; i < DSTATE; i += warpSize*consumerWarps) {
+                sram.B[i] = B[batch * ngroups * DSTATE + group * DSTATE + i];
+                sram.C[i] = C[batch * ngroups * DSTATE + group * DSTATE + i];
+            }
+        }
+
+        sram.bar_consumers.wait(sram.bar_consumers.arrive());
+
+        for (auto dBegin = 0, stage = 0; dBegin < dim; dBegin += rowsPerStage, stage = (stage+1) % numStages) {
+
+            // wait for the producer
+            sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
+
+
+            for (auto dd = warp; dd < rowsPerStage; dd += consumerWarps) {
+                auto d = dBegin + warp;
+                float dt_value = sram.dt[d];
+                float x_value = toFloat(sram.x[d]);
+                float out_value = toFloat(sram.D[d]) * x_value * int(lane == 0); // first lane has the value
+
+                for (int i = lane; i < DSTATE; i += warpSize) {
+                    auto A_value = toFloat(sram.A[stage][dd * DSTATE + i]);
+                    auto state_value = toFloat(sram.state[stage][dd * DSTATE + i]);
+                    auto B_value = toFloat(sram.B[i]);
+                    auto C_value = toFloat(sram.C[i]);
+
+                    auto const dA = fast_exp(A_value * dt_value);
+                    auto const dB = B_value * dt_value;
+                    auto const new_state = state_value * dA + dB * x_value;
+                    convertAndStore(&sram.state[stage][dd*DSTATE + i], new_state);
+                    out_value += new_state * C_value;
+                }
+
+                using load_t = float2;
+                static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
+                for (int i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
+                {
+                    auto const * src = reinterpret_cast<load_t*>(&sram.state[stage][dd * DSTATE + i]);;
+                    auto * dst = reinterpret_cast<load_t*>(&state[head * dim * DSTATE + d * DSTATE + i]) ;
+                    *dst = *src;
+                }
+
+                // warpReduce the out_value
+                for (int s = warpSize / 2; s > 0; s /= 2)
+                {
+                    auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
+                    // out_value += tmp * int(s >= lane);
+                    if (s >= lane)
+                        out_value += tmp;
+                }
+                if (lane == 0)
+                {
+                    sram.dt[d] = out_value;
+                }
+            }
+
+            // Unblock producer
+            auto _ = sram.bar_empty[stage].arrive();
+        }
+
+        // Write output
+        sram.bar_consumers.wait(sram.bar_consumers.arrive());
+        auto d = warp * warpSize + lane;
+        if (d < dim)
+        {
+            auto out_value = sram.dt[d];
+            if (z)
+            {
+                float z_value = toFloat(sram.z[d]);
+                float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+                float silu_z = z_value * sig_z;
+                out_value *= silu_z;
+            }
+            auto const x_offset = (batch * nheads + head) * dim + d;
+            convertAndStore(&output[x_offset], out_value);
+        }
+
+    }
+}
+
 template <typename input_t, typename weight_t>
 void invokeSelectiveStateUpdate(
     SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType)
 {
+    TLLM_CHECK(params.dstate % 16 == 0);
+    constexpr int DSTATE = 128;
+    TLLM_CHECK(params.dstate == DSTATE);
     if (kernelType == SelectiveStateUpdateKernelType::naive)
     {
         constexpr int channels_per_block = 128;
@@ -852,7 +1043,6 @@ void invokeSelectiveStateUpdate(
 
         TLLM_CHECK(params.dstate % 16 == 0);
 
-        constexpr int DSTATE = 128;
         TLLM_CHECK(params.dstate == DSTATE);
         selective_state_update_kernel<input_t, weight_t, DSTATE, channels_per_block>
             <<<grid, block, 0, stream>>>(params);
@@ -866,33 +1056,14 @@ void invokeSelectiveStateUpdate(
         dim3 block(block_size, 1);
         dim3 grid(blocks_per_dim, params.batch, params.nheads);
 
-        TLLM_CHECK(params.dstate % 16 == 0);
-        constexpr int DSTATE = 128;
-        TLLM_CHECK(params.dstate == DSTATE);
         selective_state_update_kernel_opt<input_t, weight_t, DSTATE, block_size, channels_per_block>
             <<<grid, block, 0, stream>>>(params);
     }
     else if (kernelType == SelectiveStateUpdateKernelType::simple)
-    // {
-    //     int const blocks_per_dim = params.dim;
-    //     dim3 block(32, 1);
-    //     dim3 grid(blocks_per_dim, params.batch, params.nheads);
-
-    //     TLLM_CHECK(params.dstate % 16 == 0);
-    //     constexpr int DSTATE = 128;
-    //     TLLM_CHECK(params.dstate == DSTATE);
-    //     selective_state_update_kernel_simple<input_t, weight_t, DSTATE><<<grid, block, 0, stream>>>(params);
-    // }
-
-    // simple2
     {
         int const blocks_per_dim = params.dim / 32;
         dim3 block(32, 1);
         dim3 grid(blocks_per_dim, params.batch, params.nheads);
-
-        TLLM_CHECK(params.dstate % 16 == 0);
-        constexpr int DSTATE = 128;
-        TLLM_CHECK(params.dstate == DSTATE);
         selective_state_update_kernel_simple2<input_t, weight_t, DSTATE><<<grid, block, 0, stream>>>(params);
     }
     else if (kernelType == SelectiveStateUpdateKernelType::simple3)
@@ -901,11 +1072,45 @@ void invokeSelectiveStateUpdate(
         int const blocks_per_dim = params.dim / (32 * numWarps);
         dim3 block(32, numWarps);
         dim3 grid(blocks_per_dim, params.batch, params.nheads);
-
-        TLLM_CHECK(params.dstate % 16 == 0);
-        constexpr int DSTATE = 128;
-        TLLM_CHECK(params.dstate == DSTATE);
         selective_state_update_kernel_simple3<input_t, weight_t, DSTATE, numWarps><<<grid, block, 0, stream>>>(params);
+    }
+    else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer)
+    {
+        constexpr auto numConsumers = 2;
+        constexpr auto numWarps = 1 + numConsumers;
+        constexpr auto numStages = 1;
+        constexpr auto rowsPerStage = 1 * numConsumers;
+        auto scan_func = selective_state_update_kernel_producer_consumer<input_t, weight_t, DSTATE,
+        numConsumers, rowsPerStage, numStages>;
+
+        dim3 block(32, numWarps);
+        dim3 grid(params.batch, params.nheads);
+
+        // batchedGemm::trtllm::gen::Dtype A_dtype;
+        // if constexpr (weight_t == half) {
+        //     A_dtype = batchedGemm::trtllm::gen::Dtype::FP16;
+        // } else if constexpr (weight_t == float) {
+        //     A_dtype = batchedGemm::trtllm::gen::Dtype::FP32;
+        // } else {
+        //     TLLM_CHECK(false);
+        // }
+
+        auto nh = params.nheads;
+        auto dim = params.dim;
+        auto b = params.batch;
+        TLLM_CHECK(reinterpret_cast<uintptr_t>(params.A) % 128 == 0);
+        auto tensorA = tma::createTensorMap<weight_t>(params.A, nh*dim, DSTATE, rowsPerStage, DSTATE);
+        auto tensorState = tma::createTensorMap<input_t>(params.state, b*nh*dim, DSTATE, rowsPerStage, DSTATE);
+
+        // using namespace batchGemm::gemm;
+        // namespace tg = trtllm::gen;
+        // std::vector<uint64_t> A_shapes = {dstate, dim, nheads};
+        // std::vector<uint64_t> A_strides = {1, dstate, dstate*dim};
+        // std::vector<int32_t> A_tile_shapes = {dstate, rowsPerStage};
+        // auto tensorA = batchedGemm::gemm::buildNdTmaDescriptor(A_dtype, MmaKind::Auto, A_shapes, A_strides, A_tile_shapes,
+        //    params.A, /*doSwizzle */ false);
+
+        scan_func<<<grid, block, 0, stream>>>(params, tensorA, tensorState);
     }
     else
     {
@@ -916,6 +1121,7 @@ void invokeSelectiveStateUpdate(
 // we should focus on BF16, FP16 and even FP32 where the Mamba states are involved.
 template void invokeSelectiveStateUpdate<half, half>(
     SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType);
+
 template void invokeSelectiveStateUpdate<float, float>(
     SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType);
 
