@@ -32,6 +32,7 @@ auto run_selective_state_update(                   //
     // indices 0 and 3 */
 
     auto const batch = x.size(0);
+    auto const state_cache_size = state.size(0);
     auto const nheads = state.size(1);
     auto const dim = state.size(2);
     auto const dstate = state.size(3);
@@ -49,11 +50,13 @@ auto run_selective_state_update(                   //
     TORCH_CHECK(C.sizes() == B.sizes(), "C.shape must match B.shape");
 
     TORCH_CHECK(D.size(0) == nheads && D.size(1) == dim, "D.shape must be (", nheads, ", ", dim, ")");
-    // TORCH_CHECK(z.sizes() == x.sizes(), "z.shape must match x.shape");
+    // if (z)
+    // {
+    //     TORCH_CHECK(z.sizes() == x.sizes(), "z.shape must match x.shape");
+    // }
     if (dt_bias)
     {
-        TORCH_CHECK(
-            dt_bias->size(0) == nheads && dt_bias->size(1) == dim, "dt_bias.shape must be (", nheads, ", ", dim, ")");
+        TORCH_CHECK(dt_bias->size(0) == nheads && dt_bias->size(1) == dim, "dt_bias.shape must be (", nheads, ", ", dim, ")");
     }
 
     using namespace tensorrt_llm::kernels;
@@ -63,6 +66,7 @@ auto run_selective_state_update(                   //
     p.dim = dim;
     p.dstate = dstate;
     p.ngroups = ngroups;
+    p.state_cache_size = state_cache_size;
 
     p.state = state.data_ptr();
     p.x = x.data_ptr();
@@ -79,8 +83,11 @@ auto run_selective_state_update(                   //
     p.B = B.data_ptr();
     p.C = C.data_ptr();
     p.D = D.data_ptr();
+    p.dt_softplus = dt_softplus;
+
     auto output = torch::empty_like(x);
     p.output = output.data_ptr();
+
 
     if (state_batch_indices)
     {
@@ -154,7 +161,7 @@ auto run_selective_state_update_producer_consumer(th::Tensor const& state, th::T
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "selective_state_update("
+        "selective_state_update_naive("
         "Tensor state, Tensor x, Tensor dt, "
         "Tensor A, Tensor B, Tensor C, Tensor D, "
         "Tensor? z, "
@@ -207,7 +214,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("selective_state_update", &torch_ext::run_selective_state_update_naive);
+    m.impl("selective_state_update_naive", &torch_ext::run_selective_state_update_naive);
     m.impl("selective_state_update_opt", &torch_ext::run_selective_state_update_opt);
     m.impl("selective_state_update_simple", &torch_ext::run_selective_state_update_simple);
     m.impl("selective_state_update_simple3", &torch_ext::run_selective_state_update_simple3);

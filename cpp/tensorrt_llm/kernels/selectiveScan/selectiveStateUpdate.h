@@ -16,20 +16,20 @@ enum class SelectiveStateUpdateKernelType
 
 struct SelectiveStateUpdateParams
 {
-    uint32_t batch, nheads, dim, dstate, ngroups;
+    uint32_t batch, nheads, dim, dstate, ngroups, state_cache_size;
     int32_t pad_slot_id{-1};
 
-    bool dt_softplus, tie_hdim, has_state_batch_indices;
+    bool dt_softplus{false};
 
-    void* __restrict__ state; // input_t: (batch, nheads, dim, dstate)
+    void* __restrict__ state; // input_t: (state_cache_size, nheads, dim, dstate)
     void* __restrict__ x; // input_t: (batch, nheads, dim)
     void* __restrict__ dt; // weight_t: (batch, nheads, dim)
-    void* __restrict__ dt_bias{nullptr};
+    void* __restrict__ dt_bias{nullptr}; // weight_t (nheads, dim)
     void* __restrict__ A; // weight_t: (nheads, dim, dstate)
     void* __restrict__ B; // input_t: (batch, ngroups, dstate)
     void* __restrict__ C; // input_t: (batch, ngroups, dstate)
-    void* __restrict__ D; // weight_t: (nheads, dim)
-    void* __restrict__ z{nullptr}; // input_t
+    void* __restrict__ D{nullptr}; // weight_t: (nheads, dim)
+    void* __restrict__ z{nullptr}; // input_t: (batch, nheads, dim)
     void* __restrict__ output; // input_t: (batch, nheads, dim)
     void* __restrict__ state_batch_indices{nullptr}; // state_batch_indices: (batch,)
 };

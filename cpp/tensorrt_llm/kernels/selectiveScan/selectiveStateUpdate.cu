@@ -788,6 +788,10 @@ __global__ void selective_state_update_kernel_simple3(SelectiveStateUpdateParams
                 auto const new_state = state_value * dA + dB * x_value;
                 convertAndStore(&state_vals[ii], new_state);
 
+                // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warp == 0 && threadIdx.x == 0 && warp == 0 && d == 0 && i == 0 && ii == 0) {
+                //     printf("d = %d i = %d old_state = %f new_state = %f \n", d, i, state_value, new_state);
+                // }
+
                 out_value += new_state * C_value;
             }
             *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + d * DSTATE + i]) = rState;
@@ -910,14 +914,13 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
 
                     auto tma_copy = cde::cp_async_bulk_tensor_2d_global_to_shared;
                     tma_copy(&sram.A[stage][0], &tensorA, /*x*/ 0, /*y*/ head*dim + d, sram.bar_full[stage]);
-                    uint64_t const state_offset = state_batch * nheads* dim + head*dim;
+                    uint64_t const state_offset = (state_batch * nheads + head)*dim;
                     tma_copy(&sram.state[stage][0], &tensorState, /*x*/ 0, /*y*/ state_offset + d, sram.bar_full[stage]);
 
                     // Unblock the consumers
                     auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(input_t);
                     auto constexpr bytesA = rowsPerStage * DSTATE * sizeof(weight_t);
                     auto constexpr bytes = bytesState + bytesA;
-                    // auto constexpr bytes = bytesA;
                     auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytes);
                 });
             }
@@ -960,9 +963,26 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
             // wait for the producer
             sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
 
+            if (blockIdx.x == 0 && blockIdx.y == 0 && warp == 0 && lane == 0 && dBegin == 0) {
+                printf("sram.A[stage][0:10][0:10] =\n ");
+                for(int i = 0; i < rowsPerStage; i++){
+                    for (int j = 0; j < 10; j++) {
+                            printf("%f ", toFloat(sram.A[stage][i*DSTATE + j]));
+                    }
+                    printf("\n");
+                }
+                printf("sram.state[stage][0:10][0:10] =\n ");
+                for(int i = 0; i < rowsPerStage; i++){
+                    for (int j = 0; j < 10; j++) {
+                            printf("%f ", toFloat(sram.state[stage][i*DSTATE + j]));
+                    }
+                    printf("\n");
+                }
+            }
+
 
             for (auto dd = warp; dd < rowsPerStage; dd += consumerWarps) {
-                auto d = dBegin + warp;
+                auto d = dBegin + dd;
                 float dt_value = sram.dt[d];
                 float x_value = toFloat(sram.x[d]);
                 float out_value = toFloat(sram.D[d]) * x_value * int(lane == 0); // first lane has the value
@@ -976,6 +996,9 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                     auto const dA = fast_exp(A_value * dt_value);
                     auto const dB = B_value * dt_value;
                     auto const new_state = state_value * dA + dB * x_value;
+                    if (blockIdx.x == 0 && blockIdx.y == 0 && warp == 0 && threadIdx.x == 0 && warp == 0 && dBegin == 0 && i == 0) {
+                        printf("d = %d i = %i old_state = %f new_state = %f \n", d, i, state_value, new_state);
+                    }
                     convertAndStore(&sram.state[stage][dd*DSTATE + i], new_state);
                     out_value += new_state * C_value;
                 }
@@ -984,8 +1007,8 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                 static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
                 for (int i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
                 {
-                    auto const * src = reinterpret_cast<load_t*>(&sram.state[stage][dd * DSTATE + i]);;
-                    auto * dst = reinterpret_cast<load_t*>(&state[head * dim * DSTATE + d * DSTATE + i]) ;
+                    auto const * src = reinterpret_cast<load_t*>(&sram.state[stage][dd * DSTATE + i]);
+                    auto * dst = reinterpret_cast<load_t*>(&state[state_batch * nheads * dim * DSTATE + head * dim * DSTATE + d * DSTATE + i]);
                     *dst = *src;
                 }
 
@@ -997,6 +1020,7 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                     if (s >= lane)
                         out_value += tmp;
                 }
+
                 if (lane == 0)
                 {
                     sram.dt[d] = out_value;
@@ -1097,10 +1121,11 @@ void invokeSelectiveStateUpdate(
 
         auto nh = params.nheads;
         auto dim = params.dim;
-        auto b = params.batch;
+        // auto b = params.batch;
+        auto B = params.state_cache_size;
         TLLM_CHECK(reinterpret_cast<uintptr_t>(params.A) % 128 == 0);
         auto tensorA = tma::createTensorMap<weight_t>(params.A, nh*dim, DSTATE, rowsPerStage, DSTATE);
-        auto tensorState = tma::createTensorMap<input_t>(params.state, b*nh*dim, DSTATE, rowsPerStage, DSTATE);
+        auto tensorState = tma::createTensorMap<input_t>(params.state, B*nh*dim, DSTATE, rowsPerStage, DSTATE);
 
         // using namespace batchGemm::gemm;
         // namespace tg = trtllm::gen;

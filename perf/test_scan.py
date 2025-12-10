@@ -40,7 +40,7 @@ def create_test_inputs(
     # if we use the cache, then the state indices are taken from a specific slot
     # so the state in the kernel will have batch as the first dimension, but it will
     # only come from a particular slot; the full tensor first dim is larger
-    ssm_state_cache_size = max( 384, batch_size )
+    ssm_state_cache_size = max(384, batch_size)
     # ssm_state_cache_size = batch_size
 
     ssm_state_cache = torch.randn(
