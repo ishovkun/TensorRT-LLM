@@ -40,6 +40,7 @@ def create_test_inputs(
     # if we use the cache, then the state indices are taken from a specific slot
     # so the state in the kernel will have batch as the first dimension, but it will
     # only come from a particular slot; the full tensor first dim is larger
+    # ssm_state_cache_size = max(384, int(2*batch_size))
     ssm_state_cache_size = max(384, batch_size)
     # ssm_state_cache_size = batch_size
 
@@ -65,7 +66,6 @@ def create_test_inputs(
     dt_bias_hp = torch.randn(nheads, dim, dtype=dtype, device=device)
 
     # Slot indices for state batching - (batch_size,)
-    # slot_idx_decode = torch.randint(0, batch_size, (batch_size,), dtype=torch.int32, device=device)
     slot_idx_decode = torch.randperm(ssm_state_cache_size, dtype=torch.int32, device=device)[:batch_size]
 
     return {
@@ -105,8 +105,8 @@ def test_correctness(
 
     # Define test kernels to compare against reference
     kernels = [
-        torch.ops.trtllm.selective_state_update,
-        torch.ops.trtllm.selective_state_update_opt,
+        # torch.ops.trtllm.selective_state_update_naive,
+        # torch.ops.trtllm.selective_state_update_opt,
         torch.ops.trtllm.selective_state_update_simple,
         torch.ops.trtllm.selective_state_update_simple3,
         torch.ops.trtllm.selective_state_update_producer_consumer,
@@ -141,7 +141,6 @@ def test_correctness(
     # Test each kernel implementation against the reference
     all_passed = True
     for kernel_func in kernels:
-        # kernel_name = kernel_func.__name__
         kernel_name = f"{kernel_func.__module__}.{kernel_func.__name__}"
         print(f"\n{'-' * 80}")
         print(f"Testing kernel: {kernel_name}")
@@ -175,7 +174,7 @@ def test_correctness(
             continue
 
         # Compare outputs
-        print("\nComparing with reference...")
+        print("\nComparing outputs with reference...")
         output_diff = torch.abs(y_ref - y_test)
         max_diff = output_diff.max().item()
         mean_diff = output_diff.mean().item()
@@ -218,6 +217,55 @@ def test_correctness(
                         f"  Index {idx_tuple}: ref={ref_val:.6f}, test={test_val:.6f}, diff={diff:.6e}, rel_diff={rel_diff:.6e}"
                     )
 
+        # Compare states (updated in-place)
+        print("\nComparing states with reference...")
+
+        # Extract the relevant state slices using slot indices
+        state_ref_batch = state_ref[inputs["slot_idx_decode"]]
+        state_test_batch = state_test[inputs["slot_idx_decode"]]
+
+        state_diff = torch.abs(state_ref_batch - state_test_batch)
+        max_state_diff = state_diff.max().item()
+        mean_state_diff = state_diff.mean().item()
+
+        print(f"Max absolute state difference: {max_state_diff:.6e}")
+        print(f"Mean absolute state difference: {mean_state_diff:.6e}")
+
+        # Check if states match within tolerance
+        states_match = torch.allclose(state_ref_batch, state_test_batch, atol=atol, rtol=rtol)
+
+        if states_match:
+            print(f"✓ States match within tolerance (atol={atol}, rtol={rtol})")
+        else:
+            print(f"✗ States do NOT match within tolerance (atol={atol}, rtol={rtol})")
+            all_passed = False
+
+            # Detailed comparison using numpy testing
+            state_ref_np = state_ref_batch.detach().cpu().numpy()
+            state_test_np = state_test_batch.detach().cpu().numpy()
+
+            print("\nDetailed state mismatch analysis:")
+            state_mismatch_mask = ~np.isclose(state_ref_np, state_test_np, atol=atol, rtol=rtol)
+            num_state_mismatches = np.sum(state_mismatch_mask)
+            total_state_elements = state_ref_np.size
+
+            print(
+                f"Number of mismatched state elements: {num_state_mismatches} / {total_state_elements} ({100 * num_state_mismatches / total_state_elements:.2f}%)"
+            )
+
+            if num_state_mismatches > 0:
+                state_mismatch_indices = np.argwhere(state_mismatch_mask)
+                print(f"First few state mismatch locations (up to 10):")
+                for i, idx in enumerate(state_mismatch_indices[:10]):
+                    idx_tuple = tuple(idx)
+                    ref_val = state_ref_np[idx_tuple]
+                    test_val = state_test_np[idx_tuple]
+                    diff = abs(ref_val - test_val)
+                    rel_diff = diff / (abs(ref_val) + 1e-8)
+                    print(
+                        f"  Index {idx_tuple}: ref={ref_val:.6f}, test={test_val:.6f}, diff={diff:.6e}, rel_diff={rel_diff:.6e}"
+                    )
+
     return all_passed
 
 
@@ -231,7 +279,6 @@ def benchmark_performance(
     num_iterations=100,
     warmup=10,
 ):
-
     device = "cuda"
     dtype = torch.float16
 
@@ -370,10 +417,11 @@ def main(batch_size, repeats, warmup, skip_test):
 
     kernels = [
         selective_state_update,
-        # torch.ops.trtllm.selective_state_update,
-        torch.ops.trtllm.selective_state_update_opt,
-        torch.ops.trtllm.selective_state_update_simple,
+        # torch.ops.trtllm.selective_state_update_naive,
+        # torch.ops.trtllm.selective_state_update_opt,
+        # torch.ops.trtllm.selective_state_update_simple,
         torch.ops.trtllm.selective_state_update_simple3,
+        torch.ops.trtllm.selective_state_update_producer_consumer,
     ]
 
     for kernel in kernels:

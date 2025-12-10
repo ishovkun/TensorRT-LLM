@@ -624,8 +624,7 @@ __global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams
         for (int i = threadIdx.x * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
         {
             load_t rA = *reinterpret_cast<load_t const*>(&A[head * dim * DSTATE + (dim_offset + channel) * DSTATE + i]);
-            load_t rState
-                = *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (dim_offset + channel) * DSTATE + i]);
+            load_t rState = *reinterpret_cast<load_t*>(&state[head * dim * DSTATE + (dim_offset + channel) * DSTATE + i]);
             load_t rB = *reinterpret_cast<load_t const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
             load_t rC = *reinterpret_cast<load_t const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
 
@@ -648,6 +647,7 @@ __global__ void selective_state_update_kernel_simple2(SelectiveStateUpdateParams
                 // auto const dA = fast_exp_pade44(A_value * dt_value);
                 auto const dB = B_value * dt_value;
                 auto const new_state = state_value * dA + dB * x_value;
+                convertAndStore(&state_vals[ii], new_state);
 
                 out_value += new_state * C_value;
             }
@@ -749,8 +749,8 @@ __global__ void selective_state_update_kernel_simple3(SelectiveStateUpdateParams
         sD[_d] = D ? D[head * dim + d] : (input_t) 0.f;
     }
 
-    // using load_t = float2;
-    using load_t = float4;
+    using load_t = float2;
+    // using load_t = float4;
     static_assert(sizeof(weight_t) == sizeof(input_t));
     static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
 
@@ -846,7 +846,7 @@ struct SharedStorage {
   barrier_t bar_consumers;
 };
 
-template <typename input_t, typename weight_t, int DSTATE, int consumerWarps, int rowsPerState, int numStages = 1>
+template <typename input_t, typename weight_t, int DSTATE, int consumerWarps, int rowsPerStage, int numStages = 1>
 __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUpdateParams params,
     __grid_constant__ CUtensorMap const tensorA,
     __grid_constant__ CUtensorMap const tensorState)
@@ -870,7 +870,6 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
     int const dim = params.dim;
 
     constexpr auto warpSize = 32;
-    constexpr auto rowsPerStage = 1 * consumerWarps;
     constexpr auto numWarps = 1 + consumerWarps;
 
     auto const batch = blockIdx.x;
@@ -920,8 +919,8 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                     // Unblock the consumers
                     auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(input_t);
                     auto constexpr bytesA = rowsPerStage * DSTATE * sizeof(weight_t);
-                    auto constexpr bytes = bytesState + bytesA;
-                    auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytes);
+                    auto constexpr bytesToArrive = bytesState + bytesA;
+                    auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
                 });
             }
         }
@@ -929,9 +928,11 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
     else { // consumers
 
         // Unblock the producer
+        #pragma unroll
         for (uint8_t stage = 0; stage < numStages; ++stage) {
            auto const _ = sram.bar_empty[stage].arrive();
         }
+
         // Load x, dt, z, D
         {
             auto d = warp*warpSize + lane;
@@ -963,25 +964,9 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
             // wait for the producer
             sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
 
-            if (blockIdx.x == 0 && blockIdx.y == 0 && warp == 0 && lane == 0 && dBegin == 0) {
-                printf("sram.A[stage][0:10][0:10] =\n ");
-                for(int i = 0; i < rowsPerStage; i++){
-                    for (int j = 0; j < 10; j++) {
-                            printf("%f ", toFloat(sram.A[stage][i*DSTATE + j]));
-                    }
-                    printf("\n");
-                }
-                printf("sram.state[stage][0:10][0:10] =\n ");
-                for(int i = 0; i < rowsPerStage; i++){
-                    for (int j = 0; j < 10; j++) {
-                            printf("%f ", toFloat(sram.state[stage][i*DSTATE + j]));
-                    }
-                    printf("\n");
-                }
-            }
-
-
-            for (auto dd = warp; dd < rowsPerStage; dd += consumerWarps) {
+            #pragma unroll
+            for (auto ddBegin = 0; ddBegin < rowsPerStage; ddBegin += consumerWarps) {
+                auto dd = ddBegin + warp;
                 auto d = dBegin + dd;
                 float dt_value = sram.dt[d];
                 float x_value = toFloat(sram.x[d]);
@@ -996,9 +981,7 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                     auto const dA = fast_exp(A_value * dt_value);
                     auto const dB = B_value * dt_value;
                     auto const new_state = state_value * dA + dB * x_value;
-                    if (blockIdx.x == 0 && blockIdx.y == 0 && warp == 0 && threadIdx.x == 0 && warp == 0 && dBegin == 0 && i == 0) {
-                        printf("d = %d i = %i old_state = %f new_state = %f \n", d, i, state_value, new_state);
-                    }
+
                     convertAndStore(&sram.state[stage][dd*DSTATE + i], new_state);
                     out_value += new_state * C_value;
                 }
@@ -1102,8 +1085,8 @@ void invokeSelectiveStateUpdate(
     {
         constexpr auto numConsumers = 2;
         constexpr auto numWarps = 1 + numConsumers;
-        constexpr auto numStages = 1;
-        constexpr auto rowsPerStage = 1 * numConsumers;
+        constexpr auto numStages = 3;
+        constexpr auto rowsPerStage = 4 * numConsumers;
         auto scan_func = selective_state_update_kernel_producer_consumer<input_t, weight_t, DSTATE,
         numConsumers, rowsPerStage, numStages>;
 
@@ -1126,6 +1109,7 @@ void invokeSelectiveStateUpdate(
         TLLM_CHECK(reinterpret_cast<uintptr_t>(params.A) % 128 == 0);
         auto tensorA = tma::createTensorMap<weight_t>(params.A, nh*dim, DSTATE, rowsPerStage, DSTATE);
         auto tensorState = tma::createTensorMap<input_t>(params.state, B*nh*dim, DSTATE, rowsPerStage, DSTATE);
+        TLLM_CHECK(params.dim % rowsPerStage == 0);
 
         // using namespace batchGemm::gemm;
         // namespace tg = trtllm::gen;
