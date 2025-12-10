@@ -999,9 +999,9 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                 for (int s = warpSize / 2; s > 0; s /= 2)
                 {
                     auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
-                    // out_value += tmp * int(s >= lane);
-                    if (s >= lane)
-                        out_value += tmp;
+                    out_value += tmp * int(s >= lane);
+                    // if (s >= lane)
+                    //     out_value += tmp;
                 }
 
                 if (lane == 0)
@@ -1085,7 +1085,7 @@ void invokeSelectiveStateUpdate(
     {
         constexpr auto numConsumers = 2;
         constexpr auto numWarps = 1 + numConsumers;
-        constexpr auto numStages = 3;
+        constexpr auto numStages = 2;
         constexpr auto rowsPerStage = 4 * numConsumers;
         auto scan_func = selective_state_update_kernel_producer_consumer<input_t, weight_t, DSTATE,
         numConsumers, rowsPerStage, numStages>;
