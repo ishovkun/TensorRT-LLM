@@ -5,6 +5,7 @@ Compares the original selective_state_update with selective_state_update2.
 """
 
 import argparse
+import pickle
 import time
 
 import numpy as np
@@ -53,7 +54,7 @@ def create_test_inputs(
     dt = torch.randn(batch_size, nheads, dim, dtype=dtype, device=device)
 
     # A matrix - (nheads, dim, dstate)
-    A_full = -torch.rand(nheads, dim, dstate, dtype=dtype, device=device)
+    A_full = -torch.rand(nheads, dim, dstate, dtype=torch.float32, device=device)
 
     # B and C - (batch_size, ngroups, dstate)
     B_decode = torch.randn(batch_size, ngroups, dstate, dtype=dtype, device=device)
@@ -66,7 +67,9 @@ def create_test_inputs(
     dt_bias_hp = torch.randn(nheads, dim, dtype=dtype, device=device)
 
     # Slot indices for state batching - (batch_size,)
-    slot_idx_decode = torch.randperm(ssm_state_cache_size, dtype=torch.int32, device=device)[:batch_size]
+    slot_idx_decode = torch.randperm(ssm_state_cache_size, dtype=torch.int32, device=device)[
+        :batch_size
+    ]
 
     return {
         "ssm_state_cache": ssm_state_cache,
@@ -81,35 +84,35 @@ def create_test_inputs(
     }
 
 
-def test_correctness(
-    batch_size, nheads, dim, dstate, ngroups, dtype=torch.float16, atol=1e-3, rtol=1e-2
-):
+# def test_correctness(
+#     batch_size, nheads, dim, dstate, ngroups, dtype=torch.float16, atol=1e-3, rtol=1e-2
+# ):
+def test_correctness(inputs, atol=1e-3, rtol=1e-2):
     """
     Test correctness by computing reference once and comparing multiple implementations against it.
     """
+    batch_size = inputs["x_decode"].shape[0]
+    input_dtype = inputs["x_decode"].dtype
     print(f"\n{'=' * 80}")
-    print(f"Testing correctness with batch_size={batch_size}, dtype={dtype}")
+    print(f"Testing correctness with batch_size={batch_size}, input_dtype={input_dtype}")
     print(f"{'=' * 80}")
 
-    device = "cuda"
+    # device = "cuda"
 
-    inputs = create_test_inputs(
-        batch_size=batch_size,
-        nheads=nheads,
-        dim=dim,
-        dstate=dstate,
-        ngroups=ngroups,
-        dtype=dtype,
-        device=device,
-    )
+    # inputs = create_test_inputs(
+    #     batch_size=batch_size,
+    #     nheads=nheads,
+    #     dim=dim,
+    #     dstate=dstate,
+    #     ngroups=ngroups,
+    #     dtype=dtype,
+    #     device=device,
+    # )
 
     # Define test kernels to compare against reference
     kernels = [
-        # torch.ops.trtllm.selective_state_update_naive,
-        # torch.ops.trtllm.selective_state_update_opt,
         torch.ops.trtllm.selective_state_update_simple,
-        torch.ops.trtllm.selective_state_update_simple3,
-        torch.ops.trtllm.selective_state_update_producer_consumer,
+        # torch.ops.trtllm.selective_state_update_producer_consumer,
     ]
 
     # Run reference implementation once
@@ -377,16 +380,92 @@ def main(batch_size, repeats, warmup, skip_test):
     # dstate = 128
     # ngroups = 1
 
-    dtype = torch.float16
+    # dtype = torch.float16
+    dtype = torch.bfloat16
 
     test_passed = True
     if not skip_test:
         for test_batch_size in [1, 16, 32, 64, 256, 512]:
-            passed = test_correctness(test_batch_size, nheads, dim, dstate, ngroups, dtype=dtype)
+            # passed = test_correctness(test_batch_size, nheads, dim, dstate, ngroups, dtype=dtype)
+            inputs = create_test_inputs(
+                batch_size=batch_size,
+                nheads=nheads,
+                dim=dim,
+                dstate=dstate,
+                ngroups=ngroups,
+                dtype=dtype,
+                device="cuda",
+            )
+            passed = test_correctness(inputs)
             if not passed:
                 print(f"✗ Test {batch_size} failed")
                 exit(1)
             test_passed = test_passed and passed
+        print("testing with custom input")
+
+        # Load debug.pkl and test with custom inputs
+        try:
+            with open('debug.pkl', 'rb') as f:
+                debug_data = pickle.load(f)
+
+            print("Loaded debug.pkl successfully")
+
+            # Move all tensors to GPU
+            device = "cuda"
+            custom_inputs = {}
+            for key, value in debug_data.items():
+                if isinstance(value, torch.Tensor):
+                    custom_inputs[key] = value.to(device)
+                else:
+                    custom_inputs[key] = value
+
+            # Map keys to match test_correctness expected format
+            inputs_for_test = {
+                'ssm_state_cache': custom_inputs['ssm_state_cache'],
+                'x_decode': custom_inputs['x_decode'],
+                'dt_hp': custom_inputs['dt_hp'],
+                'A_full': custom_inputs['A_full'],
+                'B_decode': custom_inputs['B_decode'],
+                'C_decode': custom_inputs['C_decode'],
+                'D_full': custom_inputs['D_full'],
+                'dt_bias_hp': custom_inputs['dt_bias_hp'],
+                'slot_idx_decode': custom_inputs['state_batch_indices'],
+            }
+
+            # Check for NaN values in tensors
+            for key, value in inputs_for_test.items():
+                if isinstance(value, torch.Tensor):
+                    if torch.isnan(value).any():
+                        print(f"Error: Tensor '{key}' contains NaN values")
+                        exit(1)
+
+            print(f"Custom input shapes:")
+            for key, value in inputs_for_test.items():
+                if isinstance(value, torch.Tensor):
+                    print(f"  {key}: {value.shape}, dtype={value.dtype}, device={value.device}")
+
+            # Test with custom inputs
+            passed = test_correctness(inputs_for_test)
+            if not passed:
+                print(f"✗ Custom input test failed")
+                exit(1)
+            test_passed = test_passed and passed
+            if not passed:
+                print(f"✗ Test custom failed")
+                exit(1)
+
+        except TypeError:
+            print("TypeError encountered while loading debug.pkl, exiting")
+            exit(1)
+        except FileNotFoundError:
+            print("debug.pkl not found, skipping custom input test")
+            exit(1)
+        except Exception as e:
+            print(f"Error loading debug.pkl: {e}")
+            import traceback
+            traceback.print_exc()
+            exit(1)
+
 
         # Final summary
         print("\n" + "=" * 80)
@@ -417,16 +496,15 @@ def main(batch_size, repeats, warmup, skip_test):
 
     kernels = [
         selective_state_update,
-        # torch.ops.trtllm.selective_state_update_naive,
-        # torch.ops.trtllm.selective_state_update_opt,
-        # torch.ops.trtllm.selective_state_update_simple,
-        torch.ops.trtllm.selective_state_update_simple3,
-        torch.ops.trtllm.selective_state_update_producer_consumer,
+        torch.ops.trtllm.selective_state_update_simple,
+        # torch.ops.trtllm.selective_state_update_producer_consumer,
     ]
 
     for kernel in kernels:
         kernel_name = f"{kernel.__module__}.{kernel.__name__}"
-        avg_time = benchmark_performance(kernel, batch_size, nheads, dim, ngroups, dstate, repeats, warmup)
+        avg_time = benchmark_performance(
+            kernel, batch_size, nheads, dim, ngroups, dstate, repeats, warmup
+        )
         results[kernel_name] = avg_time
 
     print("=" * 80)
@@ -436,10 +514,19 @@ def main(batch_size, repeats, warmup, skip_test):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Selective State Update Test Suite")
-    parser.add_argument("--warmup", type=int, default=10, help="Number of warmup iterations (default: 10)")
-    parser.add_argument("--repeat", type=int, default=100, help="Number of benchmark iterations (default: 100)")
+    parser.add_argument(
+        "--warmup", type=int, default=10, help="Number of warmup iterations (default: 10)"
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=100, help="Number of benchmark iterations (default: 100)"
+    )
     parser.add_argument("--batch-size", type=int, default=10, help="Batch size during benchmark")
-    parser.add_argument("--skip-test", action="store_true", default=False, help="Skip correctness tests (default: False)")
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        default=False,
+        help="Skip correctness tests (default: False)",
+    )
     args = parser.parse_args()
 
     results = main(args.batch_size, args.repeat, args.warmup, args.skip_test)

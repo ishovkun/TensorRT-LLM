@@ -259,7 +259,48 @@ def _triton_cached_ssm(
         A_full = A[..., None, None].expand(num_heads, head_dim, ssm_state_size)
         D_full = D[..., None].expand(num_heads, head_dim)
 
-        y_dec = selective_state_update(
+        # y_dec = selective_state_update(
+        #     ssm_state_cache,
+        #     x_decode,
+        #     dt_hp,
+        #     A_full,
+        #     B_decode,
+        #     C_decode,
+        #     D=D_full,
+        #     z=None,
+        #     dt_bias=dt_bias_hp,
+        #     dt_softplus=True,
+        #     state_batch_indices=slot_idx_decode,
+        # )  # [nd, H, D]
+
+
+        import pickle
+        from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+
+        # Pickle dump all inputs for debugging
+        debug_data = {
+            'ssm_state_cache': ssm_state_cache.cpu(),
+            'x_decode': x_decode.cpu(),
+            'dt_hp': dt_hp.cpu(),
+            'A_full': A_full.cpu(),
+            'B_decode': B_decode.cpu(),
+            'C_decode': C_decode.cpu(),
+            'D_full': D_full.cpu(),
+            'z': None,
+            'dt_bias_hp': dt_bias_hp.cpu(),
+            'dt_softplus': True,
+            'state_batch_indices': slot_idx_decode.cpu(),
+            'pad_slot_id': PAD_SLOT_ID,
+        }
+
+        with open('debug.pkl', 'wb') as f:
+            pickle.dump(debug_data, f)
+
+        print(f"Debug data saved to debug.pkl")
+        print(f"Keys: {list(debug_data.keys())}")
+        print(f"Shapes: {[(k, v.shape if hasattr(v, 'shape') else type(v)) for k, v in debug_data.items()]}")
+
+        y_dec = torch.ops.trtllm.selective_state_update_producer_consumer(
             ssm_state_cache,
             x_decode,
             dt_hp,
@@ -271,6 +312,7 @@ def _triton_cached_ssm(
             dt_bias=dt_bias_hp,
             dt_softplus=True,
             state_batch_indices=slot_idx_decode,
+            pad_slot_id=PAD_SLOT_ID,
         )  # [nd, H, D]
 
         y_flat[num_prefill_tokens : num_prefill_tokens + num_decode].copy_(y_dec.to(y_flat.dtype))

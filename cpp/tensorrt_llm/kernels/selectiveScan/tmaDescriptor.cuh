@@ -59,7 +59,11 @@ namespace tensorrt_llm::kernels::tma {
          dtype_format = CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
        } else if constexpr (std::is_same_v<Dtype, float>) {
          dtype_format = CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
-       } else {
+       }
+    else if constexpr (std::is_same_v<Dtype, __nv_bfloat16>){
+         dtype_format = CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    }
+    else {
          static_assert([]() { return false; }(), "Unsupported data type for TMA tensor map");
          return tensor_map; // shut the compiler up
        }
