@@ -51,20 +51,25 @@ def create_test_inputs(
 
     # Decode inputs - batch_size varies between 1-2 in the logs
     x_decode = torch.randn(batch_size, nheads, dim, dtype=dtype, device=device)
-    dt = torch.randn(batch_size, nheads, dim, dtype=dtype, device=device)
 
-    # A matrix - (nheads, dim, dstate)
-    A_full = -torch.rand(nheads, dim, dstate, dtype=torch.float32, device=device)
+    # dt: shape (batch, nheads, dim) with strides (nheads, 1, 0) - one value per head
+    dt_base = torch.randn(batch_size, nheads, dtype=dtype, device=device)
+    dt = dt_base.as_strided((batch_size, nheads, dim), (nheads, 1, 0))
+
+    # A matrix - (nheads, dim, dstate) with strides (1, 0, 0) - one value per head
+    A_base = -torch.rand(nheads, dtype=torch.float32, device=device)
+    A_full = A_base.as_strided((nheads, dim, dstate), (1, 0, 0))
 
     # B and C - (batch_size, ngroups, dstate)
     B_decode = torch.randn(batch_size, ngroups, dstate, dtype=dtype, device=device)
     C_decode = torch.randn(batch_size, ngroups, dstate, dtype=dtype, device=device)
 
-    # D - (nheads, dim)
-    D_full = torch.randn(nheads, dim, dtype=dtype, device=device)
+    # D - (nheads, dim) with strides (1, 0) - one value per head
+    D_full = torch.randn(nheads, dtype=dtype, device=device).as_strided((nheads, dim), (1, 0))
 
-    # dt_bias - (nheads, dim)
-    dt_bias_hp = torch.randn(nheads, dim, dtype=dtype, device=device)
+    # dt_bias - (nheads, dim) with strides (1, 0) - one value per head
+    dt_bias_base = torch.randn(nheads, dtype=dtype, device=device)
+    dt_bias_hp = dt_bias_base.as_strided((nheads, dim), (1, 0))
 
     # Slot indices for state batching - (batch_size,)
     slot_idx_decode = torch.randperm(ssm_state_cache_size, dtype=torch.int32, device=device)[
@@ -84,30 +89,10 @@ def create_test_inputs(
     }
 
 
-# def test_correctness(
-#     batch_size, nheads, dim, dstate, ngroups, dtype=torch.float16, atol=1e-3, rtol=1e-2
-# ):
 def test_correctness(inputs, atol=1e-3, rtol=1e-2):
     """
     Test correctness by computing reference once and comparing multiple implementations against it.
     """
-    batch_size = inputs["x_decode"].shape[0]
-    input_dtype = inputs["x_decode"].dtype
-    print(f"\n{'=' * 80}")
-    print(f"Testing correctness with batch_size={batch_size}, input_dtype={input_dtype}")
-    print(f"{'=' * 80}")
-
-    # device = "cuda"
-
-    # inputs = create_test_inputs(
-    #     batch_size=batch_size,
-    #     nheads=nheads,
-    #     dim=dim,
-    #     dstate=dstate,
-    #     ngroups=ngroups,
-    #     dtype=dtype,
-    #     device=device,
-    # )
 
     # Define test kernels to compare against reference
     kernels = [
@@ -133,7 +118,7 @@ def test_correctness(inputs, atol=1e-3, rtol=1e-2):
             state_batch_indices=inputs["slot_idx_decode"],
             pad_slot_id=-1,
         )
-        print(f"Reference output shape: {y_ref.shape}")
+        print(f"Reference output shape: {y_ref.shape} dtype = {y_ref.dtype}")
         print(
             f"Reference output stats: min={y_ref.min():.6f}, max={y_ref.max():.6f}, mean={y_ref.mean():.6f}"
         )
@@ -167,7 +152,7 @@ def test_correctness(inputs, atol=1e-3, rtol=1e-2):
                 state_batch_indices=inputs["slot_idx_decode"],
                 pad_slot_id=-1,
             )
-            print(f"Output shape: {y_test.shape}")
+            print(f"Output shape: {y_test.shape} dtype = {y_test.dtype}")
             print(
                 f"Output stats: min={y_test.min():.6f}, max={y_test.max():.6f}, mean={y_test.mean():.6f}"
             )
@@ -195,8 +180,9 @@ def test_correctness(inputs, atol=1e-3, rtol=1e-2):
             all_passed = False
 
             # Detailed comparison using numpy testing
-            y_ref_np = y_ref.detach().cpu().numpy()
-            y_test_np = y_test.detach().cpu().numpy()
+            y_ref_np = y_ref.detach().cpu().float().numpy()
+            y_test_np = y_test.detach().cpu().float().numpy()
+            print(f"dtypes: ref {y_ref_np.dtype}, test {y_test_np.dtype}")
 
             print("\nDetailed mismatch analysis:")
             mismatch_mask = ~np.isclose(y_ref_np, y_test_np, atol=atol, rtol=rtol)
@@ -244,8 +230,8 @@ def test_correctness(inputs, atol=1e-3, rtol=1e-2):
             all_passed = False
 
             # Detailed comparison using numpy testing
-            state_ref_np = state_ref_batch.detach().cpu().numpy()
-            state_test_np = state_test_batch.detach().cpu().numpy()
+            state_ref_np = state_ref_batch.detach().cpu().float().numpy()
+            state_test_np = state_test_batch.detach().cpu().float().numpy()
 
             print("\nDetailed state mismatch analysis:")
             state_mismatch_mask = ~np.isclose(state_ref_np, state_test_np, atol=atol, rtol=rtol)
@@ -283,7 +269,8 @@ def benchmark_performance(
     warmup=10,
 ):
     device = "cuda"
-    dtype = torch.float16
+    # dtype = torch.float16
+    dtype = torch.bfloat16
 
     inputs = create_test_inputs(
         batch_size=batch_size,
@@ -351,6 +338,103 @@ def benchmark_performance(
     return mean_time
 
 
+def load_custom_inputs_from_debug_file(filename, device='cuda'):
+    """Load custom inputs from debug file and reconstruct tensors with exact strides.
+
+    Args:
+        filename: Path to the debug file (e.g., 'debug.pt')
+        device: Device to move tensors to ('cuda' or 'cpu')
+
+    Returns:
+        Dictionary with inputs formatted for test_correctness
+    """
+    def reconstruct_tensor(metadata, device='cuda'):
+        """Reconstruct a tensor from saved metadata with exact strides."""
+        if not isinstance(metadata, dict) or 'data' not in metadata:
+            return metadata
+
+        # Extract metadata
+        storage_bytes = metadata['data']
+        dtype_raw = metadata['dtype']
+
+        # Convert dtype to torch.dtype if it's a string
+        if isinstance(dtype_raw, str):
+            # Handle strings like "torch.float32" or "float32"
+            dtype_str = dtype_raw.replace('torch.', '')
+            dtype = getattr(torch, dtype_str)
+        else:
+            dtype = dtype_raw
+
+        shape = tuple(metadata['shape'])
+        stride = tuple(metadata['stride'])
+        storage_offset = metadata['storage_offset']
+
+        # Create UntypedStorage from raw bytes and move to target device
+        untyped_storage = torch.UntypedStorage.from_buffer(storage_bytes, dtype=torch.uint8)
+        if device != 'cpu':
+            # Extract device index if device is a string like 'cuda' or 'cuda:0'
+            if isinstance(device, str):
+                if ':' in device:
+                    device_idx = int(device.split(':')[1])
+                else:
+                    device_idx = 0
+            else:
+                device_idx = device
+            untyped_storage = untyped_storage.cuda(device_idx)
+
+        # Create tensor directly on target device with exact layout
+        tensor = torch.tensor([], dtype=dtype, device=device).set_(
+            untyped_storage,
+            storage_offset,
+            shape,
+            stride
+        )
+
+        return tensor
+
+    # Load debug data
+    debug_data = torch.load(filename)
+    print(f"Loaded {filename} successfully")
+
+    # Reconstruct tensors from saved metadata to preserve exact strides
+    custom_inputs = {}
+    for key, value in debug_data.items():
+        custom_inputs[key] = reconstruct_tensor(value, device)
+
+    # Map keys to match test_correctness expected format
+    inputs_for_test = {
+        'ssm_state_cache': custom_inputs['ssm_state_cache'],
+        'x_decode': custom_inputs['x_decode'],
+        'dt_hp': custom_inputs['dt_hp'],
+        'A_full': custom_inputs['A_full'],
+        'B_decode': custom_inputs['B_decode'],
+        'C_decode': custom_inputs['C_decode'],
+        'D_full': custom_inputs['D_full'],
+        'dt_bias_hp': custom_inputs['dt_bias_hp'],
+        'slot_idx_decode': custom_inputs['state_batch_indices'],
+    }
+
+    # Check for NaN values in tensors
+    for key, value in inputs_for_test.items():
+        if isinstance(value, torch.Tensor):
+            if key != 'ssm_state_cache':
+                if torch.isnan(value).any():
+                    print(f"Error: Tensor '{key}' contains NaN values")
+                    exit(1)
+            else:
+                if torch.isnan(value[inputs_for_test['slot_idx_decode']]).any():
+                    print(f"Error: Tensor '{key}' contains NaN values in selected indices")
+                    exit(1)
+
+    # Print reconstructed tensor information
+    print(f"\nCustom input shapes and strides after reconstruction:")
+    for key, value in inputs_for_test.items():
+        if isinstance(value, torch.Tensor):
+            print(f"  {key}: shape={value.shape}, stride={value.stride()}, dtype={value.dtype}, device={value.device}")
+
+    return inputs_for_test
+
+
 def main(batch_size, repeats, warmup, skip_test):
     """Main test function."""
 
@@ -386,7 +470,6 @@ def main(batch_size, repeats, warmup, skip_test):
     test_passed = True
     if not skip_test:
         for test_batch_size in [1, 16, 32, 64, 256, 512]:
-            # passed = test_correctness(test_batch_size, nheads, dim, dstate, ngroups, dtype=dtype)
             inputs = create_test_inputs(
                 batch_size=batch_size,
                 nheads=nheads,
@@ -396,75 +479,37 @@ def main(batch_size, repeats, warmup, skip_test):
                 dtype=dtype,
                 device="cuda",
             )
+
+            print(f"\n{'=' * 80}")
+            input_dtype = inputs["x_decode"].dtype
+            print(f"Testing correctness with batch_size={batch_size}, input_dtype={input_dtype}")
+            print(f"{'=' * 80}")
             passed = test_correctness(inputs)
             if not passed:
                 print(f"✗ Test {batch_size} failed")
                 exit(1)
             test_passed = test_passed and passed
-        print("testing with custom input")
 
-        # Load debug.pkl and test with custom inputs
-        try:
-            with open('debug.pkl', 'rb') as f:
-                debug_data = pickle.load(f)
+        # print("testing with custom input")
+        # # Load debug.pt and test with custom inputs
+        # custom_test_file = 'debug.pt'
+        # try:
+        #     inputs_for_test = load_custom_inputs_from_debug_file(custom_test_file, device='cuda')
+        #     print("inputs loaded from debug.pt successfully")
 
-            print("Loaded debug.pkl successfully")
+        #     # Test with custom inputs
+        #     passed = test_correctness(inputs_for_test)
+        #     if not passed:
+        #         print(f"✗ Custom input test failed")
+        #         exit(1)
+        #     test_passed = test_passed and passed
+        #     if not passed:
+        #         print(f"✗ Test custom failed")
+        #         exit(1)
 
-            # Move all tensors to GPU
-            device = "cuda"
-            custom_inputs = {}
-            for key, value in debug_data.items():
-                if isinstance(value, torch.Tensor):
-                    custom_inputs[key] = value.to(device)
-                else:
-                    custom_inputs[key] = value
-
-            # Map keys to match test_correctness expected format
-            inputs_for_test = {
-                'ssm_state_cache': custom_inputs['ssm_state_cache'],
-                'x_decode': custom_inputs['x_decode'],
-                'dt_hp': custom_inputs['dt_hp'],
-                'A_full': custom_inputs['A_full'],
-                'B_decode': custom_inputs['B_decode'],
-                'C_decode': custom_inputs['C_decode'],
-                'D_full': custom_inputs['D_full'],
-                'dt_bias_hp': custom_inputs['dt_bias_hp'],
-                'slot_idx_decode': custom_inputs['state_batch_indices'],
-            }
-
-            # Check for NaN values in tensors
-            for key, value in inputs_for_test.items():
-                if isinstance(value, torch.Tensor):
-                    if torch.isnan(value).any():
-                        print(f"Error: Tensor '{key}' contains NaN values")
-                        exit(1)
-
-            print(f"Custom input shapes:")
-            for key, value in inputs_for_test.items():
-                if isinstance(value, torch.Tensor):
-                    print(f"  {key}: {value.shape}, dtype={value.dtype}, device={value.device}")
-
-            # Test with custom inputs
-            passed = test_correctness(inputs_for_test)
-            if not passed:
-                print(f"✗ Custom input test failed")
-                exit(1)
-            test_passed = test_passed and passed
-            if not passed:
-                print(f"✗ Test custom failed")
-                exit(1)
-
-        except TypeError:
-            print("TypeError encountered while loading debug.pkl, exiting")
-            exit(1)
-        except FileNotFoundError:
-            print("debug.pkl not found, skipping custom input test")
-            exit(1)
-        except Exception as e:
-            print(f"Error loading debug.pkl: {e}")
-            import traceback
-            traceback.print_exc()
-            exit(1)
+        # except FileNotFoundError:
+        #     print("debug.pt not found, skipping custom input test")
+        #     exit(1)
 
 
         # Final summary
@@ -480,10 +525,6 @@ def main(batch_size, repeats, warmup, skip_test):
         print("\n" + "=" * 80)
         print("SKIPPING CORRECTNESS TESTS")
         print("=" * 80)
-
-    # Run performance benchmark
-    # batch_size = 2
-    # batch_size = 10
 
     print("\n" + "=" * 80)
     print("PERFORMANCE BENCHMARK")

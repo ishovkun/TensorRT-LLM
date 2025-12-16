@@ -17,33 +17,34 @@ namespace tensorrt_llm::kernels
 __forceinline__ __device__ float softplus(float x)
 {
     return __logf(1.f + __expf(x));
+    // return log1pf(exp(x));
 }
 
 // Pade approximation or minimax polynomial for exp
-__device__ __forceinline__ float fast_exp_poly(float x)
-{
-    // For x in [-10, 0] range (typical for SSM)
-    // Pade [3/3] approximation
-    float x2 = x * x;
-    float num = 1.0f + x * 0.5f + x2 * 0.08333333f;
-    float den = 1.0f - x * 0.5f + x2 * 0.08333333f;
-    float result = __fdividef(num, den);
-    return result; // or adjust for better accuracy
-}
+// __device__ __forceinline__ float fast_exp_poly(float x)
+// {
+//     // For x in [-10, 0] range (typical for SSM)
+//     // Pade [3/3] approximation
+//     float x2 = x * x;
+//     float num = 1.0f + x * 0.5f + x2 * 0.08333333f;
+//     float den = 1.0f - x * 0.5f + x2 * 0.08333333f;
+//     float result = __fdividef(num, den);
+//     return result; // or adjust for better accuracy
+// }
 
-__device__ __forceinline__ float fast_exp_pade44(float x)
-{
-    // Pade [4/4] approximation - extremely high accuracy
-    float x2 = x * x;
-    float x3 = x2 * x;
-    float x4 = x2 * x2;
+// __device__ __forceinline__ float fast_exp_pade44(float x)
+// {
+//     // Pade [4/4] approximation - extremely high accuracy
+//     float x2 = x * x;
+//     float x3 = x2 * x;
+//     float x4 = x2 * x2;
 
-    float num = 1.0f + 0.5f * x + 0.083333333333f * x2 + 0.0083333333333f * x3 + 0.00059523809524f * x4;
-    float den = 1.0f - 0.5f * x + 0.083333333333f * x2 - 0.0083333333333f * x3 + 0.00059523809524f * x4;
+//     float num = 1.0f + 0.5f * x + 0.083333333333f * x2 + 0.0083333333333f * x3 + 0.00059523809524f * x4;
+//     float den = 1.0f - 0.5f * x + 0.083333333333f * x2 - 0.0083333333333f * x3 + 0.00059523809524f * x4;
 
-    return __fdividef(num, den);
-    // Coefficients: 1, 1/2, 1/12, 1/120, 1/1680
-}
+//     return __fdividef(num, den);
+//     // Coefficients: 1, 1/2, 1/12, 1/120, 1/1680
+// }
 
 __device__ __forceinline__ float fast_exp(float x)
 {
@@ -57,6 +58,39 @@ __device__ __forceinline__ float thresholded_softplus(float dt_value)
 {
     constexpr float threshold = 20.f;
     return (dt_value <= threshold) ? softplus(dt_value) : dt_value;
+}
+
+template <typename T>
+__device__ inline auto make_zero() -> T;
+
+template<>
+__device__ inline auto make_zero<float2>() -> float2
+{
+    return make_float2(0.f, 0.f);
+}
+
+template <typename compute_t, typename load_t>
+__device__ inline auto make_zeros() -> load_t {
+    load_t rValue;
+    #pragma unroll
+    for (int i = 0; i < sizeof(load_t) / sizeof(compute_t); i++)
+    {
+        auto *dst = reinterpret_cast<compute_t*>(&rValue) + i;
+        convertAndStore(dst, 0.f);
+    }
+    return rValue;
+}
+
+__device__ __forceinline__ float warpReduceSum(float val)
+{
+    constexpr auto warpSize = 32;
+    auto const lane = threadIdx.x;
+    for (int s = warpSize / 2; s > 0; s /= 2)
+    {
+        auto tmp = __shfl_down_sync(UINT32_MAX, val, s);
+        val += tmp * int(lane < s);
+    }
+    return val;
 }
 
 // Naive
@@ -186,16 +220,15 @@ __device__ __forceinline__ void cp_async_ldgsts(void* smem_dst, void const* gmem
     }
 }
 
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
+template <typename input_t, typename weight_t, typename state_t>
 struct VectorizedLoadTraits
 {};
 
 template <>
-struct VectorizedLoadTraits<__nv_bfloat16, __nv_bfloat16, float, __nv_bfloat16>
+struct VectorizedLoadTraits<__nv_bfloat16, __nv_bfloat16, __nv_bfloat16>
 {
     using input = float2;
     using weight = float2;
-    using a = float4;
     using state = float2;
     static constexpr auto chunk_size = sizeof(input) / sizeof(__nv_bfloat16);
 };
@@ -528,7 +561,7 @@ __device__ inline auto swizzle_func(int row, int col, int width, int factor) -> 
 //     for (int s = warpSize / 2; s > 0; s /= 2)
 //     {
 //         auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
-//         if (s >= lane)
+//         if (s > lane)
 //         {
 //             out_value += tmp;
 //         }
@@ -673,8 +706,8 @@ __device__ inline auto swizzle_func(int row, int col, int width, int factor) -> 
 //         for (int s = warpSize / 2; s > 0; s /= 2)
 //         {
 //             auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
-//             // out_value += tmp * int(s >= lane);
-//             if (s >= lane)
+//             // out_value += tmp * int(s > lane);
+//             if (s > lane)
 //                 out_value += tmp;
 //         }
 //         if (threadIdx.x == 0)
@@ -698,14 +731,156 @@ __device__ inline auto swizzle_func(int row, int col, int width, int factor) -> 
 //     }
 // }
 
-template <typename T>
-__device__ inline auto make_zero() -> T;
+// template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DSTATE, int numWarps>
+// __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params)
+// {
+//     auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
+//     auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);   // state: (batch, nheads, dim, dstate)
 
-template<>
-__device__ inline auto make_zero<float2>() -> float2
-{
-    return make_float2(0.f, 0.f);
-}
+//     auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
+//     auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
+//     auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);   // A: (nheads, dim, dstate)
+//     auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
+//     auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
+//     auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
+//     auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
+//     auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
+//     auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
+//     bool const dt_softplus = params.dt_softplus;
+
+//     int const nheads = params.nheads;
+//     int const ngroups = params.ngroups;
+//     int const dim = params.dim;
+
+//     constexpr auto warpSize = 32;
+//     auto const dim_offset = blockIdx.x * warpSize * numWarps;
+//     auto const batch = blockIdx.y;
+//     auto const head = blockIdx.z;
+//     auto const group = head / (nheads / ngroups);
+//     auto lane = threadIdx.x % warpSize;
+//     auto warp = threadIdx.y;
+
+//     auto const batch_idx = (state_batch_indices) ? state_batch_indices[batch] : batch;
+//     state += batch_idx * nheads * dim * DSTATE;
+
+//     /*
+//      *  Idea: each thread just
+//      * - separate: somehow load 1d arrays: D, C, x
+//      * - loads an element state[m, d], dA[m, d]
+//      * - update state[m, d] = state[m, d] * dA[m, d] + dB[M, d] * x[M]
+//      * - compute (state[m, d] * C[d]) + reduce along d dimension
+//      */
+
+//     __shared__ input_t sx[numWarps*warpSize];
+//     __shared__ float sdt[numWarps*warpSize];
+//     __shared__ weight_t sz[numWarps*warpSize];
+//     __shared__ input_t sD[numWarps*warpSize];
+
+//     if (dim_offset + warp*warpSize + threadIdx.x < dim)
+//     {
+//         auto _d = warp*warpSize + threadIdx.x;
+//         auto d = dim_offset + _d;
+//         // x: (batch, nheads, dim)
+//         auto const x_offset = (batch * nheads + head) * dim + d;
+//         sx[_d] = x[x_offset];
+
+//         // dt: (batch, nheads, dim)
+//         auto const dt_offset = x_offset;
+//         auto dt_value = toFloat(dt[dt_offset]);
+//         if (dt_bias)
+//             dt_value += toFloat(dt_bias[head * dim + d]);
+//         if (dt_softplus)
+//             dt_value = thresholded_softplus(dt_value);
+//         sdt[_d] = dt_value;
+
+//         sz[_d] = z ? z[batch * nheads * dim + head * dim + d] : (weight_t) 0.f;
+//         sD[_d] = D ? D[head * dim + d] : (input_t) 0.f;
+//     }
+
+//     // using load_t = float2;
+//     // using load_t = float4;
+//     // using loadA_t = float4;
+//     // static_assert(sizeof(weight_t) == sizeof(input_t));
+//     // static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
+//     // using loadA_t = (sizeof(matrixA_t) == 2) ? float2 : float4;
+//     // static_assert(sizeof(loadA_t) / sizeof(matrixA_t) == vectorizedLoadSize);
+
+//     // static constexpr VectorizedLoadTraits<input_t, weight_t, matrixA_t, state_t> load_t;
+//     using Load = VectorizedLoadTraits<input_t, weight_t, matrixA_t, state_t>;
+
+//     for (auto _d = warp*warpSize; _d < (warp+1)*warpSize; _d++)
+//     {
+//         auto d = dim_offset + _d;
+//         float dt_value = sdt[_d];
+//         float x_value = toFloat(sx[_d]);
+//         float out_value = toFloat(sD[_d]) * x_value * int(lane == 0); // first lane has the value
+
+//         for (int i = threadIdx.x * Load::chunk_size; i < DSTATE; i += warpSize * Load::chunk_size)
+//         {
+//             auto rA = *reinterpret_cast<typename Load::a const*>(&A[head * dim * DSTATE + d * DSTATE + i]);
+//             auto rState = *reinterpret_cast<typename Load::state*>(&state[head * dim * DSTATE + d * DSTATE + i]);
+//             auto rB = *reinterpret_cast<typename Load::input const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
+//             auto rC = *reinterpret_cast<typename Load::input const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
+
+//             auto const* A_vals = reinterpret_cast<matrixA_t const*>(&rA);
+//             auto* state_vals = reinterpret_cast<state_t*>(&rState);
+//             auto const* B_vals = reinterpret_cast<input_t const*>(&rB);
+//             auto const* C_vals = reinterpret_cast<input_t const*>(&rC);
+
+//             for (int ii = 0; ii < Load::chunk_size; ii++)
+//             {
+//                 auto A_value = toFloat(A_vals[ii]);
+//                 auto state_value = toFloat(state_vals[ii]);
+//                 auto B_value = toFloat(B_vals[ii]);
+//                 auto C_value = toFloat(C_vals[ii]);
+
+//                 // auto const dA = __expf(A_value * dt_value);
+//                 auto const dA = fast_exp(A_value * dt_value);
+//                 // auto const dA = fast_exp_poly(A_value * dt_value);
+//                 // auto const dA = fast_exp_pade44(A_value * dt_value);
+//                 auto const dB = B_value * dt_value;
+//                 auto const new_state = state_value * dA + dB * x_value;
+//                 convertAndStore(&state_vals[ii], new_state);
+
+//                 // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warp == 0 && threadIdx.x == 0 && warp == 0 && d == 0 && i == 0 && ii == 0) {
+//                 //     printf("d = %d i = %d old_state = %f new_state = %f \n", d, i, state_value, new_state);
+//                 // }
+
+//                 out_value += new_state * C_value;
+//             }
+//             *reinterpret_cast<typename Load::state*>(&state[head * dim * DSTATE + d * DSTATE + i]) = rState;
+//         }
+
+//         // warpReduce the out_value
+//         for (int s = warpSize / 2; s > 0; s /= 2)
+//         {
+//             auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
+//             // out_value += tmp * int(s > lane);
+//             if (s > lane)
+//                 out_value += tmp;
+//         }
+//         if (lane == 0)
+//         {
+//             sdt[_d] = out_value;
+//         }
+//     }
+
+//     auto _d = threadIdx.y * warpSize + threadIdx.x;
+//     auto d = dim_offset + _d;
+//     if (d < dim)
+//     {
+//         auto out_value = sdt[_d];
+//         if (z)
+//         {
+//             float z_value = toFloat(sz[_d]);
+//             float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+//             float silu_z = z_value * sig_z;
+//             out_value *= silu_z;
+//         }
+//         auto const x_offset = (batch * nheads + head) * dim + d;
+//         convertAndStore(&output[x_offset], out_value);
+//     }
+// }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DSTATE, int numWarps>
 __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams params)
@@ -714,12 +889,12 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);   // state: (batch, nheads, dim, dstate)
 
     auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
-    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
-    auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);   // A: (nheads, dim, dstate)
+    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads)
+    auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);   // A: (nheads)
     auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
     auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
     auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
-    auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
+    auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias); // (nheads)
     auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
     auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
     bool const dt_softplus = params.dt_softplus;
@@ -736,116 +911,145 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
     auto lane = threadIdx.x % warpSize;
     auto warp = threadIdx.y;
 
-    auto const batch_idx = (state_batch_indices) ? state_batch_indices[batch] : batch;
-    state += batch_idx * nheads * dim * DSTATE;
-
-    /*
-     *  Idea: each thread just
-     * - separate: somehow load 1d arrays: D, C, x
-     * - loads an element state[m, d], dA[m, d]
-     * - update state[m, d] = state[m, d] * dA[m, d] + dB[M, d] * x[M]
-     * - compute (state[m, d] * C[d]) + reduce along d dimension
-     */
+    auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
+    state += state_batch * nheads * dim * DSTATE + head * dim * DSTATE;
 
     __shared__ input_t sx[numWarps*warpSize];
     __shared__ float sdt[numWarps*warpSize];
     __shared__ weight_t sz[numWarps*warpSize];
-    __shared__ input_t sD[numWarps*warpSize];
 
-    if (dim_offset + warp*warpSize + threadIdx.x < dim)
-    {
-        auto _d = warp*warpSize + threadIdx.x;
-        auto d = dim_offset + _d;
-        // x: (batch, nheads, dim)
-        auto const x_offset = (batch * nheads + head) * dim + d;
-        sx[_d] = x[x_offset];
+    auto const A_value = toFloat(A[head]);
 
-        // dt: (batch, nheads, dim)
-        auto const dt_offset = x_offset;
-        auto dt_value = toFloat(dt[dt_offset]);
-        if (dt_bias)
-            dt_value += toFloat(dt_bias[head * dim + d]);
-        if (dt_softplus)
-            dt_value = thresholded_softplus(dt_value);
-        sdt[_d] = dt_value;
-
-        sz[_d] = z ? z[batch * nheads * dim + head * dim + d] : (weight_t) 0.f;
-        sD[_d] = D ? D[head * dim + d] : (input_t) 0.f;
+    auto dt_value = toFloat(dt[batch*params.dt_stride_batch + head]);
+    if (dt_bias)
+        dt_value += toFloat(dt_bias[head]);
+    if (dt_softplus) {
+        dt_value = thresholded_softplus(dt_value);
     }
 
-    // using load_t = float2;
-    // using load_t = float4;
-    // using loadA_t = float4;
-    // static_assert(sizeof(weight_t) == sizeof(input_t));
-    // static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
-    // using loadA_t = (sizeof(matrixA_t) == 2) ? float2 : float4;
-    // static_assert(sizeof(loadA_t) / sizeof(matrixA_t) == vectorizedLoadSize);
+    // auto const dA = fast_exp(A_value * dt_value);
+    auto const dA = __expf(A_value * dt_value);
+    // auto const dA = exp(A_value * dt_value);
 
-    // static constexpr VectorizedLoadTraits<input_t, weight_t, matrixA_t, state_t> load_t;
-    using Load = VectorizedLoadTraits<input_t, weight_t, matrixA_t, state_t>;
+    auto d_value = D ? toFloat(D[head]) : 0.f;
+
+    auto _d = warp*warpSize + lane;
+    auto d = dim_offset + _d;
+    if (d < dim)
+    {
+        sx[_d] = x[batch * params.x_stride_batch +  head * dim + d];
+        if (z) {
+            sz[_d] = z[batch * nheads * dim + head * dim + d];
+        }
+        else {
+            convertAndStore(&sz[_d], 0.f);
+        }
+    }
+    else {
+        convertAndStore(&sx[_d], 0.f);
+        convertAndStore(&sz[_d], 0.f);
+    }
+
+    // for (auto _d = warp*warpSize; _d < (warp+1)*warpSize; _d += numWarps * warpSize) {
+    //     auto d = dim_offset + _d;
+    //     if (d < dim) {
+    //         sx[_d] = x[batch * params.x_stride_batch +  head * dim + d];
+    //     }
+    //     else {
+    //         convertAndStore(&sx[_d], 0.f);
+    //     }
+    // }
+
+    // if (z) {
+    //     for (auto _d = warp*warpSize; _d < (warp+1)*warpSize; _d += numWarps * warpSize) {
+    //         auto d = dim_offset + _d;
+    //         if (d < dim) {
+    //             sz[_d] = z[batch * nheads * dim + head * dim + d];
+    //         }
+    //         else {
+    //             convertAndStore(&sz[_d], 0.f);
+    //         }
+    //     }
+    // }
+    // else {
+    //     for (auto _d = warp*warpSize; _d < (warp+1)*warpSize; _d += numWarps * warpSize) {
+    //         convertAndStore(&sz[_d], 0.f);
+    //     }
+    // }
+
+    using Load = VectorizedLoadTraits<input_t, weight_t, state_t>;
 
     for (auto _d = warp*warpSize; _d < (warp+1)*warpSize; _d++)
     {
         auto d = dim_offset + _d;
-        float dt_value = sdt[_d];
+        if (d >= dim) break;
+
         float x_value = toFloat(sx[_d]);
-        float out_value = toFloat(sD[_d]) * x_value * int(lane == 0); // first lane has the value
+        float out_value = d_value * x_value * int(lane == 0); // first lane has the value
 
         for (int i = threadIdx.x * Load::chunk_size; i < DSTATE; i += warpSize * Load::chunk_size)
         {
-            auto rA = *reinterpret_cast<typename Load::a const*>(&A[head * dim * DSTATE + d * DSTATE + i]);
-            auto rState = *reinterpret_cast<typename Load::state*>(&state[head * dim * DSTATE + d * DSTATE + i]);
-            auto rB = *reinterpret_cast<typename Load::input const*>(&B[batch * ngroups * DSTATE + group * DSTATE + i]);
-            auto rC = *reinterpret_cast<typename Load::input const*>(&C[batch * ngroups * DSTATE + group * DSTATE + i]);
+            auto rState = make_zeros<state_t, Load::state>();
+            if (state_batch != params.pad_slot_id)
+                rState = *reinterpret_cast<typename Load::state*>(&state[d * DSTATE + i]);
+            auto rB = *reinterpret_cast<typename Load::input const*>(&B[batch * params.B_stride_batch + group * DSTATE + i]);
+            auto rC = *reinterpret_cast<typename Load::input const*>(&C[batch * params.C_stride_batch + group * DSTATE + i]);
 
-            auto const* A_vals = reinterpret_cast<matrixA_t const*>(&rA);
             auto* state_vals = reinterpret_cast<state_t*>(&rState);
             auto const* B_vals = reinterpret_cast<input_t const*>(&rB);
             auto const* C_vals = reinterpret_cast<input_t const*>(&rC);
 
             for (int ii = 0; ii < Load::chunk_size; ii++)
             {
-                auto A_value = toFloat(A_vals[ii]);
                 auto state_value = toFloat(state_vals[ii]);
                 auto B_value = toFloat(B_vals[ii]);
                 auto C_value = toFloat(C_vals[ii]);
 
-                // auto const dA = __expf(A_value * dt_value);
-                auto const dA = fast_exp(A_value * dt_value);
-                // auto const dA = fast_exp_poly(A_value * dt_value);
-                // auto const dA = fast_exp_pade44(A_value * dt_value);
                 auto const dB = B_value * dt_value;
                 auto const new_state = state_value * dA + dB * x_value;
                 convertAndStore(&state_vals[ii], new_state);
 
-                // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && warp == 0 && threadIdx.x == 0 && warp == 0 && d == 0 && i == 0 && ii == 0) {
-                //     printf("d = %d i = %d old_state = %f new_state = %f \n", d, i, state_value, new_state);
-                // }
-
                 out_value += new_state * C_value;
+                // if ((isinf(out_value) || isnan(out_value)))
+                // {
+                //     // printf("WARNING: out_value = %f at batch=%d, head=%d, warp=%d, lane=%d\n", out_value, batch, head, warp, lane);
+                //     printf("Bad value = %f: state = %f dA =%f dB = %f C = %f x = %f new_state = %f\n",
+                //             out_value, state_value, dA, dB, C_value, x_value, new_state);
+                // }
             }
-            *reinterpret_cast<typename Load::state*>(&state[head * dim * DSTATE + d * DSTATE + i]) = rState;
+            if (state_batch != params.pad_slot_id)
+                *reinterpret_cast<typename Load::state*>(&state[d * DSTATE + i]) = rState;
         }
 
         // warpReduce the out_value
-        for (int s = warpSize / 2; s > 0; s /= 2)
-        {
-            auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
-            // out_value += tmp * int(s >= lane);
-            if (s >= lane)
-                out_value += tmp;
-        }
+        out_value = warpReduceSum(out_value);
         if (lane == 0)
         {
             sdt[_d] = out_value;
         }
     }
 
-    auto _d = threadIdx.y * warpSize + threadIdx.x;
-    auto d = dim_offset + _d;
+    // for (auto _d = warp*warpSize; _d < (warp+1)*warpSize; _d += numWarps * warpSize) {
+    //     auto d = dim_offset + _d;
+    //     if (d >= dim) break;
+    //     auto out_value = sdt[_d];
+    //     if (z)
+    //     {
+    //         float z_value = toFloat(sz[_d]);
+    //         float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+    //         float silu_z = z_value * sig_z;
+    //         out_value *= silu_z;
+    //     }
+    //     convertAndStore(&output[batch * nheads* dim +  head * dim + d], out_value);
+    // }
+
     if (d < dim)
     {
         auto out_value = sdt[_d];
+        // if (isinf(out_value) || isnan(out_value))
+        // {
+        //     printf("WARNING: out_value = %f at batch=%d, head=%d, warp=%d, lane=%d\n", batch, head, warp, lane);
+        // }
         if (z)
         {
             float z_value = toFloat(sz[_d]);
@@ -853,22 +1057,24 @@ __global__ void selective_state_update_kernel_simple(SelectiveStateUpdateParams 
             float silu_z = z_value * sig_z;
             out_value *= silu_z;
         }
-        auto const x_offset = (batch * nheads + head) * dim + d;
-        convertAndStore(&output[x_offset], out_value);
+        // convertAndStore(&output[batch * params.x_stride_batch +  head * dim + d], out_value);
+        // I assume that output is contiguous... but is it ? :-)
+        // convertAndStore(&output[batch * nheads* dim +  head * dim + d], out_value);
+        convertAndStore(&output[batch * params.out_stride_batch +  head * dim + d], out_value);
     }
 }
 
 
-template <typename input_t, typename weight_t, int rowsPerStage, int DSTATE, uint8_t numStages>
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int rowsPerStage, int dim, int dstate, uint8_t numStages>
 struct SharedStorage {
-  alignas(128) weight_t A[numStages][rowsPerStage * DSTATE];
-  alignas(128) input_t state[numStages][rowsPerStage * DSTATE];
-  input_t x[64];
-  float dt[64];
-  weight_t z[64];
-  input_t D[64];
-  weight_t B[DSTATE];
-  weight_t C[DSTATE];
+  alignas(128) matrixA_t A[numStages][rowsPerStage * dstate];
+  alignas(128) state_t state[numStages][rowsPerStage * dstate];
+  input_t x[dim];
+  float dt[dim]; // dt is special cause we're gonna store input in there as well
+  input_t z[dim];
+  input_t D[dim];
+  input_t B[dstate];
+  input_t C[dstate];
 
   using barrier_t = cuda::barrier<cuda::thread_scope_block>;
   barrier_t bar_empty[numStages];
@@ -876,17 +1082,17 @@ struct SharedStorage {
   barrier_t bar_consumers;
 };
 
-template <typename input_t, typename weight_t, int DSTATE, int consumerWarps, int rowsPerStage, int numStages = 1>
+template <typename input_t, typename weight_t, typename matrixA_t, typename state_t,
+            int DIM, int DSTATE, int consumerWarps, int rowsPerStage, int numStages = 1>
 __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUpdateParams params,
-    __grid_constant__ CUtensorMap const tensorA,
-    __grid_constant__ CUtensorMap const tensorState)
+                                                                __grid_constant__ CUtensorMap const tensorA,
+                                                                __grid_constant__ CUtensorMap const tensorState)
 {
     auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
-    auto* __restrict__ state = reinterpret_cast<input_t*>(params.state);   // state: (batch, nheads, dim, dstate)
+    auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);   // state: (batch, nheads, dim, dstate)
 
     auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
     auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
-    // auto const* __restrict__ A = reinterpret_cast<weight_t const*>(params.A);   // A: (nheads, dim, dstate)
     auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
     auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
     auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
@@ -915,7 +1121,7 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
         return;
     }
 
-    using sram_t = SharedStorage<input_t, weight_t, rowsPerStage, DSTATE, numStages>;
+    using sram_t = SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE, numStages>;
     __shared__ sram_t sram;
 
     namespace cde = cuda::device::experimental;
@@ -947,8 +1153,8 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                     tma_copy(&sram.state[stage][0], &tensorState, /*x*/ 0, /*y*/ state_offset + d, sram.bar_full[stage]);
 
                     // Unblock the consumers
-                    auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(input_t);
-                    auto constexpr bytesA = rowsPerStage * DSTATE * sizeof(weight_t);
+                    auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(state_t);
+                    auto constexpr bytesA = rowsPerStage * DSTATE * sizeof(matrixA_t);
                     auto constexpr bytesToArrive = bytesState + bytesA;
                     auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
                 });
@@ -1062,7 +1268,8 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                     out_value += new_state * C_value;
                 }
 
-                for (int i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
+                constexpr auto state_chunk = sizeof(load_t) / sizeof(state_t);
+                for (int i = lane * state_chunk; i < DSTATE; i += warpSize * state_chunk)
                 {
                     auto const * src = reinterpret_cast<load_t*>(&sram.state[stage][dd * DSTATE + i]);
                     auto * dst = reinterpret_cast<load_t*>(&state[state_batch * nheads * dim * DSTATE + head * dim * DSTATE + d * DSTATE + i]);
@@ -1073,7 +1280,7 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                 for (int s = warpSize / 2; s > 0; s /= 2)
                 {
                     auto tmp = __shfl_down_sync(UINT32_MAX, out_value, s);
-                    out_value += tmp * int(s >= lane);
+                    out_value += tmp * int(s > lane);
                 }
 
                 if (lane == 0)
@@ -1099,8 +1306,8 @@ __global__ void selective_state_update_kernel_producer_consumer(SelectiveStateUp
                 float silu_z = z_value * sig_z;
                 out_value *= silu_z;
             }
-            auto const x_offset = (batch * nheads + head) * dim + d;
-            convertAndStore(&output[x_offset], out_value);
+            auto const x_offset = batch * params.out_stride_batch +  head * dim + d;
+            convertAndStore(&output[(batch * nheads + head) * dim + d], out_value);
         }
 
     }
@@ -1110,90 +1317,64 @@ template <typename input_t, typename weight_t, typename matrixA_t, typename stat
 void invokeSelectiveStateUpdate(
     SelectiveStateUpdateParams& params, cudaStream_t stream, SelectiveStateUpdateKernelType kernelType)
 {
-    TLLM_CHECK(params.dstate % 16 == 0);
     constexpr int DSTATE = 128;
     TLLM_CHECK(params.dstate == DSTATE);
-    // if (kernelType == SelectiveStateUpdateKernelType::naive)
-    // {
-    //     constexpr int channels_per_block = 128;
-    //     int const blocks_per_dim = (params.dim + channels_per_block - 1) / channels_per_block;
-    //     dim3 block(channels_per_block, 1);
-    //     dim3 grid(blocks_per_dim, params.batch, params.nheads);
 
-    //     TLLM_CHECK(params.dstate % 16 == 0);
-
-    //     TLLM_CHECK(params.dstate == DSTATE);
-    //     selective_state_update_kernel<input_t, weight_t, DSTATE, channels_per_block>
-    //         <<<grid, block, 0, stream>>>(params);
-    // }
-    // if (kernelType == SelectiveStateUpdateKernelType::optimized)
-    // {
-    //     constexpr int channels_per_block = 64;
-    //     // constexpr int channels_per_block = 128;
-    //     constexpr int block_size = 128;
-    //     int const blocks_per_dim = (params.dim + channels_per_block - 1) / channels_per_block;
-    //     dim3 block(block_size, 1);
-    //     dim3 grid(blocks_per_dim, params.batch, params.nheads);
-
-    //     selective_state_update_kernel_opt<input_t, weight_t, DSTATE, block_size, channels_per_block>
-    //         <<<grid, block, 0, stream>>>(params);
-    // }
     if (kernelType == SelectiveStateUpdateKernelType::simple)
     {
         constexpr int numWarps = 2;
-        int const blocks_per_dim = params.dim / (32 * numWarps);
+        int const blocks_per_dim = (params.dim + 32*numWarps - 1) / (32 * numWarps);
         dim3 block(32, numWarps);
         dim3 grid(blocks_per_dim, params.batch, params.nheads);
         selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, DSTATE, numWarps><<<grid, block, 0, stream>>>(params);
     }
-    // else if (kernelType == SelectiveStateUpdateKernelType::simple3)
-    // {
-    //     constexpr int numWarps = 2;
-    //     int const blocks_per_dim = params.dim / (32 * numWarps);
-    //     dim3 block(32, numWarps);
-    //     dim3 grid(blocks_per_dim, params.batch, params.nheads);
-    //     selective_state_update_kernel_simple3<input_t, weight_t, DSTATE, numWarps><<<grid, block, 0, stream>>>(params);
-    // }
-    // else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer)
-    // {
-    //     constexpr auto numConsumers = 2;
-    //     constexpr auto numWarps = 1 + numConsumers;
-    //     constexpr auto numStages = 2;
-    //     constexpr auto rowsPerStage = 4 * numConsumers;
-    //     auto scan_func = selective_state_update_kernel_producer_consumer<input_t, weight_t, DSTATE,
-    //     numConsumers, rowsPerStage, numStages>;
+    else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer)
+    {
+        constexpr auto numConsumers = 2;
+        constexpr auto numWarps = 1 + numConsumers;
+        constexpr auto numStages = 2;
+        constexpr auto rowsPerStage = 4 * numConsumers;
+        constexpr auto DIM = 64;
+        TLLM_CHECK(params.dim == DIM);
+        auto scan_func =
+            selective_state_update_kernel_producer_consumer<input_t, weight_t, matrixA_t, state_t,
+                                                            DIM, DSTATE, numConsumers, rowsPerStage,
+                                                            numStages>;
 
-    //     dim3 block(32, numWarps);
-    //     dim3 grid(params.batch, params.nheads);
+        dim3 block(32, numWarps);
+        dim3 grid(params.batch, params.nheads);
 
-    //     // batchedGemm::trtllm::gen::Dtype A_dtype;
-    //     // if constexpr (weight_t == half) {
-    //     //     A_dtype = batchedGemm::trtllm::gen::Dtype::FP16;
-    //     // } else if constexpr (weight_t == float) {
-    //     //     A_dtype = batchedGemm::trtllm::gen::Dtype::FP32;
-    //     // } else {
-    //     //     TLLM_CHECK(false);
-    //     // }
+        // batchedGemm::trtllm::gen::Dtype A_dtype;
+        // if constexpr (weight_t == half) {
+        //     A_dtype = batchedGemm::trtllm::gen::Dtype::FP16;
+        // } else if constexpr (weight_t == float) {
+        //     A_dtype = batchedGemm::trtllm::gen::Dtype::FP32;
+        // } else {
+        //     TLLM_CHECK(false);
+        // }
 
-    //     auto nh = params.nheads;
-    //     auto dim = params.dim;
-    //     // auto b = params.batch;
-    //     auto B = params.state_cache_size;
-    //     TLLM_CHECK(reinterpret_cast<uintptr_t>(params.A) % 128 == 0);
-    //     auto tensorA = tma::createTensorMap<weight_t>(params.A, nh*dim, DSTATE, rowsPerStage, DSTATE);
-    //     auto tensorState = tma::createTensorMap<input_t>(params.state, B*nh*dim, DSTATE, rowsPerStage, DSTATE);
-    //     TLLM_CHECK(params.dim % rowsPerStage == 0);
+        auto nh = params.nheads;
+        auto dim = params.dim;
+        // auto b = params.batch;
+        auto B = params.state_cache_size;
 
-    //     // using namespace batchGemm::gemm;
-    //     // namespace tg = trtllm::gen;
-    //     // std::vector<uint64_t> A_shapes = {dstate, dim, nheads};
-    //     // std::vector<uint64_t> A_strides = {1, dstate, dstate*dim};
-    //     // std::vector<int32_t> A_tile_shapes = {dstate, rowsPerStage};
-    //     // auto tensorA = batchedGemm::gemm::buildNdTmaDescriptor(A_dtype, MmaKind::Auto, A_shapes, A_strides, A_tile_shapes,
-    //     //    params.A, /*doSwizzle */ false);
+        TLLM_CHECK(reinterpret_cast<uintptr_t>(params.A) % 128 == 0); // TMA requires 128B aligned
+        auto tensorA = tma::createTensorMap<matrixA_t>(params.A, nh*dim, DSTATE, rowsPerStage, DSTATE);
 
-    //     scan_func<<<grid, block, 0, stream>>>(params, tensorA, tensorState);
-    // }
+        TLLM_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 == 0); // TMA requires 128B aligned
+        auto tensorState = tma::createTensorMap<state_t>(params.state, B*nh*dim, DSTATE, rowsPerStage, DSTATE);
+        TLLM_CHECK(params.dim % rowsPerStage == 0);
+
+        // using namespace batchGemm::gemm;
+        // namespace tg = trtllm::gen;
+        // std::vector<uint64_t> A_shapes = {dstate, dim, nheads};
+        // std::vector<uint64_t> A_strides = {1, dstate, dstate*dim};
+        // std::vector<int32_t> A_tile_shapes = {dstate, rowsPerStage};
+        // auto tensorA = batchedGemm::gemm::buildNdTmaDescriptor(A_dtype, MmaKind::Auto, A_shapes, A_strides, A_tile_shapes,
+        //    params.A, /*doSwizzle */ false);
+
+        scan_func<<<grid, block, 0, stream>>>(params, tensorA, tensorState);
+    }
     else
     {
         TLLM_CHECK(false && "Unsupported SelectiveStateUpdateKernelType");
