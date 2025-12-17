@@ -9,7 +9,7 @@ import pandas as pd
 from test_scan import main
 
 # Powers of two from 1 to 256
-batch_sizes = [2**i for i in range(10)]  # 1, 2, 4, 8, 16, 32, 64, 128, 256
+batch_sizes = [2**i for i in range(12)]
 
 all_results = []
 
