@@ -87,8 +87,7 @@ __device__ __forceinline__ float warpReduceSum(float val)
     auto const lane = threadIdx.x;
     for (int s = warpSize / 2; s > 0; s /= 2)
     {
-        auto tmp = __shfl_down_sync(UINT32_MAX, val, s);
-        val += tmp * int(lane < s);
+        val += __shfl_down_sync(UINT32_MAX, val, s);
     }
     return val;
 }
