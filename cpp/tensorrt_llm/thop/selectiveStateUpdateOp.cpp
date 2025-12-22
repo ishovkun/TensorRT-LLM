@@ -354,6 +354,24 @@ auto run_selective_state_update_producer_consumer(th::Tensor const& state, th::T
         pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer);
 }
 
+auto run_selective_state_update_producer_consumer_writeback(th::Tensor const& state, th::Tensor const& x, th::Tensor const& dt,
+    th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D, std::optional<th::Tensor> z,
+    std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
+    int64_t pad_slot_id) -> th::Tensor
+{
+    return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
+        pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer_writeback);
+}
+
+auto run_selective_state_update_producer_consumer_serial(th::Tensor const& state, th::Tensor const& x, th::Tensor const& dt,
+    th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D, std::optional<th::Tensor> z,
+    std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
+    int64_t pad_slot_id) -> th::Tensor
+{
+    return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
+        pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer_serial);
+}
+
 } // end namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -378,10 +396,32 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? state_batch_indices,"
         "int pad_slot_id"
         ") -> Tensor");
+    m.def(
+        "selective_state_update_producer_consumer_writeback("
+        "Tensor state, Tensor x, Tensor dt, "
+        "Tensor A, Tensor B, Tensor C, Tensor D, "
+        "Tensor? z, "
+        "Tensor? dt_bias,"
+        "bool dt_softplus,"
+        "Tensor? state_batch_indices,"
+        "int pad_slot_id"
+        ") -> Tensor");
+    m.def(
+        "selective_state_update_producer_consumer_serial("
+        "Tensor state, Tensor x, Tensor dt, "
+        "Tensor A, Tensor B, Tensor C, Tensor D, "
+        "Tensor? z, "
+        "Tensor? dt_bias,"
+        "bool dt_softplus,"
+        "Tensor? state_batch_indices,"
+        "int pad_slot_id"
+        ") -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("selective_state_update_simple", &torch_ext::run_selective_state_update_simple);
     m.impl("selective_state_update_producer_consumer", &torch_ext::run_selective_state_update_producer_consumer);
+    m.impl("selective_state_update_producer_consumer_writeback", &torch_ext::run_selective_state_update_producer_consumer_writeback);
+    m.impl("selective_state_update_producer_consumer_serial", &torch_ext::run_selective_state_update_producer_consumer_serial);
 }
