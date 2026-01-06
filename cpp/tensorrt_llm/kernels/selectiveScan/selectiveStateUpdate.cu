@@ -1,5 +1,5 @@
-#include "conversion.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/selectiveScan/conversion.h"
 #include "tensorrt_llm/kernels/selectiveScan/selectiveStateUpdate.h"
 // #include "tensorrt_llm/kernels/trtllmGenKernels/fmha/kernelParams.h"
 #include "tmaDescriptor.cuh"
@@ -1555,7 +1555,6 @@ __global__ void selective_state_update_kernel_producer_consumer_serial(
 
     int const nheads = params.nheads;
     int const ngroups = params.ngroups;
-    int const dim = params.dim;
 
     constexpr auto warpSize = 32;
     constexpr auto numWarps = 1 + consumerWarps;
@@ -1577,7 +1576,8 @@ __global__ void selective_state_update_kernel_producer_consumer_serial(
 
     for (int stage = warp; stage < numStages; stage += numWarps)
     {
-        if (lane > 0) continue;
+        if (lane > 0)
+            continue;
         constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
         init(&sram.bar_empty[stage], num_arrivals);
         init(&sram.bar_full[stage], num_arrivals);
@@ -1592,9 +1592,10 @@ __global__ void selective_state_update_kernel_producer_consumer_serial(
 
     if (warp == consumerWarps)
     {
-        auto const state_offset = (state_batch * nheads + head) * dim;
+        auto const state_offset = (state_batch * nheads + head) * DIM;
 
-        for (int i = 0, stage = 0; i < DSTATE + colsPerStage * numStages; i += colsPerStage, stage = (stage + 1) % numStages)
+        for (int i = 0, stage = 0; i < DSTATE + colsPerStage * numStages;
+             i += colsPerStage, stage = (stage + 1) % numStages)
         {
             if (lane == 0)
             {
@@ -1683,20 +1684,29 @@ __global__ void selective_state_update_kernel_producer_consumer_serial(
 
         sram.bar_consumers.wait(sram.bar_consumers.arrive());
 
-        // Thread computes a row of x
-        auto const d = warp * warpSize + lane;
-        auto const x_value = toFloat(x[batch * params.x_stride_batch + head * dim + d]);
-        auto const z_value = z ? toFloat(z[batch * nheads * dim + head * dim + d]) : 0.f;
-        float out_value = toFloat(d_value) * x_value;
+        // Thread
+
+        constexpr auto lanesPerRow = (consumerWarps * warpSize) / DIM;
+        static_assert(lanesPerRow >= 1);
+        constexpr auto rowsPerWarp = warpSize / lanesPerRow;
+        auto const group = lane % rowsPerWarp;
+        auto const member = lane / rowsPerWarp;
+        auto const d = warp * rowsPerWarp + group;
+        constexpr auto itemsPerThread = colsPerStage / lanesPerRow;
+        auto const x_value = toFloat(x[batch * params.x_stride_batch + head * DIM + d]);
+        auto const z_value = z ? toFloat(z[batch * nheads * DIM + head * DIM + d]) : 0.f;
+        // float out_value = d_value * x_value;
+        float out_value = 0.f;
+#pragma unroll 1
         for (int iBegin = 0, stage = 0; iBegin < DSTATE; iBegin += colsPerStage, stage = (stage + 1) % numStages)
         {
             // wait for the producer
             sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
 
-            for (int ii = 0; ii < colsPerStage; ii++)
+            for (int item = 0; item < itemsPerThread; item++)
             {
-                auto const state_value
-                    = (state_batch != params.pad_slot_id) ? toFloat(sram.state[stage][d * colsPerStage + ii]) : 0.f;
+                auto const ii = (item + member*itemsPerThread + (group / 4)*2) % colsPerStage;
+                auto const state_value = (state_batch != params.pad_slot_id) ? toFloat(sram.state[stage][d * colsPerStage + ii]) : 0.f;
 
                 auto const i = iBegin + ii;
                 auto const B_value = toFloat(sram.B[i]);
@@ -1715,14 +1725,24 @@ __global__ void selective_state_update_kernel_producer_consumer_serial(
             auto _ = sram.bar_empty[stage].arrive();
         }
 
-        // Write output
-        if (z)
-        {
-            float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
-            float silu_z = z_value * sig_z;
-            out_value *= silu_z;
+        for (int s = lanesPerRow / 2; s > 0; s /= 2) {
+            out_value += __shfl_down_sync(UINT32_MAX, out_value, s);
         }
-        convertAndStore(&output[batch * params.out_stride_batch + head * dim + d], out_value);
+        // out_value += __shfl_down_sync(UINT32_MAX, out_value, 1);
+
+        if (group == 0)
+        {
+            out_value += d_value * x_value;
+
+            // Write output
+            if (z)
+            {
+                float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
+                float silu_z = z_value * sig_z;
+                out_value *= silu_z;
+            }
+            convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], out_value);
+        }
     }
 }
 
@@ -1961,19 +1981,22 @@ __global__ void selective_state_update_kernel_producer_consumer_serial(
 // }
 
 template <typename KernelFunc>
-void request_sram_if_needed(KernelFunc kernel, size_t sram_required) {
-  int max_sram;
-  cudaDeviceGetAttribute(&max_sram, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-  if (sram_required > max_sram) {
-    std::cerr << "Warning: Requested shared memory " << sram_required
-              << " exceeds the default maximum " << max_sram << std::endl;
-    std::cerr << "Trying to bump up the maximum: " << std::endl;
-    auto check = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sram_required);
-    if (check != cudaSuccess) {
-      std::cerr << "Failed to set dynamic shared memory size: " << sram_required << std::endl;
-      throw std::runtime_error("Failed to set dynamic shared memory size");
+void request_sram_if_needed(KernelFunc kernel, size_t sram_required)
+{
+    int max_sram;
+    cudaDeviceGetAttribute(&max_sram, cudaDevAttrMaxSharedMemoryPerBlock, 0);
+    if (sram_required > max_sram)
+    {
+        std::cerr << "Warning: Requested shared memory " << sram_required << " exceeds the default maximum " << max_sram
+                  << std::endl;
+        std::cerr << "Trying to bump up the maximum: " << std::endl;
+        auto check = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sram_required);
+        if (check != cudaSuccess)
+        {
+            std::cerr << "Failed to set dynamic shared memory size: " << sram_required << std::endl;
+            throw std::runtime_error("Failed to set dynamic shared memory size");
+        }
     }
-  }
 }
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t>
@@ -2044,14 +2067,16 @@ void invokeSelectiveStateUpdate(
     else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer_serial)
     {
         constexpr auto DIM = 64;
-        constexpr auto warpSize = 32;
+        // constexpr auto warpSize = 32;
         TLLM_CHECK(params.dim == DIM);
-        constexpr auto numConsumers = (DIM + warpSize - 1) / warpSize;
+        // constexpr auto numConsumers = (DIM + warpSize - 1) / warpSize;
+        constexpr auto numConsumers = 4;
+
         constexpr auto numProducers = 1;
         constexpr auto numWarps = numProducers + numConsumers;
         constexpr auto sectorSize = 32;
         constexpr auto stageCols = sectorSize / sizeof(state_t); // 32 / 2 = 16;
-        constexpr auto numStages = 2;
+        constexpr auto numStages = 3;
         auto func = selective_state_update_kernel_producer_consumer_serial<input_t, weight_t, matrixA_t, state_t, DIM,
             DSTATE, numConsumers, stageCols, numStages>;
 
@@ -2084,17 +2109,6 @@ void invokeSelectiveStateUpdate(
         // }
         request_sram_if_needed(func, sram_required);
         func<<<grid, block, sram_required, stream>>>(params, tensorState);
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
-        }
-        cudaDeviceSynchronize();
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            printf("Kernel execution failed: %s\n", cudaGetErrorString(err));
-        }
     }
 
     // This is an old implementation that thinks that matrix A is a 2D matrix.

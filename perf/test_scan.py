@@ -192,7 +192,7 @@ def test_correctness(inputs, atol=1e-3, rtol=1e-2):
             total_elements = y_ref_np.size
 
             print(
-                f"Number of mismatched elements: {num_mismatches} / {total_elements} ({100 * num_mismatches / total_elements:.2f}%)"
+                f"Number of mismatched output (y) elements: {num_mismatches} / {total_elements} ({100 * num_mismatches / total_elements:.2f}%)"
             )
 
             if num_mismatches > 0:
