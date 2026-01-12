@@ -380,218 +380,7 @@ struct SharedStorage
 
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM, int DSTATE,
     int consumerWarps, int rowsPerStage, int numStages = 1>
-__global__ void selective_state_update_kernel_producer_consumer(
-    SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState)
-{
-    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
-    auto* __restrict__ state = reinterpret_cast<state_t*>(params.state);   // state: (batch, nheads, dim, dstate)
-
-    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
-    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
-    auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);  // A: (nheads)
-    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
-    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
-    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
-    auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
-    auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
-    auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
-
-    int const nheads = params.nheads;
-    int const ngroups = params.ngroups;
-    int const dim = params.dim;
-
-    constexpr auto warpSize = 32;
-    constexpr auto numWarps = 1 + consumerWarps;
-
-    auto const batch = blockIdx.x;
-    auto const head = blockIdx.y;
-    auto const group = head / (nheads / ngroups);
-    auto lane = threadIdx.x % warpSize;
-    auto warp = threadIdx.y;
-
-    auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
-
-    using sram_t = SharedStorage<input_t, weight_t, matrixA_t, state_t, rowsPerStage, DIM, DSTATE, numStages>;
-#pragma nv_diag_suppress 20054
-    __shared__ sram_t sram;
-#pragma nv_diag_default 20054
-
-    namespace cde = cuda::device::experimental;
-    namespace cg = cooperative_groups;
-
-    for (int stage = warp; stage < numStages; stage += numWarps)
-    {
-        if (lane > 0)
-            continue;
-        constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
-        init(&sram.bar_empty[stage], num_arrivals);
-        init(&sram.bar_full[stage], num_arrivals);
-        // signal to async proxy that barriers are initilized
-        cde::fence_proxy_async_shared_cta();
-    }
-    if (lane == 0 && warp == 0)
-    {
-        init(&sram.bar_consumers, warpSize * consumerWarps);
-    }
-    __syncthreads();
-
-    if (warp == consumerWarps)
-    { // producer
-        for (int d = 0, stage = 0; d < dim; d += rowsPerStage, stage = (stage + 1) % numStages)
-        {
-            if (lane == 0)
-            {
-                cg::invoke_one(cg::coalesced_threads(),
-                    [&]()
-                    {
-                        sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
-
-                        if (state_batch != params.pad_slot_id)
-                        {
-                            uint64_t const state_offset = (state_batch * nheads + head) * dim;
-                            cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState, /*x*/ 0,
-                                /*y*/ state_offset + d, sram.bar_full[stage]);
-
-                            // Unblock the consumers
-                            auto constexpr bytesState = rowsPerStage * DSTATE * sizeof(state_t);
-                            auto constexpr bytesToArrive = bytesState;
-                            auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
-                        }
-                        else
-                            auto const _ = sram.bar_full[stage].arrive();
-                    });
-            }
-        }
-    }
-    else
-    { // consumers
-
-        using load_t = float2;
-        static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
-
-#pragma unroll
-        // Unblock the producer
-        for (uint8_t stage = 0; stage < numStages; ++stage)
-        {
-            auto const _ = sram.bar_empty[stage].arrive();
-        }
-
-        // Load A
-        auto const A_value = toFloat(A[head]);
-
-        // Load D
-        auto d_value = D ? toFloat(D[head]) : 0.f;
-
-        // load dt_value
-        auto dt_value = toFloat(dt[batch * params.dt_stride_batch + head]);
-        if (dt_bias)
-            dt_value += toFloat(dt_bias[head]);
-        if (params.dt_softplus)
-        {
-            dt_value = thresholded_softplus(dt_value);
-        }
-
-        if (warp == 0)
-        { // Load x, B
-            for (auto d = lane * vectorizedLoadSize; d < dim; d += warpSize * vectorizedLoadSize)
-            {
-                auto* dst = reinterpret_cast<load_t*>(&sram.x[d]);
-                *dst = *reinterpret_cast<load_t const*>(&x[batch * params.x_stride_batch + head * dim + d]);
-            }
-            for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
-            {
-                auto* dst = reinterpret_cast<load_t*>(&sram.B[i]);
-                *dst = *reinterpret_cast<load_t const*>(&B[batch * params.B_stride_batch + group * DSTATE + i]);
-            }
-        }
-        else if (warp == 1)
-        { // Load z, C
-            for (auto d = lane * vectorizedLoadSize; d < dim; d += warpSize * vectorizedLoadSize)
-            {
-                auto* dst = reinterpret_cast<load_t*>(&sram.z[d]);
-                *dst = z ? *reinterpret_cast<load_t const*>(&z[batch * nheads * dim + head * dim + d])
-                         : make_zero<load_t>();
-            }
-            for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
-            {
-                auto* dst = reinterpret_cast<load_t*>(&sram.C[i]);
-                *dst = *reinterpret_cast<load_t const*>(&C[batch * params.C_stride_batch + group * DSTATE + i]);
-            }
-        }
-
-        sram.bar_consumers.wait(sram.bar_consumers.arrive());
-
-        for (auto dBegin = 0, stage = 0; dBegin < dim; dBegin += rowsPerStage, stage = (stage + 1) % numStages)
-        {
-            // wait for the producer
-            sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
-
-#pragma unroll
-            for (auto ddBegin = 0; ddBegin < rowsPerStage; ddBegin += consumerWarps)
-            {
-                auto dd = ddBegin + warp;
-                auto d = dBegin + dd;
-                float const x_value = toFloat(sram.x[d]);
-                float out_value = toFloat(d_value) * x_value * int(lane == 0); // first lane has the value
-
-                for (int i = lane; i < DSTATE; i += warpSize)
-                {
-                    auto const state_value
-                        = (state_batch != params.pad_slot_id) ? toFloat(sram.state[stage][dd * DSTATE + i]) : 0.f;
-                    auto const B_value = toFloat(sram.B[i]);
-                    auto const C_value = toFloat(sram.C[i]);
-
-                    // auto const dA = fast_exp(A_value * dt_value);
-                    auto const dA = __expf(A_value * dt_value);
-                    auto const dB = B_value * dt_value;
-                    auto const new_state = state_value * dA + dB * x_value;
-
-                    convertAndStore(&sram.state[stage][dd * DSTATE + i], new_state);
-                    out_value += new_state * C_value;
-                }
-
-                constexpr auto state_chunk = sizeof(load_t) / sizeof(state_t);
-                for (int i = lane * state_chunk; i < DSTATE; i += warpSize * state_chunk)
-                {
-                    auto const* src = reinterpret_cast<load_t*>(&sram.state[stage][dd * DSTATE + i]);
-                    auto* dst = reinterpret_cast<load_t*>(
-                        &state[state_batch * nheads * dim * DSTATE + head * dim * DSTATE + d * DSTATE + i]);
-                    if (state_batch != params.pad_slot_id)
-                        *dst = *src;
-                }
-
-                out_value = warpReduceSum(out_value);
-                if (lane == 0)
-                {
-                    sram.out[d] = out_value;
-                }
-            }
-
-            // Unblock producer
-            auto _ = sram.bar_empty[stage].arrive();
-        }
-
-        // Write output
-        sram.bar_consumers.wait(sram.bar_consumers.arrive());
-        auto d = warp * warpSize + lane;
-        if (d < dim)
-        {
-            auto out_value = sram.out[d];
-            if (z)
-            {
-                float z_value = toFloat(sram.z[d]);
-                float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
-                float silu_z = z_value * sig_z;
-                out_value *= silu_z;
-            }
-            convertAndStore(&output[batch * params.out_stride_batch + head * dim + d], out_value);
-        }
-    }
-}
-
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM, int DSTATE,
-    int consumerWarps, int rowsPerStage, int numStages = 1>
-__global__ void selective_state_update_kernel_producer_consumer_writeback(
+__global__ void selective_state_update_kernel_producer_consumer_vertical(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState)
 {
     auto* __restrict__ output = reinterpret_cast<input_t*>(params.output);
@@ -761,18 +550,36 @@ __global__ void selective_state_update_kernel_producer_consumer_writeback(
                 float const x_value = toFloat(sram.x[d]);
                 float out_value = d_value * x_value * int(lane == 0); // first lane has the value
 
-                for (int i = lane; i < DSTATE; i += warpSize)
+                constexpr auto bankSize = sizeof(uint32_t);
+                constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
+                static_assert(sizeof(state_t) == sizeof(input_t), "state_t and input_t must have the same size");
+
+                for (int i = lane * stateValuesPerBank; i < DSTATE; i += warpSize * stateValuesPerBank)
                 {
-                    auto const state_value
-                        = (state_batch != params.pad_slot_id) ? toFloat(sram.state[stage][dd * DSTATE + i]) : 0.f;
-                    auto const B_value = toFloat(sram.B[i]);
-                    auto const C_value = toFloat(sram.C[i]);
+                    auto* sState_ptr = reinterpret_cast<uint32_t*>(&sram.state[stage][dd * DSTATE + i]);
+                    uint32_t rState = *sState_ptr;
+                    auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
 
-                    auto const dB = B_value * dt_value;
-                    auto const new_state = state_value * dA + dB * x_value;
+                    uint32_t rB = *reinterpret_cast<uint32_t const*>(&sram.B[i]);
+                    auto* rB_ptr = reinterpret_cast<input_t const*>(&rB);
 
-                    convertAndStore(&sram.state[stage][dd * DSTATE + i], new_state);
-                    out_value += new_state * C_value;
+                    uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
+                    auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
+
+                    for (int e = 0; e < stateValuesPerBank; e++)
+                    {
+                        auto const state_value
+                            = (state_batch != params.pad_slot_id) ? toFloat(rState_ptr[e]) : 0.f;
+                        auto const B_value = toFloat(rB_ptr[e]);
+                        auto const C_value = toFloat(rC_ptr[e]);
+
+                        auto const dB = B_value * dt_value;
+                        auto const new_state = state_value * dA + dB * x_value;
+
+                        convertAndStore(&rState_ptr[e], new_state);
+                        out_value += new_state * C_value;
+                    }
+                    *sState_ptr = rState;
                 }
 
                 out_value = warpReduceSum(out_value);
@@ -819,43 +626,8 @@ struct SharedStorageSuper
     barrier_t bar_consumers;
 };
 
-// SharedStorage for the horizontal_warps kernel variant
-// In this variant:
-// - Each thread processes exactly one dim value (one row)
-// - Multiple warps process the same set of dims but different dstate columns
-// - Warps that share the same dims reduce their out_value via shared memory atomics
-// - Only one warp per dim group writes the final output
-//
-// Example: dim=64, consumerWarps=4
-//   dimGroups = 64/32 = 2 groups
-//   warpsPerDimGroup = 4/2 = 2
-//   Warps 0,1 -> dims 0-31 (reduce together)
-//   Warps 2,3 -> dims 32-63 (reduce together)
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int dim, int dstate, int stageCols,
-    int numStages, int consumerWarps>
-struct SharedStorageWarps
-{
-    static constexpr int warpSize = 32;
-    static constexpr int dimGroups = dim / warpSize;
-    static constexpr int warpsPerDimGroup = consumerWarps / dimGroups;
-    static_assert(dimGroups * warpSize == dim, "dim must be a multiple of warpSize");
-    static_assert(consumerWarps % dimGroups == 0, "consumerWarps must be divisible by dimGroups");
-
-    alignas(128) state_t state[numStages][dim * stageCols];
-    input_t B[dstate];
-    input_t C[dstate];
-
-    // For reduction across warps within the same dimGroup via atomics
-    alignas(128) float out[dim];
-
-    using barrier_t = cuda::barrier<cuda::thread_scope_block>;
-    barrier_t bar_empty[numStages];
-    barrier_t bar_full[numStages];
-    barrier_t bar_consumers;
-};
-
 template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM, int DSTATE,
-    int consumerWarps, int colsPerStage, int numStages = 1>
+    int consumerWarps, int colsPerStage, int headsGroupsRatio, int numStages = 1>
 __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState)
 {
@@ -873,14 +645,15 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
 
     int const nheads = params.nheads;
-    int const ngroups = params.ngroups;
+    // int const ngroups = params.ngroups;
 
     constexpr auto warpSize = 32;
     constexpr auto numWarps = 1 + consumerWarps;
 
     auto const batch = blockIdx.x;
     auto const head = blockIdx.y;
-    auto const group = head / (nheads / ngroups);
+    // auto const group = head / (nheads / ngroups);
+    auto const group = head / headsGroupsRatio;
     auto lane = threadIdx.x % warpSize;
     auto warp = threadIdx.y;
 
@@ -1034,6 +807,7 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
 
             constexpr auto bankSize = sizeof(uint32_t);
             constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
+            static_assert(sizeof(state_t) == sizeof(input_t), "state_t and input_t must have the same size");
 #pragma unroll
             for (int item = 0; item < itemsPerThread; item += stateValuesPerBank)
             {
@@ -1043,12 +817,19 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
                 auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
                 uint32_t rState = *sState_ptr;
                 auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
+
+                uint32_t rB = *reinterpret_cast<uint32_t const*>(&sram.B[i]);
+                auto* rB_ptr = reinterpret_cast<input_t const*>(&rB);
+
+                uint32_t rC = *reinterpret_cast<uint32_t const*>(&sram.C[i]);
+                auto* rC_ptr = reinterpret_cast<input_t const*>(&rC);
+
                 for (int e = 0; e < stateValuesPerBank; e++)
                 {
                     auto const state_value = (state_batch != params.pad_slot_id) ? toFloat(rState_ptr[e]) : 0.f;
 
-                    auto const B_value = toFloat(sram.B[i + e]);
-                    auto const C_value = toFloat(sram.C[i + e]);
+                    auto const B_value = toFloat(rB_ptr[e]);
+                    auto const C_value = toFloat(rC_ptr[e]);
 
                     auto const dA = __expf(A_value * dt_value);
                     auto const dB = B_value * dt_value;
@@ -1094,277 +875,6 @@ __global__ void selective_state_update_kernel_producer_consumer_horizontal(
     }
 }
 
-// New kernel variant where multiple warps share the same dims and reduce via shared memory
-// Each thread processes exactly one dim value
-// Multiple warps work on the same set of dims but different dstate columns
-// After processing, they reduce via shared memory atomics and only one warp writes the output
-template <typename input_t, typename weight_t, typename matrixA_t, typename state_t, int DIM, int DSTATE,
-    int consumerWarps, int colsPerStage, int numStages = 1>
-__global__ void selective_state_update_kernel_producer_consumer_horizontal_warps(
-    SelectiveStateUpdateParams params, __grid_constant__ CUtensorMap const tensorState)
-{
-    auto* __restrict__ output = reinterpret_cast<input_t*>(params.output); // output: (batch, nheads, dim)
-
-    auto const* __restrict__ x = reinterpret_cast<input_t const*>(params.x);    // x: (batch, nheads, dim)
-    auto const* __restrict__ dt = reinterpret_cast<weight_t const*>(params.dt); // dt: (batch, nheads, dim)
-    auto const* __restrict__ A = reinterpret_cast<matrixA_t const*>(params.A);  // A: (nheads)
-    auto const* __restrict__ B = reinterpret_cast<input_t const*>(params.B);    // B: (batch, ngroups, dstate)
-    auto const* __restrict__ C = reinterpret_cast<input_t const*>(params.C);    // C: (batch, ngroups, dstate)
-    auto const* __restrict__ D = reinterpret_cast<weight_t const*>(params.D);   // D: (nheads, dim)
-    auto const* __restrict__ dt_bias = reinterpret_cast<weight_t const*>(params.dt_bias);
-    auto const* __restrict__ z = reinterpret_cast<input_t const*>(params.z);
-    auto const* __restrict__ state_batch_indices = reinterpret_cast<int const*>(params.state_batch_indices);
-
-    int const nheads = params.nheads;
-    int const ngroups = params.ngroups;
-
-    constexpr auto warpSize = 32;
-    constexpr auto numWarps = 1 + consumerWarps; // 1 producer + N consumers
-    constexpr auto dimGroups = DIM / warpSize;
-    constexpr auto warpsPerDimGroup = consumerWarps / dimGroups;
-    static_assert(dimGroups * warpSize == DIM, "DIM must be a multiple of warpSize");
-    static_assert(consumerWarps % dimGroups == 0, "consumerWarps must be divisible by dimGroups");
-
-    auto const batch = blockIdx.x;
-    auto const head = blockIdx.y;
-    auto const group = head / (nheads / ngroups);
-    auto lane = threadIdx.x % warpSize;
-    auto warp = threadIdx.y;
-
-    auto const state_batch = (state_batch_indices) ? state_batch_indices[batch] : batch;
-
-    extern __shared__ uint8_t sbuffer[];
-    using sram_t = SharedStorageWarps<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, colsPerStage, numStages,
-        consumerWarps>;
-    auto& sram = *reinterpret_cast<sram_t*>(sbuffer);
-
-    namespace cde = cuda::device::experimental;
-    namespace cg = cooperative_groups;
-
-    // Initialize barriers
-    for (int stage = warp; stage < numStages; stage += numWarps)
-    {
-        if (lane > 0)
-            continue;
-        constexpr auto num_arrivals = 1 + consumerWarps * warpSize;
-        init(&sram.bar_empty[stage], num_arrivals);
-        init(&sram.bar_full[stage], num_arrivals);
-        cde::fence_proxy_async_shared_cta();
-    }
-    if (lane == 0 && warp == 0)
-    {
-        init(&sram.bar_consumers, warpSize * consumerWarps);
-    }
-    __syncthreads();
-
-    if (warp == consumerWarps)
-    {
-        // Producer warp - handles TMA reads and writes
-        auto const state_offset = (state_batch * nheads + head) * DIM;
-
-        for (int i = 0, stage = 0; i < DSTATE + colsPerStage * numStages;
-             i += colsPerStage, stage = (stage + 1) % numStages)
-        {
-            if (lane == 0)
-            {
-                cg::invoke_one(cg::coalesced_threads(),
-                    [&]()
-                    {
-                        sram.bar_empty[stage].wait(sram.bar_empty[stage].arrive());
-
-                        if (state_batch != params.pad_slot_id)
-                        {
-                            // Writeback
-                            if (i >= colsPerStage * numStages)
-                            {
-                                cde::cp_async_bulk_tensor_2d_shared_to_global(&tensorState,
-                                    /*x*/ i - colsPerStage * numStages,
-                                    /*y*/ state_offset, &sram.state[stage][0]);
-                                cde::cp_async_bulk_commit_group();
-                                cde::cp_async_bulk_wait_group_read<0>();
-                            }
-
-                            if (i < DSTATE)
-                            {
-                                cde::cp_async_bulk_tensor_2d_global_to_shared(&sram.state[stage][0], &tensorState,
-                                    /*x*/ i, /*y*/ state_offset, sram.bar_full[stage]);
-
-                                auto constexpr bytesState = DIM * colsPerStage * sizeof(state_t);
-                                auto constexpr bytesToArrive = bytesState;
-                                auto const _ = cuda::device::barrier_arrive_tx(sram.bar_full[stage], 1, bytesToArrive);
-                            }
-                        }
-                        else
-                        {
-                            auto const _ = sram.bar_full[stage].arrive();
-                        }
-                    });
-            }
-        }
-    }
-    else
-    {
-        // Consumer warps
-        using load_t = float2;
-        static constexpr auto vectorizedLoadSize = sizeof(load_t) / sizeof(weight_t);
-
-        // Unblock the producer for all stages
-#pragma unroll
-        for (auto stage = 0; stage < numStages; ++stage)
-        {
-            auto const _ = sram.bar_empty[stage].arrive();
-        }
-
-        // Load A (scalar per head)
-        auto const A_value = toFloat(A[head]);
-
-        // Load D (scalar per head)
-        auto const d_value = D ? toFloat(D[head]) : 0.f;
-
-        // Load dt_value (scalar per head)
-        auto dt_value = toFloat(dt[batch * params.dt_stride_batch + head]);
-        if (dt_bias)
-            dt_value += toFloat(dt_bias[head]);
-        if (params.dt_softplus)
-        {
-            dt_value = thresholded_softplus(dt_value);
-        }
-
-        // Cooperative load of B and C into shared memory
-        // Use first two warps to load B and C respectively
-        if (warp == 0)
-        {
-            for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
-            {
-                auto* dst = reinterpret_cast<load_t*>(&sram.B[i]);
-                *dst = *reinterpret_cast<load_t const*>(&B[batch * params.B_stride_batch + group * DSTATE + i]);
-            }
-        }
-        else if (warp == 1)
-        {
-            for (auto i = lane * vectorizedLoadSize; i < DSTATE; i += warpSize * vectorizedLoadSize)
-            {
-                auto* dst = reinterpret_cast<load_t*>(&sram.C[i]);
-                *dst = *reinterpret_cast<load_t const*>(&C[batch * params.C_stride_batch + group * DSTATE + i]);
-            }
-        }
-
-        // Compute which dim this thread handles
-        // dimGroup: which set of 32 dims (0 to dimGroups-1)
-        // warpIdxInGroup: which warp within the dim group (0 to warpsPerDimGroup-1)
-        auto const dimGroup = warp / warpsPerDimGroup;
-        auto const warpIdxInGroup = warp % warpsPerDimGroup;
-        auto const d = dimGroup * warpSize + lane; // The actual dim index this thread handles
-
-        // Each warp in a group processes different columns of dstate
-        // colsPerStage columns per stage, divided among warpsPerDimGroup warps
-        constexpr auto colsPerWarp = colsPerStage / warpsPerDimGroup;
-        static_assert(colsPerStage % warpsPerDimGroup == 0, "colsPerStage must be divisible by warpsPerDimGroup");
-
-        auto const x_value = toFloat(x[batch * params.x_stride_batch + head * DIM + d]);
-        auto const z_value = z ? toFloat(z[batch * nheads * DIM + head * DIM + d]) : 0.f;
-
-        // Initialize out[] to zero - done by first warp in each dimGroup
-        if (warpIdxInGroup == 0)
-        {
-            sram.out[d] = 0.f;
-        }
-
-        // Wait for B and C to be loaded (also ensures out[] is initialized)
-        sram.bar_consumers.wait(sram.bar_consumers.arrive());
-
-        // Accumulate output value
-        float out_value = 0.f;
-
-#pragma unroll 1
-        for (int iBegin = 0, stage = 0; iBegin < DSTATE; iBegin += colsPerStage, stage = (stage + 1) % numStages)
-        {
-            // Wait for the producer to fill this stage
-            sram.bar_full[stage].wait(sram.bar_full[stage].arrive());
-
-            // Each warp in the group processes its subset of columns
-            auto const colStart = warpIdxInGroup * colsPerWarp;
-
-            constexpr auto bankSize = sizeof(uint32_t);
-            constexpr auto stateValuesPerBank = bankSize / sizeof(state_t);
-#pragma unroll
-            for (int col = 0; col < colsPerWarp; col += stateValuesPerBank)
-            {
-                auto const ii = colStart + col;
-                auto const i = iBegin + ii;
-
-                auto* sState_ptr = reinterpret_cast<uint*>(&sram.state[stage][d * colsPerStage + ii]);
-                uint32_t rState = *sState_ptr;
-                auto* rState_ptr = reinterpret_cast<state_t*>(&rState);
-                for (int e = 0; e < stateValuesPerBank; e++)
-                {
-                    auto const state_value = (state_batch != params.pad_slot_id) ? toFloat(rState_ptr[e]) : 0.f;
-
-                    auto const B_value = toFloat(sram.B[i + e]);
-                    auto const C_value = toFloat(sram.C[i + e]);
-
-                    auto const dA = __expf(A_value * dt_value);
-                    auto const dB = B_value * dt_value;
-                    auto const new_state = state_value * dA + dB * x_value;
-
-                    convertAndStore(&rState_ptr[e], new_state);
-                    out_value += new_state * C_value;
-                }
-                *sState_ptr = rState;
-            }
-            // #pragma unroll
-            //             for (int col = 0; col < colsPerWarp; ++col)
-            //             {
-            //                 auto const ii = colStart + col;
-            //                 auto const i = iBegin + ii;
-
-            //                 auto const state_value =
-            //                     (state_batch != params.pad_slot_id) ? toFloat(sram.state[stage][d * colsPerStage +
-            //                     ii]) : 0.f;
-
-            //                 auto const B_value = toFloat(sram.B[i]);
-            //                 auto const C_value = toFloat(sram.C[i]);
-
-            //                 auto const dA = __expf(A_value * dt_value);
-            //                 auto const dB = B_value * dt_value;
-            //                 auto const new_state = state_value * dA + dB * x_value;
-
-            //                 // All warps in the group write to the same state location
-            //                 // This is safe because they process different columns
-            //                 convertAndStore(&sram.state[stage][d * colsPerStage + ii], new_state);
-            //                 out_value += new_state * C_value;
-            //             }
-
-            // Unblock producer
-            cde::fence_proxy_async_shared_cta();
-            auto _ = sram.bar_empty[stage].arrive();
-        }
-
-        // Atomic add partial out_value to shared memory for cross-warp reduction
-        atomicAdd(&sram.out[d], out_value);
-
-        // Synchronize all consumer warps
-        __syncthreads();
-
-        // Only the first warp in each dimGroup writes the final output
-        if (warpIdxInGroup == 0)
-        {
-            float reduced_out = sram.out[d];
-            reduced_out += d_value * x_value;
-
-            // Apply z gating if present
-            if (z)
-            {
-                float sig_z = __fdividef(1.f, (1.f + __expf(0.f - z_value)));
-                float silu_z = z_value * sig_z;
-                reduced_out *= silu_z;
-            }
-
-            convertAndStore(&output[batch * params.out_stride_batch + head * DIM + d], reduced_out);
-        }
-    }
-}
-
 template <typename KernelFunc>
 void request_sram_if_needed(KernelFunc kernel, size_t sram_required)
 {
@@ -1401,32 +911,7 @@ void invokeSelectiveStateUpdate(
         selective_state_update_kernel_simple<input_t, weight_t, matrixA_t, state_t, DSTATE, numWarps>
             <<<grid, block, 0, stream>>>(params);
     }
-    // assume that A is just one value per head
-    else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer)
-    {
-        constexpr auto numConsumers = 2;
-        constexpr auto numWarps = 1 + numConsumers;
-        constexpr auto numStages = 2;
-        constexpr auto rowsPerStage = 4 * numConsumers;
-        constexpr auto DIM = 64;
-        TLLM_CHECK(params.dim == DIM);
-        auto scan_func = selective_state_update_kernel_producer_consumer<input_t, weight_t, matrixA_t, state_t, DIM,
-            DSTATE, numConsumers, rowsPerStage, numStages>;
-
-        dim3 block(warpSize, numWarps);
-        dim3 grid(params.batch, params.nheads);
-
-        auto nh = params.nheads;
-        auto dim = params.dim;
-        auto B = params.state_cache_size;
-
-        TLLM_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 == 0); // TMA requires 128B aligned
-        auto tensorState = tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, rowsPerStage, DSTATE);
-        TLLM_CHECK(params.dim % rowsPerStage == 0);
-
-        scan_func<<<grid, block, 0, stream>>>(params, tensorState);
-    }
-    else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer_writeback)
+    else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer_vertical)
     {
         constexpr auto numConsumers = 4;
         constexpr auto numWarps = 1 + numConsumers;
@@ -1434,7 +919,8 @@ void invokeSelectiveStateUpdate(
         constexpr auto rowsPerStage = 4 * numConsumers;
         constexpr auto DIM = 64;
         TLLM_CHECK(params.dim == DIM);
-        auto scan_func = selective_state_update_kernel_producer_consumer_writeback<input_t, weight_t, matrixA_t,
+
+        auto scan_func = selective_state_update_kernel_producer_consumer_vertical<input_t, weight_t, matrixA_t,
             state_t, DIM, DSTATE, numConsumers, rowsPerStage, numStages>;
 
         dim3 block(warpSize, numWarps);
@@ -1464,8 +950,11 @@ void invokeSelectiveStateUpdate(
         constexpr auto stageCols = sectorSize / sizeof(state_t); // 32 / 2 = 16;
         constexpr auto numStages = 4;
 
+        constexpr int headsGroupsRatio = 8;
+        TLLM_CHECK(params.nheads / params.ngroups == headsGroupsRatio);
+
         auto func = selective_state_update_kernel_producer_consumer_horizontal<input_t, weight_t, matrixA_t, state_t,
-            DIM, DSTATE, numConsumers, stageCols, numStages>;
+            DIM, DSTATE, numConsumers, stageCols, headsGroupsRatio, numStages>;
 
         dim3 block(warpSize, numWarps);
         dim3 grid(params.batch, params.nheads);
@@ -1479,39 +968,6 @@ void invokeSelectiveStateUpdate(
         TLLM_CHECK(DSTATE % stageCols == 0);
 
         using sram_t = SharedStorageSuper<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, stageCols, numStages>;
-        constexpr auto sram_required = sizeof(sram_t);
-        request_sram_if_needed(func, sram_required);
-        func<<<grid, block, sram_required, stream>>>(params, tensorState);
-    }
-    else if (kernelType == SelectiveStateUpdateKernelType::producer_consumer_horizontal_warps)
-    {
-        constexpr auto DIM = 64;
-        TLLM_CHECK(params.dim == DIM);
-        constexpr auto numConsumers = 4;
-        constexpr auto numProducers = 1;
-        constexpr auto numWarps = numProducers + numConsumers;
-
-        // Compute the size (width) of the stage
-        constexpr auto sectorSize = 32;                          // bytes
-        constexpr auto stageCols = sectorSize / sizeof(state_t); // 32 / 2 = 16;
-        constexpr auto numStages = 4;
-
-        auto func = selective_state_update_kernel_producer_consumer_horizontal_warps<input_t, weight_t, matrixA_t,
-            state_t, DIM, DSTATE, numConsumers, stageCols, numStages>;
-
-        dim3 block(warpSize, numWarps);
-        dim3 grid(params.batch, params.nheads);
-
-        auto nh = params.nheads;
-        auto dim = params.dim;
-        auto B = params.state_cache_size;
-
-        TLLM_CHECK(reinterpret_cast<uintptr_t>(params.state) % 128 == 0); // TMA requires 128B aligned
-        auto tensorState = tma::createTensorMap<state_t>(params.state, B * nh * dim, DSTATE, DIM, stageCols);
-        TLLM_CHECK(DSTATE % stageCols == 0);
-
-        using sram_t = SharedStorageWarps<input_t, weight_t, matrixA_t, state_t, DIM, DSTATE, stageCols, numStages,
-            numConsumers>;
         constexpr auto sram_required = sizeof(sram_t);
         request_sram_if_needed(func, sram_required);
         func<<<grid, block, sram_required, stream>>>(params, tensorState);

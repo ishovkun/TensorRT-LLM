@@ -10,9 +10,8 @@ enum class SelectiveStateUpdateKernelType
 {
     simple,
     producer_consumer,
-    producer_consumer_writeback,
+    producer_consumer_vertical,
     producer_consumer_horizontal,
-    producer_consumer_horizontal_warps,
 };
 
 struct SelectiveStateUpdateParams
