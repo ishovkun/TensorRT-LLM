@@ -9,7 +9,8 @@ namespace torch_ext
 
 using namespace tensorrt_llm::kernels;
 
-void validate_shape(th::Tensor const& tensor, std::string const& tensor_name, std::vector<int64_t> const& expected_shape)
+void validate_shape(
+    th::Tensor const& tensor, std::string const& tensor_name, std::vector<int64_t> const& expected_shape)
 {
     // Check shape
     bool shape_matches = tensor.dim() == static_cast<int64_t>(expected_shape.size());
@@ -109,8 +110,7 @@ void validate_contiguous_tensor(
 
 // Validate tensor shape and strides
 void validate_tensor(th::Tensor const& tensor, std::string const& tensor_name,
-                     std::vector<int64_t> const& expected_shape,
-                     std::vector<int64_t> const& expected_strides)
+    std::vector<int64_t> const& expected_shape, std::vector<int64_t> const& expected_strides)
 {
     // Check shape
     bool shape_matches = tensor.dim() == static_cast<int64_t>(expected_shape.size());
@@ -184,15 +184,14 @@ void validate_tensor(th::Tensor const& tensor, std::string const& tensor_name,
 template <size_t N>
 void copy_strides(th::Tensor const& tensor, std::array<int64_t, N>& strides_array)
 {
-    TORCH_CHECK(strides_array.size() == static_cast<size_t>(tensor.dim()),
-        "Stride array size (", strides_array.size(), ") must match tensor dimensions (", tensor.dim(), ")");
+    TORCH_CHECK(strides_array.size() == static_cast<size_t>(tensor.dim()), "Stride array size (", strides_array.size(),
+        ") must match tensor dimensions (", tensor.dim(), ")");
 
     for (size_t i = 0; i < N; ++i)
     {
         strides_array[i] = tensor.stride(i);
     }
 }
-
 
 auto run_selective_state_update(                   //
     th::Tensor const& state,                       // (state_cache_size, nheads, dim, dstate)
@@ -245,7 +244,6 @@ auto run_selective_state_update(                   //
     TORCH_CHECK(B.stride(1) == dstate);
     TORCH_CHECK(B.stride(2) == 1);
 
-
     validate_shape(C, "C", {batch, C.size(1), dstate});
     p.C_stride_batch = C.stride(0);
     TORCH_CHECK(C.stride(1) == dstate);
@@ -254,17 +252,23 @@ auto run_selective_state_update(                   //
     validate_tensor(D, "D", {nheads, dim}, {1, 0});
     validate_tensor(A, "A", {nheads, dim, dstate}, {1, 0, 0});
 
-
-    // if (z)
-    // {
-    //     TORCH_CHECK(z.sizes() == x.sizes(), "z.shape must match x.shape");
-    // }
+    if (z)
+    {
+        auto& z_tensor = z.value();
+        TORCH_CHECK(z_tensor.is_cuda(), "z must be a CUDA tensor");
+        TORCH_CHECK(z_tensor.dim() == 3, "z must have 3 dimensions");
+        TORCH_CHECK(z_tensor.size(0) == batch, "z.size(0) must equal batch");
+        TORCH_CHECK(z_tensor.size(1) == nheads, "z.size(1) must equal nheads");
+        TORCH_CHECK(z_tensor.size(2) == dim, "z.size(2) must equal dim");
+        TORCH_CHECK(z_tensor.stride(2) == 1, "z must be contiguous in the last dimension");
+        TORCH_CHECK(
+            z_tensor.stride(1) == dim, "z.stride(1) must equal dim, got ", z_tensor.stride(1), " expected ", dim);
+    }
 
     if (dt_bias)
     {
         validate_tensor(*dt_bias, "dt_bias", {nheads, dim}, {1, 0});
     }
-
 
     p.batch = batch;
     p.nheads = nheads;
@@ -284,7 +288,7 @@ auto run_selective_state_update(                   //
     if (z)
     {
         p.z = z->data_ptr();
-        TORCH_CHECK(false && "z is not supported yet");
+        p.z_stride_batch = z->stride(0);
     }
 
     p.A = A.data_ptr();
@@ -309,10 +313,10 @@ auto run_selective_state_update(                   //
     auto input_dtype = x.scalar_type();
     auto weight_dtype = dt.scalar_type();
 
-
     TORCH_CHECK(state.scalar_type() == torch::kBFloat16);
     TORCH_CHECK(D.scalar_type() == weight_dtype);
-    if (dt_bias) {
+    if (dt_bias)
+    {
         TORCH_CHECK(dt_bias->scalar_type() == weight_dtype);
     }
 
@@ -354,22 +358,31 @@ auto run_selective_state_update_producer_consumer(th::Tensor const& state, th::T
         pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer);
 }
 
-auto run_selective_state_update_producer_consumer_writeback(th::Tensor const& state, th::Tensor const& x, th::Tensor const& dt,
-    th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D, std::optional<th::Tensor> z,
-    std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
-    int64_t pad_slot_id) -> th::Tensor
+auto run_selective_state_update_producer_consumer_writeback(th::Tensor const& state, th::Tensor const& x,
+    th::Tensor const& dt, th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D,
+    std::optional<th::Tensor> z, std::optional<th::Tensor> dt_bias, bool dt_softplus,
+    std::optional<th::Tensor> state_batch_indices, int64_t pad_slot_id) -> th::Tensor
 {
     return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
         pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer_writeback);
 }
 
-auto run_selective_state_update_producer_consumer_serial(th::Tensor const& state, th::Tensor const& x, th::Tensor const& dt,
-    th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D, std::optional<th::Tensor> z,
-    std::optional<th::Tensor> dt_bias, bool dt_softplus, std::optional<th::Tensor> state_batch_indices,
-    int64_t pad_slot_id) -> th::Tensor
+auto run_selective_state_update_producer_consumer_horizontal(th::Tensor const& state, th::Tensor const& x,
+    th::Tensor const& dt, th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D,
+    std::optional<th::Tensor> z, std::optional<th::Tensor> dt_bias, bool dt_softplus,
+    std::optional<th::Tensor> state_batch_indices, int64_t pad_slot_id) -> th::Tensor
 {
     return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
-        pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer_serial);
+        pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer_horizontal);
+}
+
+auto run_selective_state_update_producer_consumer_horizontal_warps(th::Tensor const& state, th::Tensor const& x,
+    th::Tensor const& dt, th::Tensor const& A, th::Tensor const& B, th::Tensor const& C, th::Tensor const& D,
+    std::optional<th::Tensor> z, std::optional<th::Tensor> dt_bias, bool dt_softplus,
+    std::optional<th::Tensor> state_batch_indices, int64_t pad_slot_id) -> th::Tensor
+{
+    return run_selective_state_update(state, x, dt, A, B, C, D, z, dt_bias, dt_softplus, state_batch_indices,
+        pad_slot_id, SelectiveStateUpdateKernelType::producer_consumer_horizontal_warps);
 }
 
 } // end namespace torch_ext
@@ -407,7 +420,17 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int pad_slot_id"
         ") -> Tensor");
     m.def(
-        "selective_state_update_producer_consumer_serial("
+        "selective_state_update_producer_consumer_horizontal("
+        "Tensor state, Tensor x, Tensor dt, "
+        "Tensor A, Tensor B, Tensor C, Tensor D, "
+        "Tensor? z, "
+        "Tensor? dt_bias,"
+        "bool dt_softplus,"
+        "Tensor? state_batch_indices,"
+        "int pad_slot_id"
+        ") -> Tensor");
+    m.def(
+        "selective_state_update_producer_consumer_horizontal_warps("
         "Tensor state, Tensor x, Tensor dt, "
         "Tensor A, Tensor B, Tensor C, Tensor D, "
         "Tensor? z, "
@@ -422,6 +445,10 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("selective_state_update_simple", &torch_ext::run_selective_state_update_simple);
     m.impl("selective_state_update_producer_consumer", &torch_ext::run_selective_state_update_producer_consumer);
-    m.impl("selective_state_update_producer_consumer_writeback", &torch_ext::run_selective_state_update_producer_consumer_writeback);
-    m.impl("selective_state_update_producer_consumer_serial", &torch_ext::run_selective_state_update_producer_consumer_serial);
+    m.impl("selective_state_update_producer_consumer_writeback",
+        &torch_ext::run_selective_state_update_producer_consumer_writeback);
+    m.impl("selective_state_update_producer_consumer_horizontal",
+        &torch_ext::run_selective_state_update_producer_consumer_horizontal);
+    m.impl("selective_state_update_producer_consumer_horizontal_warps",
+        &torch_ext::run_selective_state_update_producer_consumer_horizontal_warps);
 }

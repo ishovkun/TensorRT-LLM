@@ -99,7 +99,8 @@ def test_correctness(inputs, atol=1e-3, rtol=1e-2):
         torch.ops.trtllm.selective_state_update_simple,
         torch.ops.trtllm.selective_state_update_producer_consumer,
         torch.ops.trtllm.selective_state_update_producer_consumer_writeback,
-        torch.ops.trtllm.selective_state_update_producer_consumer_serial,
+        torch.ops.trtllm.selective_state_update_producer_consumer_horizontal,
+        torch.ops.trtllm.selective_state_update_producer_consumer_horizontal_warps,
     ]
 
     # Run reference implementation once
@@ -542,7 +543,8 @@ def main(batch_size, repeats, warmup, skip_test):
         torch.ops.trtllm.selective_state_update_simple,
         torch.ops.trtllm.selective_state_update_producer_consumer,
         torch.ops.trtllm.selective_state_update_producer_consumer_writeback,
-        torch.ops.trtllm.selective_state_update_producer_consumer_serial,
+        torch.ops.trtllm.selective_state_update_producer_consumer_horizontal,
+        torch.ops.trtllm.selective_state_update_producer_consumer_horizontal_warps,
     ]
 
     for kernel in kernels:
