@@ -69,7 +69,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
     Args:
         num_layers: attention layers that persist K/V (the generator tower).
         num_kv_heads, head_dim, dtype: K/V geometry, per layer, per rank.
-        tokens_per_block: page size. A free performance knob; the mask makes
+        tokens_per_block: page size, a power of two (the TRT-LLM K/V kernels
+            require it). Otherwise a free performance knob; the mask makes
             correctness independent of it.
         prompt_capacity: largest prompt this cache accepts, in tokens
             (``text_cache_max_len``). Rounded up to whole pages.
@@ -102,6 +103,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
             raise ValueError(
                 "tokens_per_block, prompt_capacity, window_tokens, chunk_tokens must be positive"
             )
+        if tokens_per_block & (tokens_per_block - 1):
+            # The TRT-LLM paged K/V kernels assert this (kvCacheUtils.h).
+            raise ValueError(f"tokens_per_block must be a power of two, got {tokens_per_block}")
 
         self.tokens_per_block = tokens_per_block
         self.prompt_pages = _ceil_div(prompt_capacity, tokens_per_block)

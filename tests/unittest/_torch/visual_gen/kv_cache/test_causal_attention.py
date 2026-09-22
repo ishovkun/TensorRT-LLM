@@ -47,7 +47,7 @@ def reference_attention(q, keys, values):
     return out.squeeze(0).transpose(0, 1).reshape(q.shape[0], -1).to(q.dtype)
 
 
-@pytest.fixture(params=[16, 24], ids=["tpb16", "tpb24-nonpow2"])
+@pytest.fixture(params=[16, 64], ids=["tpb16", "tpb64"])
 def cache(request):
     mgr = CausalKVCacheManager(
         num_layers=1,
@@ -94,18 +94,11 @@ def test_rollout_matches_dense_reference(cache, prompt_len):
         out = attn.forward(q, k, v)
         torch.cuda.synchronize()
 
-        visible_k = history_k[-cache.window_tokens :] if history_k else []
-        visible_v = history_v[-cache.window_tokens :] if history_v else []
-        keys = (
-            torch.cat([prompt_k, *visible_k, k], dim=0)
-            if visible_k
-            else torch.cat([prompt_k, k], dim=0)
-        )
-        vals = (
-            torch.cat([prompt_v, *visible_v, v], dim=0)
-            if visible_v
-            else torch.cat([prompt_v, v], dim=0)
-        )
+        empty = k.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        hist_k = torch.cat(history_k)[-cache.window_tokens :] if history_k else empty
+        hist_v = torch.cat(history_v)[-cache.window_tokens :] if history_v else empty
+        keys = torch.cat([prompt_k, hist_k, k], dim=0)
+        vals = torch.cat([prompt_v, hist_v, v], dim=0)
         expected = reference_attention(q, keys, vals)
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"step {step}")
 
@@ -116,8 +109,8 @@ def test_rollout_matches_dense_reference(cache, prompt_len):
         torch.testing.assert_close(v_back, v)
 
         cache.commit_chunk()
-        history_k.extend(k.unbind(0))
-        history_v.extend(v.unbind(0))
+        history_k.append(k)
+        history_v.append(v)
 
 
 def test_dirty_steps_overwrite_in_place(cache):
