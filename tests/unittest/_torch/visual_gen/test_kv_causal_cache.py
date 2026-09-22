@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.kv_cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a GPU for the K/V pool"

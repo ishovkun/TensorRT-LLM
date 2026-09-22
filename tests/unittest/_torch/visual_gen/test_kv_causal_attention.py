@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.attention_backend.causal_trtllm import CausalTrtllmAttention
-from tensorrt_llm._torch.visual_gen.kv_cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 

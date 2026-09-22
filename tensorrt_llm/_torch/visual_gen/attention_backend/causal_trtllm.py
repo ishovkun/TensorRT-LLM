@@ -45,7 +45,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.visual_gen.kv_cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 
 class CausalTrtllmAttention:
