@@ -48,7 +48,7 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 
-class CausalTrtllmAttention:
+class CausalKVAttention:
     """One attention layer reading and writing a :class:`CausalKVCacheManager`.
 
     Inputs are per-token, already normalised and rotated by the model:

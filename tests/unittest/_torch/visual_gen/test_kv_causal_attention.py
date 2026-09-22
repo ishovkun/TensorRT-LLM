@@ -22,7 +22,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.attention_backend.causal_trtllm import CausalTrtllmAttention
+from tensorrt_llm._torch.visual_gen.attention_backend.causal_kv import CausalKVAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -71,7 +71,7 @@ def cache(request):
 def test_rollout_matches_dense_reference(cache, prompt_len):
     torch.manual_seed(0)
     cache.open(prompt_len=prompt_len)
-    attn = CausalTrtllmAttention(
+    attn = CausalKVAttention(
         cache,
         layer_idx=0,
         num_heads=NUM_HEADS,
@@ -117,7 +117,7 @@ def test_dirty_steps_overwrite_in_place(cache):
     """Several forwards at the same ``past`` leave only the last K/V in the cache."""
     torch.manual_seed(1)
     cache.open(prompt_len=9)
-    attn = CausalTrtllmAttention(
+    attn = CausalKVAttention(
         cache,
         layer_idx=0,
         num_heads=NUM_HEADS,
