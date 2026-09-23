@@ -103,9 +103,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
             raise ValueError(
                 "tokens_per_block, prompt_capacity, window_tokens, chunk_tokens must be positive"
             )
-        if tokens_per_block & (tokens_per_block - 1):
-            # The TRT-LLM paged K/V kernels assert this (kvCacheUtils.h).
-            raise ValueError(f"tokens_per_block must be a power of two, got {tokens_per_block}")
+        if tokens_per_block & (tokens_per_block - 1) or tokens_per_block < 16:
+            # Power of two: the paged K/V kernels assert it. At least 16: the page size is
+            # part of the trtllm-gen kernel hash and no kernel exists below 16, in which
+            # case the op falls back to an unfused path that ignores the cached prefix
+            # without raising.
+            raise ValueError(
+                f"tokens_per_block must be a power of two >= 16, got {tokens_per_block}"
+            )
 
         self.tokens_per_block = tokens_per_block
         self.prompt_pages = _ceil_div(prompt_capacity, tokens_per_block)
