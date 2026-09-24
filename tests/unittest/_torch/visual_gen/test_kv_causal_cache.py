@@ -41,7 +41,7 @@ def make_cache(tokens_per_block: int, *, prompt_capacity=20, window_tokens=40, c
     )
 
 
-@pytest.fixture(params=[16, 32], ids=["tpb16", "tpb32"])
+@pytest.fixture(params=[32], ids=["tpb32"])
 def cache(request):
     mgr = make_cache(request.param)
     try:
@@ -204,10 +204,9 @@ def test_copy_batch_block_offsets_encodes_our_table(cache):
 def test_rejects_bad_geometry():
     with pytest.raises(ValueError):
         make_cache(0)
-    with pytest.raises(ValueError, match="power of two"):
-        make_cache(12)
-    with pytest.raises(ValueError, match=">= 16"):
-        make_cache(8)
+    for bad in (8, 12, 16, 64, 128):
+        with pytest.raises(ValueError, match="must be 32"):
+            make_cache(bad)
     with pytest.raises(ValueError):
         CausalKVCacheManager(
             num_layers=1,

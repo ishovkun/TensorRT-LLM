@@ -59,6 +59,10 @@ _DTYPES = {
 }
 
 
+# The only page size with shipped trtllm-gen paged context kernels.
+_TOKENS_PER_PAGE = 32
+
+
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
@@ -69,9 +73,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
     Args:
         num_layers: attention layers that persist K/V (the generator tower).
         num_kv_heads, head_dim, dtype: K/V geometry, per layer, per rank.
-        tokens_per_block: page size, a power of two (the TRT-LLM K/V kernels
-            require it). Otherwise a free performance knob; the mask makes
-            correctness independent of it.
+        tokens_per_block: page size; must be 32, the only value with shipped
+            trtllm-gen paged context kernels.
         prompt_capacity: largest prompt this cache accepts, in tokens
             (``text_cache_max_len``). Rounded up to whole pages.
         window_tokens: generator history kept attendable, in tokens
@@ -103,14 +106,12 @@ class CausalKVCacheManager(KVCacheManagerV2):
             raise ValueError(
                 "tokens_per_block, prompt_capacity, window_tokens, chunk_tokens must be positive"
             )
-        if tokens_per_block & (tokens_per_block - 1) or tokens_per_block < 16:
-            # Power of two: the paged K/V kernels assert it. At least 16: the page size is
-            # part of the trtllm-gen kernel hash and no kernel exists below 16, in which
-            # case the op falls back to an unfused path that ignores the cached prefix
-            # without raising.
-            raise ValueError(
-                f"tokens_per_block must be a power of two >= 16, got {tokens_per_block}"
-            )
+        if tokens_per_block != _TOKENS_PER_PAGE:
+            # The page size is part of the trtllm-gen kernel hash and the only paged
+            # context cubins shipped are for 32 tokens per page. Any other value misses
+            # the lookup, and the attention op then falls back to an unfused path that
+            # silently ignores the cached prefix instead of raising.
+            raise ValueError(f"tokens_per_block must be {_TOKENS_PER_PAGE}, got {tokens_per_block}")
 
         self.tokens_per_block = tokens_per_block
         self.prompt_pages = _ceil_div(prompt_capacity, tokens_per_block)

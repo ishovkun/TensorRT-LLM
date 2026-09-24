@@ -47,7 +47,7 @@ def reference_attention(q, keys, values):
     return out.squeeze(0).transpose(0, 1).reshape(q.shape[0], -1).to(q.dtype)
 
 
-@pytest.fixture(params=[16, 64], ids=["tpb16", "tpb64"])
+@pytest.fixture(params=[32], ids=["tpb32"])
 def cache(request):
     mgr = CausalKVCacheManager(
         num_layers=1,
@@ -55,7 +55,7 @@ def cache(request):
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_block=request.param,
-        prompt_capacity=40,
+        prompt_capacity=64,
         window_tokens=64,
         chunk_tokens=32,
     )
@@ -66,7 +66,7 @@ def cache(request):
 
 
 @pytest.mark.parametrize(
-    "prompt_len", [0, 17, 40], ids=["no-prompt", "partial-prompt", "full-prompt"]
+    "prompt_len", [0, 17, 64], ids=["no-prompt", "partial-prompt", "full-prompt"]
 )
 def test_rollout_matches_dense_reference(cache, prompt_len):
     torch.manual_seed(0)
@@ -111,6 +111,40 @@ def test_rollout_matches_dense_reference(cache, prompt_len):
         cache.commit_chunk()
         history_k.append(k)
         history_v.append(v)
+
+
+def test_full_prompt_takes_the_fused_path_and_reads_the_cache(cache):
+    """A page-exact prompt leaves nothing to mask, so this runs the fused trtllm-gen
+    kernel. It is the only configuration that does, and a silent fallback there
+    ignores the cached prefix -- which is what this asserts against."""
+    torch.manual_seed(2)
+    cache.open(prompt_len=cache.prompt_capacity)
+    assert cache.attention_mask(DEVICE) is None, "fused path requires no mask"
+    attn = CausalKVAttention(
+        cache,
+        layer_idx=0,
+        num_heads=NUM_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=DTYPE,
+    )
+    pk = torch.randn(cache.prompt_capacity, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    pv = torch.randn_like(pk)
+    cache.write_prompt_kv(0, pk, pv)
+    chunk = cache.chunk_tokens
+    q = torch.randn(chunk, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(chunk, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    v = torch.randn_like(k)
+    out = attn.forward(q, k, v)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out, reference_attention(q, torch.cat([pk, k]), torch.cat([pv, v])), rtol=2e-2, atol=2e-2
+    )
+    # A fallback that drops the cached prefix returns chunk-only attention; reject it.
+    chunk_only = reference_attention(q, k, v)
+    assert (out.float() - chunk_only.float()).abs().max() > 1e-2, (
+        "output matches chunk-only attention: the cached prefix was ignored"
+    )
 
 
 def test_dirty_steps_overwrite_in_place(cache):
