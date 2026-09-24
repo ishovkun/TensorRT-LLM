@@ -53,11 +53,14 @@ DEV = torch.device("cuda")
 
 
 class CuptiTimer:
-    def __init__(self, iters: int, warmup: int, l2_flush: bool, use_graph: bool) -> None:
+    def __init__(
+        self, iters: int, warmup: int, l2_flush: bool, use_graph: bool, dump: bool = False
+    ) -> None:
         from cupti import cupti
 
         self.cupti, self.iters, self.warmup = cupti, iters, warmup
         self.use_graph = use_graph
+        self.dump = dump
         self._l2 = (
             torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEV) if l2_flush else None
         )
@@ -143,8 +146,15 @@ class CuptiTimer:
             ks = [k for i in range(lo, hi) for k in by_corr.get(launches[i][2], [])]
             if not ks:
                 raise RuntimeError(f"{tag}: no kernel activity recorded for iteration {idx}")
-            us.append((max(k[1] for k in ks) - min(k[0] for k in ks)) / 1e3)
+            t_start = min(k[0] for k in ks)
+            us.append((max(k[1] for k in ks) - t_start) / 1e3)
             counts.append(sum(1 for k in ks if k[3] is not None))
+            if self.dump and idx == 0:
+                for k in sorted(ks, key=lambda r: r[0]):
+                    print(
+                        f"  k: {tag:6s} +{(k[0] - t_start) / 1e3:7.1f}us  {(k[1] - k[0]) / 1e3:7.1f}us  "
+                        f"{k[3] or '<memcpy/memset>'}"[:150]
+                    )
         us.sort()
         return {
             "median_us": statistics.median(us),
@@ -261,6 +271,9 @@ def main() -> None:
     ap.add_argument("--no-l2-flush", action="store_true")
     ap.add_argument("--no-graph", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--dump-kernels", action="store_true", help="print kernel names for iteration 0"
+    )
     args = ap.parse_args()
 
     gen = torch.Generator(device=DEV).manual_seed(args.seed)
@@ -328,7 +341,9 @@ def main() -> None:
         if err > 2e-2 or chunk_only < 1e-2:
             raise SystemExit(f"{name}: wrong result -- not benchmarking a broken path")
 
-    timer = CuptiTimer(args.iters, args.warmup, not args.no_l2_flush, not args.no_graph)
+    timer = CuptiTimer(
+        args.iters, args.warmup, not args.no_l2_flush, not args.no_graph, args.dump_kernels
+    )
     rows = []
     for name in chosen:
         try:
@@ -337,9 +352,9 @@ def main() -> None:
             if args.no_graph or "capture" not in str(e).lower():
                 raise
             print(f"{name}: graph capture failed ({str(e)[:60]}); timing eager", file=sys.stderr)
-            r = CuptiTimer(args.iters, args.warmup, not args.no_l2_flush, False).time(
-                variants[name], name
-            )
+            r = CuptiTimer(
+                args.iters, args.warmup, not args.no_l2_flush, False, args.dump_kernels
+            ).time(variants[name], name)
         rows.append((name, r))
 
     print(f"\n{'variant':8s} {'median us':>10s} {'min us':>9s} {'p90 us':>9s} {'kernels':>8s}")
