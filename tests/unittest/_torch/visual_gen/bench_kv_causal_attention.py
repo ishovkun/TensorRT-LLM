@@ -274,6 +274,13 @@ def main() -> None:
     ap.add_argument(
         "--dump-kernels", action="store_true", help="print kernel names for iteration 0"
     )
+    ap.add_argument(
+        "--square",
+        type=int,
+        default=0,
+        help="also time dense self-attention at S=N, trtllm-gen PackedQkv vs cuDNN SDPA; "
+        "N=8192 does the same q*kv work as the default rectangle",
+    )
     args = ap.parse_args()
 
     gen = torch.Generator(device=DEV).manual_seed(args.seed)
@@ -328,9 +335,53 @@ def main() -> None:
     variants = {"fused": run_fused, "split": run_split, "naive": run_naive}
     chosen = list(variants) if args.variant == "all" else [args.variant]
 
+    square_pair = ()
+    if args.square:
+        # Same kernel families on equal footing: dense self-attention, no cache, no pager.
+        from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as BaseTrtllm
+        from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import (
+            TrtllmAttention as VgTrtllm,
+        )
+
+        n = args.square
+        qs = torch.randn(n, NUM_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
+        ks = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
+        vs = torch.randn_like(ks)
+        qkv_sq = torch.cat((qs.flatten(1), ks.flatten(1), vs.flatten(1)), dim=-1)
+        vg = VgTrtllm(
+            layer_idx=0,
+            num_heads=NUM_HEADS,
+            head_dim=HEAD_DIM,
+            num_kv_heads=NUM_KV_HEADS,
+            dtype=DTYPE,
+            max_seq_len=n,
+            attention_metadata_state={},
+        )
+        md_sq = vg._prepare_metadata(1, n)
+
+        def run_sq_trtllm():
+            return BaseTrtllm.forward(
+                vg, qkv_sq, None, None, md_sq, attention_mask=PredefinedAttentionMask.FULL
+            )
+
+        def run_sq_cudnn():
+            return sdpa(qs, ks, vs)
+
+        variants["sq_trtllm"], variants["sq_cudnn"] = run_sq_trtllm, run_sq_cudnn
+        square_pair = ("sq_trtllm", "sq_cudnn")
+        chosen += list(square_pair)
+        ref_sq = sdpa(qs.float(), ks.float(), vs.float())
+        for name in square_pair:
+            out_sq = variants[name]().reshape(n, NUM_HEADS, HEAD_DIM).float()
+            torch.cuda.synchronize()
+            err = (out_sq - ref_sq).abs().max().item()
+            print(f"check {name:9s} max|err| vs dense fp32 = {err:.4f}   (S={n} square)")
+            if err > 2e-2:
+                raise SystemExit(f"{name}: wrong result")
+
     # Cross-check before timing: a silent fallback that ignores the prefix shows up here.
     ref = sdpa(q.float(), torch.cat((kp, k_hist, k)).float(), torch.cat((vp, v_hist, v)).float())
-    for name in chosen:
+    for name in [c for c in chosen if c not in square_pair]:
         out = variants[name]().reshape(CHUNK, NUM_HEADS, HEAD_DIM).float()
         torch.cuda.synchronize()
         err = (out - ref).abs().max().item()
@@ -357,10 +408,10 @@ def main() -> None:
             ).time(variants[name], name)
         rows.append((name, r))
 
-    print(f"\n{'variant':8s} {'median us':>10s} {'min us':>9s} {'p90 us':>9s} {'kernels':>8s}")
+    print(f"\n{'variant':10s} {'median us':>10s} {'min us':>9s} {'p90 us':>9s} {'kernels':>8s}")
     for name, r in rows:
         print(
-            f"{name:8s} {r['median_us']:10.1f} {r['min_us']:9.1f} {r['p90_us']:9.1f} {r['kernels']:8.0f}"
+            f"{name:10s} {r['median_us']:10.1f} {r['min_us']:9.1f} {r['p90_us']:9.1f} {r['kernels']:8.0f}"
         )
     print(f"\nsplit's small call: {small_name}")
     mgr.shutdown()
