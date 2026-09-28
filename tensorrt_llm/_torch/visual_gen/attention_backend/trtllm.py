@@ -19,7 +19,7 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
-from typing import Any, Optional, Union
+from typing import Optional, Union
 
 import torch
 
@@ -32,6 +32,7 @@ from ...attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ...metadata import KVCacheParams
+from ..cache import CausalKVCacheManager
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -257,7 +258,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len: int,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
-        kv_cache: Optional[Any] = None,
+        kv_cache: Optional[CausalKVCacheManager] = None,
         kv_cache_offset: int = 0,
         **kwargs,
     ) -> torch.Tensor:
@@ -335,7 +336,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     @torch.compiler.disable
     def _kv_cache_metadata(
-        self, kv_cache: Any, num_tokens: int, start: int
+        self, kv_cache: CausalKVCacheManager, num_tokens: int, start: int
     ) -> BaseTrtllmAttentionMetadata:
         """LLM-side metadata over ``kv_cache``: one context request of ``num_tokens``
         tokens with ``start`` tokens already cached. Re-prepared only when the table,
@@ -367,7 +368,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
-        kv_cache: Any,
+        kv_cache: CausalKVCacheManager,
         kv_cache_offset: int,
         attention_mask: PredefinedAttentionMask,
     ) -> torch.Tensor:

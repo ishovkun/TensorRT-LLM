@@ -181,14 +181,19 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
     assert saw_rotation, "test geometry should rotate the table"
 
 
-def test_seq_len_kv_device_is_persistent_and_lazy(cache):
+def test_length_tensors_are_persistent_and_rewritten_in_place(cache):
     cache.open(prompt_len=3)
-    t = cache.seq_len_kv_device(43)
+    t = cache.seq_len_kv(43)
     assert t.dtype == torch.int32 and t.item() == 43
-    assert cache.seq_len_kv_device(43) is t
-    assert cache.seq_len_kv_device(44) is t and t.item() == 44
+    assert cache.seq_len_kv(43) is t
+    assert cache.seq_len_kv(44) is t and t.item() == 44
     with pytest.raises(ValueError):
-        cache.seq_len_kv_device(cache.capacity + 1)
+        cache.seq_len_kv(cache.capacity + 1)
+    q = cache.seq_len_q(cache.chunk_tokens)
+    assert q is not t and q.item() == cache.chunk_tokens
+    assert cache.seq_len_q(5) is q and q.item() == 5
+    with pytest.raises(ValueError):
+        cache.seq_len_q(cache.chunk_tokens + 1)
 
 
 def test_copy_batch_block_offsets_encodes_our_table(cache):

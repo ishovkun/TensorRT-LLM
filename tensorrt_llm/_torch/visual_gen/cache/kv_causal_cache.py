@@ -183,7 +183,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._fixed: List[int] = []  # prompt-only pages, never rotated
         self._ring: Deque[int] = deque()  # shared page (if any), history, free pages
         self._table_device: Optional[torch.Tensor] = None
-        self._seq_len_kv_device: Optional[torch.Tensor] = None
+        self._seq_len_q_tensor: Optional[torch.Tensor] = None
+        self._seq_len_q_value = -1
+        self._seq_len_kv_tensor: Optional[torch.Tensor] = None
         self._seq_len_kv_value = -1
         self._table_version = 0
 
@@ -231,8 +233,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._ring = deque(pages[full_prompt_pages:])
         device = self.kv_buffer(0).device
         self._table_device = torch.empty(self.num_pages, dtype=torch.int32, device=device)
-        self._seq_len_kv_device = torch.zeros(1, dtype=torch.int32, device=device)
-        self._seq_len_kv_value = -1
+        self._seq_len_q_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+        self._seq_len_kv_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+        self._seq_len_q_value = self._seq_len_kv_value = -1
         self._publish_table()
 
     def close(self) -> None:
@@ -240,7 +243,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             return
         kv_cache, self._kv_cache = self._kv_cache, None
         self._table_device = None
-        self._seq_len_kv_device = None
+        self._seq_len_q_tensor = self._seq_len_kv_tensor = None
         self._release(kv_cache)
 
     def _release(self, kv_cache) -> None:
@@ -301,19 +304,30 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._require_open()
         return self._table_device
 
-    def seq_len_kv_device(self, seq_len_kv: int) -> torch.Tensor:
-        """A persistent int32 ``[1]`` device tensor holding ``seq_len_kv``.
+    def seq_len_q(self, num_new_tokens: int) -> torch.Tensor:
+        """Persistent int32 ``[1]`` device tensor: tokens this forward adds.
 
-        Rewritten only when the value changes, so denoising steps over the same
-        chunk cost nothing here.
+        Paged kernels read lengths from device memory; the tensor is rewritten in
+        place only when the value changes, so all layers of a forward and all
+        denoising steps over one chunk share a single write.
         """
         self._require_open()
-        if seq_len_kv != self._seq_len_kv_value:
-            if not 0 < seq_len_kv <= self.capacity:
-                raise ValueError(f"seq_len_kv {seq_len_kv} outside (0, {self.capacity}]")
-            self._seq_len_kv_device.fill_(seq_len_kv)
-            self._seq_len_kv_value = seq_len_kv
-        return self._seq_len_kv_device
+        if num_new_tokens != self._seq_len_q_value:
+            if not 0 < num_new_tokens <= self.chunk_tokens:
+                raise ValueError(f"seq_len_q {num_new_tokens} outside (0, {self.chunk_tokens}]")
+            self._seq_len_q_tensor.fill_(num_new_tokens)
+            self._seq_len_q_value = num_new_tokens
+        return self._seq_len_q_tensor
+
+    def seq_len_kv(self, num_keys: int) -> torch.Tensor:
+        """Persistent int32 ``[1]`` device tensor: cached tokens this forward attends over."""
+        self._require_open()
+        if num_keys != self._seq_len_kv_value:
+            if not 0 < num_keys <= self.capacity:
+                raise ValueError(f"seq_len_kv {num_keys} outside (0, {self.capacity}]")
+            self._seq_len_kv_tensor.fill_(num_keys)
+            self._seq_len_kv_value = num_keys
+        return self._seq_len_kv_tensor
 
     def commit_chunk(self) -> None:
         """The in-flight chunk's K/V are final; advance the window."""

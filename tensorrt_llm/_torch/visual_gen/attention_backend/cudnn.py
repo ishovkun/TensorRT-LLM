@@ -44,6 +44,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ...attention.backends.interface import PredefinedAttentionMask
+from ..cache import CausalKVCacheManager
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -242,7 +243,6 @@ class CuDNNAttention(AttentionBackend):
     _cudnn_handles: ClassVar[Dict[int, Any]] = {}
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
     _scales_cache: ClassVar[Dict[Tuple[int, str | None], Any]] = {}
-    _seq_len_q_cache: ClassVar[Dict[Tuple[int, int], torch.Tensor]] = {}
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
@@ -606,19 +606,13 @@ class CuDNNAttention(AttentionBackend):
                 cls._graph_cache[key] = bundle
             return bundle
 
-    @classmethod
-    def _seq_len_q_tensor(cls, s_q: int, device: torch.device) -> torch.Tensor:
-        """Persistent int32 ``[1]`` holding ``s_q``; graph replays need a stable pointer."""
-        key = (device.index if device.index is not None else torch.cuda.current_device(), s_q)
-        with cls._cache_lock:
-            t = cls._seq_len_q_cache.get(key)
-            if t is None:
-                t = torch.full((1,), s_q, dtype=torch.int32, device=device)
-                cls._seq_len_q_cache[key] = t
-            return t
-
     def _run_paged(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_cache: Any, kv_cache_offset: int
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: CausalKVCacheManager,
+        kv_cache_offset: int,
     ) -> torch.Tensor:
         """Write ``k``/``v`` into the cache, then attend over ``[0, past + offset + S_kv)``.
 
@@ -657,8 +651,8 @@ class CuDNNAttention(AttentionBackend):
             bundle.inputs["k"]: buf[:, 0],
             bundle.inputs["v"]: buf[:, 1],
             bundle.inputs["page_table"]: kv_cache.block_table_device(),
-            bundle.inputs["seq_len_q"]: self._seq_len_q_tensor(s_q, device),
-            bundle.inputs["seq_len_kv"]: kv_cache.seq_len_kv_device(seq_len_kv),
+            bundle.inputs["seq_len_q"]: kv_cache.seq_len_q(s_q),
+            bundle.inputs["seq_len_kv"]: kv_cache.seq_len_kv(seq_len_kv),
             bundle.outputs["o"]: output,
         }
         self._execute_graph(bundle, tensor_map, device)
@@ -885,7 +879,7 @@ class CuDNNAttention(AttentionBackend):
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
-        kv_cache: Optional[Any] = None,
+        kv_cache: Optional[CausalKVCacheManager] = None,
         kv_cache_offset: int = 0,
         **kwargs,
     ) -> torch.Tensor:
