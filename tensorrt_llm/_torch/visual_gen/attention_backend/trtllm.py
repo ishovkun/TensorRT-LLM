@@ -19,7 +19,7 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
@@ -31,6 +31,7 @@ from ...attention.backends.interface import AttentionRuntimeFeatures, Predefined
 from ...attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
+from ...metadata import KVCacheParams
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -221,6 +222,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
+        self._cache_md: Optional[BaseTrtllmAttentionMetadata] = None
+        self._cache_md_key: Optional[tuple] = None
 
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
@@ -254,6 +257,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len: int,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
+        kv_cache: Optional[Any] = None,
+        kv_cache_offset: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -276,10 +281,18 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             seq_len: Sequence length for Q
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
+            kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
+                tokens only: the fused kernel writes them at
+                ``past_tokens + kv_cache_offset`` and attends over everything cached
+                before them plus themselves.
+            kv_cache_offset: Tokens of the in-flight chunk already written by earlier
+                calls (a per-frame clean pass writes the chunk in pieces).
 
         Returns:
             Output tensor [B, S, H*D]
         """
+        if kv_cache is not None:
+            return self._forward_with_kv_cache(q, k, v, kv_cache, kv_cache_offset, attention_mask)
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
@@ -319,6 +332,63 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             )
         output = output.view(batch_size, seq_len, -1)
         return output
+
+    @torch.compiler.disable
+    def _kv_cache_metadata(
+        self, kv_cache: Any, num_tokens: int, start: int
+    ) -> BaseTrtllmAttentionMetadata:
+        """LLM-side metadata over ``kv_cache``: one context request of ``num_tokens``
+        tokens with ``start`` tokens already cached. Re-prepared only when the table,
+        ``start`` or ``num_tokens`` change, so denoising steps over one chunk reuse it."""
+        key = (id(kv_cache), kv_cache.table_version, start, num_tokens)
+        if key == self._cache_md_key:
+            return self._cache_md
+        md = self._cache_md
+        if md is None or md.kv_cache_manager is not kv_cache or md.max_num_tokens < num_tokens:
+            md = BaseTrtllmAttentionMetadata(
+                max_num_requests=1,
+                max_num_tokens=max(num_tokens, kv_cache.chunk_tokens),
+                max_num_sequences=1,
+                kv_cache_manager=kv_cache,
+                mapping=kv_cache.mapping,
+                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
+            )
+        md.seq_lens = torch.tensor([num_tokens], dtype=torch.int32)
+        md.num_contexts = 1
+        md.request_ids = [kv_cache.REQUEST_ID]
+        md.prompt_lens = [num_tokens]
+        md.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[start])
+        md.prepare()
+        self._cache_md, self._cache_md_key = md, key
+        return md
+
+    def _forward_with_kv_cache(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        kv_cache: Any,
+        kv_cache_offset: int,
+        attention_mask: PredefinedAttentionMask,
+    ) -> torch.Tensor:
+        if attention_mask != PredefinedAttentionMask.FULL:
+            raise NotImplementedError("K/V cache attention is full attention over the cache.")
+        if self.quant_attention_config is not None:
+            raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
+        if k is None or v is None:
+            raise ValueError("K/V cache attention needs separate q, k, v.")
+        b, s, _, _ = q.shape
+        if b != 1:
+            raise ValueError(f"the causal K/V cache holds one sequence; got batch {b}.")
+        if k.shape[1] != s:
+            raise ValueError("q and the new k/v must carry the same number of tokens.")
+        start = kv_cache.past_tokens + kv_cache_offset
+        metadata = self._kv_cache_metadata(kv_cache, s, start)
+        qkv = self._concat_qkv(q, k, v, 1, s, s)
+        output = super().forward(
+            q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
+        )
+        return output.view(1, s, -1)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

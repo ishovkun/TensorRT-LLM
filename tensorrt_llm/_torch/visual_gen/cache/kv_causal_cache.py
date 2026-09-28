@@ -16,34 +16,34 @@
 
 One rollout is one logical sequence laid out as
 
-    [ prompt (padded to whole pages) | generator history | in-flight chunk ]
+    [ prompt | generator history | in-flight chunk ]
 
 held in a single pool of ``KVCacheManagerV2``. The manager provides the pool
 and the pages; this class owns the block table and the sliding window. Nothing
 here uses the manager's own sliding-window eviction, block reuse, or request
 scheduling, and no ``LlmRequest`` is ever created.
 
-The attention kernel resolves every K/V address as ``pool_base + page * stride``
-against one base pointer per layer, and indexes logical token ``t`` at
-``table[t // tokens_per_block]``, slot ``t % tokens_per_block``. Two
-consequences shape everything below:
+Paged attention kernels index logical token ``t`` at page ``table[t // tpb]``,
+slot ``t % tpb``, and read ``[0, seq_len)`` of that sequence. Two consequences
+shape everything below:
 
-* The prompt has to live in the same pool as the history, or one attention call
-  could not read both. It is therefore the leading pages of this sequence.
-* Eviction must move the logical stream by whole pages, or slot offsets inside
-  pages would no longer match. Up to ``tokens_per_block - 1`` tokens older than
-  the window therefore stay resident at the front of the history; they, and the
-  unused tail of the prompt region, are excluded with an attention mask.
+* The prompt lives in the same pool as the history, at logical position 0 and
+  at its real length, so one attention call reads both. When its length is not
+  a page multiple, the first history tokens share its last page.
+* Eviction moves the logical stream by whole pages: the table rotates and no
+  history moves. The shared page is the one exception -- after a rotation the
+  prompt's tail is copied into the new first history page, at most
+  ``tpb - 1`` tokens per layer. Up to ``tpb - 1`` history tokens older than the
+  window stay resident at the front of the history; they are attended.
 
 Rotary positions are the caller's business and are absolute over the rollout;
-storage positions here restart at zero after each eviction and never grow past
-the resident capacity.
+storage positions here never grow past the resident capacity.
 """
 
 from __future__ import annotations
 
 from collections import deque
-from typing import Deque, List, Optional
+from typing import Deque, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -67,6 +67,17 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def _contiguous_runs(pages: List[int]) -> Iterator[Tuple[int, int, int]]:
+    """Split a page list into ``(first_index, first_page, count)`` runs of consecutive pages."""
+    i = 0
+    while i < len(pages):
+        j = i + 1
+        while j < len(pages) and pages[j] == pages[j - 1] + 1:
+            j += 1
+        yield i, pages[i], j - i
+        i = j
+
+
 class CausalKVCacheManager(KVCacheManagerV2):
     """``KVCacheManagerV2`` driven as one long-lived sequence with a caller-owned table.
 
@@ -76,7 +87,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         tokens_per_block: page size; must be 32, the only value with shipped
             trtllm-gen paged context kernels.
         prompt_capacity: largest prompt this cache accepts, in tokens
-            (``text_cache_max_len``). Rounded up to whole pages.
+            (``text_cache_max_len``).
         window_tokens: generator history kept attendable, in tokens
             (``window_frames * tokens_per_frame``).
         chunk_tokens: tokens written per forward (``chunk_frames * tokens_per_frame``).
@@ -102,9 +113,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
     ) -> None:
         if dtype not in _DTYPES:
             raise ValueError(f"CausalKVCacheManager supports bf16/fp16 K/V, got {dtype}")
-        if min(tokens_per_block, prompt_capacity, window_tokens, chunk_tokens) <= 0:
+        if min(tokens_per_block, window_tokens, chunk_tokens) <= 0 or prompt_capacity < 0:
             raise ValueError(
-                "tokens_per_block, prompt_capacity, window_tokens, chunk_tokens must be positive"
+                "tokens_per_block, window_tokens, chunk_tokens must be positive "
+                "and prompt_capacity non-negative"
             )
         if tokens_per_block != _TOKENS_PER_PAGE:
             # The page size is part of the trtllm-gen kernel hash and the only paged
@@ -114,19 +126,20 @@ class CausalKVCacheManager(KVCacheManagerV2):
             raise ValueError(f"tokens_per_block must be {_TOKENS_PER_PAGE}, got {tokens_per_block}")
 
         self.tokens_per_block = tokens_per_block
-        self.prompt_pages = _ceil_div(prompt_capacity, tokens_per_block)
-        self.prompt_capacity = self.prompt_pages * tokens_per_block
+        self.prompt_capacity = prompt_capacity
         self.window_tokens = window_tokens
         self.chunk_tokens = chunk_tokens
-        # History may exceed the window by up to a page after a whole-page
-        # eviction, and the in-flight chunk sits after it.
-        self.history_pages = _ceil_div(window_tokens + chunk_tokens, tokens_per_block) + 1
-        self.num_pages = self.prompt_pages + self.history_pages
-        capacity = self.num_pages * tokens_per_block
+        self._num_layers = num_layers
+        # Resident tokens peak at prompt + window + (tpb - 1) stale + chunk; the
+        # extra page covers the stale tokens and an unaligned prompt start.
+        self.num_pages = (
+            _ceil_div(prompt_capacity + window_tokens + chunk_tokens, tokens_per_block) + 1
+        )
+        self.capacity = self.num_pages * tokens_per_block
 
         kv_cache_config = KvCacheConfig(
-            max_tokens=capacity,
-            max_attention_window=[capacity],
+            max_tokens=self.capacity,
+            max_attention_window=[self.capacity],
             enable_block_reuse=False,
         )
         super().__init__(
@@ -136,27 +149,43 @@ class CausalKVCacheManager(KVCacheManagerV2):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
-            max_seq_len=capacity,
+            max_seq_len=self.capacity,
             max_batch_size=1,
             mapping=mapping if mapping is not None else Mapping(world_size=1, tp_size=1, rank=0),
             dtype=_DTYPES[dtype],
-            max_num_tokens=max(chunk_tokens, self.prompt_capacity),
+            max_num_tokens=max(chunk_tokens, prompt_capacity, 1),
             execution_stream=stream,
         )
-        if self.max_seq_len < capacity:
+        if self.max_seq_len < self.capacity:
             raise RuntimeError(
-                f"KVCacheManagerV2 clamped max_seq_len to {self.max_seq_len} < {capacity}; "
+                f"KVCacheManagerV2 clamped max_seq_len to {self.max_seq_len} < {self.capacity}; "
                 "the pool could not back the resident window"
             )
         if self.num_pools != 1:
             raise RuntimeError(f"expected one K/V pool, got {self.num_pools}")
+        # A physical slot holds every layer's page; ``get_buffers(layer)`` is a view
+        # whose index unit is one K/V page pair, so base page ``p`` of a layer sits
+        # at view index ``p * page_view_scale`` (1 for a single layer).
+        scales = {self.get_layer_page_index_scale(i) for i in range(num_layers)}
+        if len(scales) != 1:
+            raise RuntimeError(f"layers disagree on page index scale: {sorted(scales)}")
+        (scale,) = scales
+        if scale % self.kv_factor:
+            raise RuntimeError(
+                f"page index scale {scale} not a multiple of kv_factor {self.kv_factor}"
+            )
+        self.page_view_scale = scale // self.kv_factor
 
         self._kv_cache = None
         self._prompt_len = 0
         self._history_tokens = 0
         self._stale_tokens = 0
-        self._prompt_table: List[int] = []
-        self._ring: Deque[int] = deque()
+        self._fixed: List[int] = []  # prompt-only pages, never rotated
+        self._ring: Deque[int] = deque()  # shared page (if any), history, free pages
+        self._table_device: Optional[torch.Tensor] = None
+        self._seq_len_kv_device: Optional[torch.Tensor] = None
+        self._seq_len_kv_value = -1
+        self._table_version = 0
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -177,7 +206,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 raise RuntimeError("KVCacheManagerV2 could not resume the rollout sequence")
             # We never commit tokens; the pages are ours to address directly.
             kv_cache.stop_committing()
-            if not kv_cache.resize(self.num_pages * self.tokens_per_block):
+            if not kv_cache.resize(self.capacity):
                 raise RuntimeError(
                     f"KVCacheManagerV2 could not back {self.num_pages} pages for the rollout"
                 )
@@ -189,18 +218,29 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if len(pages) != self.num_pages or min(pages) < 0:
             self._release(kv_cache)
             raise RuntimeError(f"expected {self.num_pages} backed pages, got {pages}")
+        # Logical order is ours to choose; ascending keeps the ring a cyclic shift of
+        # consecutive pages, so a chunk's pages form at most two contiguous runs.
+        pages.sort()
 
         self._kv_cache = kv_cache
         self._prompt_len = prompt_len
         self._history_tokens = 0
         self._stale_tokens = 0
-        self._prompt_table = pages[: self.prompt_pages]
-        self._ring = deque(pages[self.prompt_pages :])
+        full_prompt_pages = prompt_len // self.tokens_per_block
+        self._fixed = pages[:full_prompt_pages]
+        self._ring = deque(pages[full_prompt_pages:])
+        device = self.kv_buffer(0).device
+        self._table_device = torch.empty(self.num_pages, dtype=torch.int32, device=device)
+        self._seq_len_kv_device = torch.zeros(1, dtype=torch.int32, device=device)
+        self._seq_len_kv_value = -1
+        self._publish_table()
 
     def close(self) -> None:
         if self._kv_cache is None:
             return
         kv_cache, self._kv_cache = self._kv_cache, None
+        self._table_device = None
+        self._seq_len_kv_device = None
         self._release(kv_cache)
 
     def _release(self, kv_cache) -> None:
@@ -237,36 +277,43 @@ class CausalKVCacheManager(KVCacheManagerV2):
     @property
     def past_tokens(self) -> int:
         """Logical position where the in-flight chunk's K/V are written."""
-        return self.prompt_capacity + self._history_tokens
+        return self._prompt_len + self._history_tokens
 
     @property
     def seq_len(self) -> int:
-        """Logical length attended by a forward: everything resident plus the chunk."""
+        """Logical length attended by a full-chunk forward: everything resident plus the chunk."""
         return self.past_tokens + self.chunk_tokens
 
+    @property
+    def table_version(self) -> int:
+        """Increments whenever the block table changes; lets callers cache derived metadata."""
+        return self._table_version
+
     def block_table(self) -> List[int]:
-        """Base page indices, in logical order, covering ``seq_len`` tokens."""
+        """Every base page in logical order. Kernels read only the first ``ceil(seq_len / tpb)``."""
         self._require_open()
-        needed = _ceil_div(self.seq_len, self.tokens_per_block)
-        assert needed <= self.num_pages, (needed, self.num_pages)
-        history_needed = needed - self.prompt_pages
-        return self._prompt_table + [self._ring[i] for i in range(history_needed)]
+        return self._fixed + list(self._ring)
 
-    def attention_mask(self, device: torch.device) -> Optional[torch.Tensor]:
-        """Dense ``[chunk_tokens, seq_len]`` bool mask, or ``None`` when nothing needs masking.
+    def block_table_device(self) -> torch.Tensor:
+        """``block_table()`` scaled to ``kv_buffer`` view indices, as a persistent int32
+        device tensor updated in place on commit. This is the page table for kernels
+        that read the ``kv_buffer`` view directly (cuDNN)."""
+        self._require_open()
+        return self._table_device
 
-        Excludes the unused tail of the prompt region and the stale head of the
-        history. Full attention otherwise; the batched clean pass adds its own
-        frame-causal structure on top of this.
+    def seq_len_kv_device(self, seq_len_kv: int) -> torch.Tensor:
+        """A persistent int32 ``[1]`` device tensor holding ``seq_len_kv``.
+
+        Rewritten only when the value changes, so denoising steps over the same
+        chunk cost nothing here.
         """
         self._require_open()
-        prompt_pad = self.prompt_capacity - self._prompt_len
-        if prompt_pad == 0 and self._stale_tokens == 0:
-            return None
-        allowed = torch.ones(self.seq_len, dtype=torch.bool, device=device)
-        allowed[self._prompt_len : self.prompt_capacity] = False
-        allowed[self.prompt_capacity : self.prompt_capacity + self._stale_tokens] = False
-        return allowed.unsqueeze(0).expand(self.chunk_tokens, -1).contiguous()
+        if seq_len_kv != self._seq_len_kv_value:
+            if not 0 < seq_len_kv <= self.capacity:
+                raise ValueError(f"seq_len_kv {seq_len_kv} outside (0, {self.capacity}]")
+            self._seq_len_kv_device.fill_(seq_len_kv)
+            self._seq_len_kv_value = seq_len_kv
+        return self._seq_len_kv_device
 
     def commit_chunk(self) -> None:
         """The in-flight chunk's K/V are final; advance the window."""
@@ -275,61 +322,118 @@ class CausalKVCacheManager(KVCacheManagerV2):
         excess = self._history_tokens - self.window_tokens
         if excess > 0:
             drop_pages = excess // self.tokens_per_block
-            for _ in range(drop_pages):
-                # Recycle: the oldest page becomes the newest free page.
-                self._ring.append(self._ring.popleft())
-            self._history_tokens -= drop_pages * self.tokens_per_block
+            if drop_pages:
+                old_head = self._ring[0]
+                for _ in range(drop_pages):
+                    # Recycle: the oldest page becomes the newest free page.
+                    self._ring.append(self._ring.popleft())
+                self._refill_shared_page(old_head, self._ring[0])
+                self._history_tokens -= drop_pages * self.tokens_per_block
+                self._publish_table()
             self._stale_tokens = self._history_tokens - self.window_tokens
         assert 0 <= self._stale_tokens < self.tokens_per_block, self._stale_tokens
-        assert self.seq_len <= self.num_pages * self.tokens_per_block
+        assert self.seq_len <= self.capacity
+
+    def _refill_shared_page(self, old_page: int, new_page: int) -> None:
+        """Copy the prompt's tail into the page that now starts the history."""
+        tail = self._prompt_len % self.tokens_per_block
+        if tail == 0:
+            return
+        old_page, new_page = old_page * self.page_view_scale, new_page * self.page_view_scale
+        for layer in range(self._num_layers):
+            buf = self.kv_buffer(layer)
+            buf[new_page, :, :, :tail].copy_(buf[old_page, :, :, :tail])
+
+    def _publish_table(self) -> None:
+        self._table_version += 1
+        table = torch.tensor(self.block_table(), dtype=torch.int32) * self.page_view_scale
+        self._table_device.copy_(table, non_blocking=True)
 
     # ------------------------------------------------------------------ direct pool access
 
     def kv_buffer(self, layer_idx: int) -> torch.Tensor:
-        """The layer's pool as ``[num_pages, 2, num_kv_heads, tokens_per_block, head_dim]``."""
+        """The layer's pool view ``[view_pages, 2, num_kv_heads, tokens_per_block, head_dim]``.
+
+        Base page ``p`` of this layer is ``buf[p * page_view_scale]``.
+        """
         buf = self.get_buffers(layer_idx, kv_layout="HND")
         if buf is None:
             raise RuntimeError(f"layer {layer_idx} has no K/V buffer")
         return buf
 
+    def write_range(self, layer_idx: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Write ``k``/``v`` ``[T, num_kv_heads, head_dim]`` at logical ``[start, start + T)``.
+
+        One copy per run of physically consecutive pages, plus one for each
+        partial page at either end. In steady state the ring is a cyclic shift of
+        consecutive pages, so a chunk costs two or three copies per tensor.
+        """
+        self._require_open()
+        n = k.shape[0]
+        if v.shape != k.shape:
+            raise ValueError(f"k/v shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}")
+        if n == 0:
+            return
+        if not 0 <= start <= start + n <= self.capacity:
+            raise ValueError(f"[{start}, {start + n}) outside the cache's {self.capacity} tokens")
+        buf = self.kv_buffer(layer_idx)
+        tpb, vs = self.tokens_per_block, self.page_view_scale
+        table = self.block_table()
+        if k.dtype != buf.dtype:
+            raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
+
+        t = 0
+        head = (-start) % tpb  # tokens that complete the page `start` falls in
+        if head:
+            m = min(head, n)
+            page, slot = table[start // tpb] * vs, start % tpb
+            buf[page, 0, :, slot : slot + m].copy_(k[:m].transpose(0, 1))
+            buf[page, 1, :, slot : slot + m].copy_(v[:m].transpose(0, 1))
+            t = m
+        full = (n - t) // tpb
+        if full:
+            first = (start + t) // tpb
+            src_k = k[t : t + full * tpb].view(full, tpb, -1, k.shape[-1]).transpose(1, 2)
+            src_v = v[t : t + full * tpb].view(full, tpb, -1, v.shape[-1]).transpose(1, 2)
+            for i, page, count in _contiguous_runs(table[first : first + full]):
+                dst = slice(page * vs, (page + count) * vs, vs)
+                buf[dst, 0].copy_(src_k[i : i + count])
+                buf[dst, 1].copy_(src_v[i : i + count])
+            t += full * tpb
+        if t < n:
+            page = table[(start + t) // tpb] * vs
+            buf[page, 0, :, : n - t].copy_(k[t:].transpose(0, 1))
+            buf[page, 1, :, : n - t].copy_(v[t:].transpose(0, 1))
+
+    def write_prompt_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Write the prompt's K/V (``[prompt_len, num_kv_heads, head_dim]``) at logical 0."""
+        self._require_open()
+        if k.shape[0] != self._prompt_len:
+            raise ValueError(
+                f"prompt K/V has {k.shape[0]} tokens, cache was opened with {self._prompt_len}"
+            )
+        self.write_range(layer_idx, 0, k, v)
+
     def _slots(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """View page index and slot of each logical position."""
         table = torch.tensor(self.block_table(), dtype=torch.long, device=positions.device)
-        return table[positions // self.tokens_per_block], positions % self.tokens_per_block
+        page = table[positions // self.tokens_per_block] * self.page_view_scale
+        return page, positions % self.tokens_per_block
 
     def write_kv(
         self, layer_idx: int, positions: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> None:
-        """Write ``k``/``v`` of shape ``[T, num_kv_heads, head_dim]`` at logical ``positions``.
-
-        Used for the prompt, which the reasoner produces outside any attention
-        call. The in-flight chunk is written by the attention kernel itself.
-        """
+        """Gather-indexed write at arbitrary logical ``positions``; ``write_range`` is the fast path."""
         buf = self.kv_buffer(layer_idx)
         page, slot = self._slots(positions)
-        # Advanced indices on dims 0 and 3 broadcast to [T] and move to the front,
-        # so the target is [T, num_kv_heads, head_dim] — the same layout as k/v.
-        buf[page, 0, :, slot, :] = k.to(buf.dtype)
-        buf[page, 1, :, slot, :] = v.to(buf.dtype)
+        buf[page, 0, :, slot, :] = k
+        buf[page, 1, :, slot, :] = v
 
     def read_kv(self, layer_idx: int, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Read back ``[T, num_kv_heads, head_dim]`` K and V at logical ``positions``."""
         buf = self.kv_buffer(layer_idx)
         page, slot = self._slots(positions)
         return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
-
-    def write_prompt_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        """Write the prompt's K/V (``[prompt_len, num_kv_heads, head_dim]``) and zero its padding."""
-        self._require_open()
-        if k.shape[0] != self._prompt_len:
-            raise ValueError(
-                f"prompt K/V has {k.shape[0]} tokens, cache was opened with {self._prompt_len}"
-            )
-        buf = self.kv_buffer(layer_idx)
-        positions = torch.arange(self.prompt_capacity, device=buf.device)
-        page, slot = self._slots(positions)
-        buf[page, :, :, slot, :] = 0
-        if self._prompt_len:
-            self.write_kv(layer_idx, positions[: self._prompt_len], k, v)
 
     # ------------------------------------------------------------------ manager hook
 
@@ -346,7 +450,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
         ``dst_tensor`` is ``[num_pools, max_num_sequences, 2, max_blocks_per_seq]``
         of int32: K offsets then V offsets per sequence, each ``page * index_scale``
-        (+ ``kv_offset`` for V) — the same encoding the manager's device copy uses.
+        (+ ``kv_offset`` for V) -- the same encoding the manager's device copy uses.
         """
         if list(request_ids) != [self.REQUEST_ID] or num_seqs != 1 or beam_width != 1:
             raise ValueError(

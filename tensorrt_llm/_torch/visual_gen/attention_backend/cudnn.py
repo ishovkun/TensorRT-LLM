@@ -203,6 +203,25 @@ class _CuDNNProblemShape:
     o_strides: Tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class _CuDNNPagedShape:
+    """Geometry of one paged-cache forward: one sequence, K/V read through a page table.
+
+    ``page_stride`` is the stride of one K (or V) block inside the pool, so the
+    pool's own layout, K and V blocks interleaved per page, is described to cuDNN
+    without a copy.
+    """
+
+    h_q: int
+    h_kv: int
+    s_q: int
+    d: int
+    num_pages: int
+    tokens_per_block: int
+    q_strides: Tuple[int, ...]
+    page_stride: Tuple[int, ...]
+
+
 # ============================================================================
 # VisualGen AttentionBackend class
 # ============================================================================
@@ -223,6 +242,7 @@ class CuDNNAttention(AttentionBackend):
     _cudnn_handles: ClassVar[Dict[int, Any]] = {}
     _graph_cache: ClassVar[Dict[Tuple, _CuDNNGraphBundle]] = {}
     _scales_cache: ClassVar[Dict[Tuple[int, str | None], Any]] = {}
+    _seq_len_q_cache: ClassVar[Dict[Tuple[int, int], torch.Tensor]] = {}
     _cache_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(
@@ -500,6 +520,151 @@ class CuDNNAttention(AttentionBackend):
             bundle.graph.execute(tensor_map, workspace, handle=handle)
 
     # ------------------------------------------------------------------
+    # Paged K/V cache (causal video rollout)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_paged_graph(
+        shape: _CuDNNPagedShape, sm_scale: float, io_dtype: torch.dtype
+    ) -> _CuDNNGraphBundle:
+        s = shape
+        io = _torch_to_cudnn_dtype(io_dtype)
+        f32, i32 = cudnn.data_type.FLOAT, cudnn.data_type.INT32
+        graph = cudnn.pygraph(
+            io_data_type=io,
+            intermediate_data_type=f32,
+            compute_data_type=f32,
+            name="visual_gen_sdpa_paged",
+        )
+        block = [s.num_pages, s.h_kv, s.tokens_per_block, s.d]
+        q_t = graph.tensor(
+            name="q", dim=[1, s.h_q, s.s_q, s.d], stride=list(s.q_strides), data_type=io
+        )
+        k_t = graph.tensor(name="k", dim=block, stride=list(s.page_stride), data_type=io)
+        v_t = graph.tensor(name="v", dim=block, stride=list(s.page_stride), data_type=io)
+        pt_t = graph.tensor(
+            name="page_table",
+            dim=[1, 1, s.num_pages, 1],
+            stride=[s.num_pages, s.num_pages, 1, 1],
+            data_type=i32,
+        )
+        lq_t = graph.tensor(name="seq_len_q", dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32)
+        lkv_t = graph.tensor(
+            name="seq_len_kv", dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32
+        )
+        # cuDNN accepts a page table only together with the padding mask and
+        # explicit lengths; the K/V length is what bounds the read of the table.
+        o_t, _ = graph.sdpa(
+            q=q_t,
+            k=k_t,
+            v=v_t,
+            is_inference=True,
+            attn_scale=sm_scale,
+            use_padding_mask=True,
+            seq_len_q=lq_t,
+            seq_len_kv=lkv_t,
+            paged_attention_k_table=pt_t,
+            paged_attention_v_table=pt_t,
+            paged_attention_max_seq_len_kv=s.num_pages * s.tokens_per_block,
+        )
+        o_strides = (s.s_q * s.h_q * s.d, s.d, s.h_q * s.d, 1)
+        o_t.set_output(True).set_dim([1, s.h_q, s.s_q, s.d]).set_stride(
+            list(o_strides)
+        ).set_data_type(io)
+        graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+        inputs = {
+            "q": q_t,
+            "k": k_t,
+            "v": v_t,
+            "page_table": pt_t,
+            "seq_len_q": lq_t,
+            "seq_len_kv": lkv_t,
+        }
+        return _CuDNNGraphBundle(
+            graph=graph,
+            workspace_size=graph.get_workspace_size(),
+            inputs=inputs,
+            outputs={"o": o_t},
+        )
+
+    @classmethod
+    @torch.compiler.disable
+    def _get_or_build_paged_graph(
+        cls, shape: _CuDNNPagedShape, sm_scale: float, io_dtype: torch.dtype, device: torch.device
+    ) -> _CuDNNGraphBundle:
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        key = (device_index, "paged", shape, sm_scale, io_dtype)
+        with cls._cache_lock:
+            bundle = cls._graph_cache.get(key)
+            if bundle is None:
+                cls.check_hardware_compatibility(device, None)
+                logger.debug(
+                    f"[CuDNNAttention] building paged graph on cuda:{device_index}: {shape}"
+                )
+                with torch.cuda.device(device_index):
+                    bundle = cls._build_paged_graph(shape, sm_scale, io_dtype)
+                cls._graph_cache[key] = bundle
+            return bundle
+
+    @classmethod
+    def _seq_len_q_tensor(cls, s_q: int, device: torch.device) -> torch.Tensor:
+        """Persistent int32 ``[1]`` holding ``s_q``; graph replays need a stable pointer."""
+        key = (device.index if device.index is not None else torch.cuda.current_device(), s_q)
+        with cls._cache_lock:
+            t = cls._seq_len_q_cache.get(key)
+            if t is None:
+                t = torch.full((1,), s_q, dtype=torch.int32, device=device)
+                cls._seq_len_q_cache[key] = t
+            return t
+
+    def _run_paged(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, kv_cache: Any, kv_cache_offset: int
+    ) -> torch.Tensor:
+        """Write ``k``/``v`` into the cache, then attend over ``[0, past + offset + S_kv)``.
+
+        ``q`` is ``[1, S_q, H, D]``; ``k``/``v`` are ``[1, S_new, H_kv, D]`` and land at
+        logical ``past_tokens + kv_cache_offset``. Output is ``[1, S_q, H, D]``.
+        """
+        if self.quant_dtype is not None:
+            raise NotImplementedError("cuDNN paged K/V cache attention runs unquantized only.")
+        self._validate_inputs(q, k, v)
+        b, s_q, h_q, d = q.shape
+        if b != 1:
+            raise ValueError(f"the causal K/V cache holds one sequence; got batch {b}.")
+        if q.stride(3) != 1:
+            raise ValueError("q must be contiguous along head_dim.")
+        device = q.device
+        start = kv_cache.past_tokens + kv_cache_offset
+        kv_cache.write_range(self.layer_idx, start, k[0], v[0])
+        seq_len_kv = start + k.shape[1]
+
+        buf = kv_cache.kv_buffer(self.layer_idx)
+        num_pages, _, h_kv, tokens_per_block, _ = buf.shape
+        shape = _CuDNNPagedShape(
+            h_q=h_q,
+            h_kv=h_kv,
+            s_q=s_q,
+            d=d,
+            num_pages=num_pages,
+            tokens_per_block=tokens_per_block,
+            q_strides=(q.stride(0), q.stride(2), q.stride(1), q.stride(3)),
+            page_stride=tuple(buf[:, 0].stride()),
+        )
+        bundle = self._get_or_build_paged_graph(shape, self.scale, buf.dtype, device)
+        output = torch.empty(1, s_q, h_q, d, dtype=buf.dtype, device=device)
+        tensor_map = {
+            bundle.inputs["q"]: q,
+            bundle.inputs["k"]: buf[:, 0],
+            bundle.inputs["v"]: buf[:, 1],
+            bundle.inputs["page_table"]: kv_cache.block_table_device(),
+            bundle.inputs["seq_len_q"]: self._seq_len_q_tensor(s_q, device),
+            bundle.inputs["seq_len_kv"]: kv_cache.seq_len_kv_device(seq_len_kv),
+            bundle.outputs["o"]: output,
+        }
+        self._execute_graph(bundle, tensor_map, device)
+        return output
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
@@ -720,6 +885,8 @@ class CuDNNAttention(AttentionBackend):
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Any] = None,
+        kv_cache_offset: int = 0,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -730,10 +897,19 @@ class CuDNNAttention(AttentionBackend):
             v: Value tensor ``[B, S_kv, H_kv, D_v]``.
             attention_mask: ``CAUSAL`` or ``FULL``.
             key_padding_mask: Not supported by this backend.
+            kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
+                tokens only: they are written at ``past_tokens + kv_cache_offset`` and
+                attention runs over everything cached before them plus themselves.
+            kv_cache_offset: Tokens of the in-flight chunk already written by earlier
+                calls (a per-frame clean pass writes the chunk in pieces).
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
+        if kv_cache is not None:
+            if self._resolve_mask(attention_mask, key_padding_mask):
+                raise NotImplementedError("K/V cache attention is full attention over the cache.")
+            return self._run_paged(q, k, v, kv_cache, kv_cache_offset)
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
