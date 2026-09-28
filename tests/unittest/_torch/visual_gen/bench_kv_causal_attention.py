@@ -17,6 +17,7 @@
     fused   one paged trtllm-gen Dense call over [prompt | history | chunk]
     split   paged gen->gen call + dense gen->prompt call + log-sum-exp merge
     naive   materialised torch.cat of all K/V + SDPA (the VANILLA path shipping today)
+    cudnn_paged  chunk K/V scattered into the same pages + cuDNN paged SDPA over the same table
 
 Timing is CUPTI kernel timestamps on CUDA-graph replays with an L2 flush before
 each iteration; ``cupti.finalize`` runs exactly once per process. The three
@@ -259,9 +260,81 @@ def small_attention_with_lse(q, k, v):
     return run_torch, "torch (unfused, several launches)"
 
 
+def cudnn_paged_attention(mgr, q, k, v):
+    """cuDNN's paged SDPA over the manager's pool and block table.
+
+    Returns ``(run, out)``: ``run`` scatters the chunk's K/V into its pages (the
+    work the fused trtllm-gen kernel does in-line) and executes the graph in place
+    into ``out`` ``[S, H, D]``.
+    """
+    import cudnn
+
+    buf = mgr.kv_buffer(0)  # [pages, 2, H_kv, tpb, D]
+    pages, _, h_kv, tpb, d = buf.shape
+    s_q, h_q = q.shape[0], q.shape[1]
+    table = mgr.block_table()
+    n_tab = len(table)
+    table_t = torch.tensor(table, dtype=torch.int32, device=DEV).view(1, 1, n_tab, 1)
+    len_q = torch.tensor([s_q], dtype=torch.int32, device=DEV).view(1, 1, 1, 1)
+    len_kv = torch.tensor([mgr.seq_len], dtype=torch.int32, device=DEV).view(1, 1, 1, 1)
+    out = torch.empty_like(q)
+
+    bf16, f32, i32 = cudnn.data_type.BFLOAT16, cudnn.data_type.FLOAT, cudnn.data_type.INT32
+    handle = cudnn.create_handle()
+    g = cudnn.pygraph(io_data_type=bf16, intermediate_data_type=f32, compute_data_type=f32)
+    shd = (s_q * h_q * d, d, h_q * d, 1)  # [B, H, S, D] view of an [S, H, D] buffer
+    q_t = g.tensor(name="q", dim=(1, h_q, s_q, d), stride=shd, data_type=bf16)
+    page_stride = (2 * h_kv * tpb * d, tpb * d, d, 1)  # K and V blocks interleave per page
+    k_t = g.tensor(name="k", dim=(pages, h_kv, tpb, d), stride=page_stride, data_type=bf16)
+    v_t = g.tensor(name="v", dim=(pages, h_kv, tpb, d), stride=page_stride, data_type=bf16)
+    pt_t = g.tensor(name="pt", dim=(1, 1, n_tab, 1), stride=(n_tab, n_tab, 1, 1), data_type=i32)
+    lq_t = g.tensor(name="len_q", dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=i32)
+    lkv_t = g.tensor(name="len_kv", dim=(1, 1, 1, 1), stride=(1, 1, 1, 1), data_type=i32)
+    o_t, _ = g.sdpa(
+        name="sdpa",
+        q=q_t,
+        k=k_t,
+        v=v_t,
+        is_inference=True,
+        attn_scale=d**-0.5,
+        use_padding_mask=True,
+        seq_len_q=lq_t,
+        seq_len_kv=lkv_t,
+        paged_attention_k_table=pt_t,
+        paged_attention_v_table=pt_t,
+        paged_attention_max_seq_len_kv=n_tab * tpb,
+    )
+    o_t.set_output(True).set_dim((1, h_q, s_q, d)).set_stride(shd).set_data_type(bf16)
+    g.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
+    ws = torch.empty(g.get_workspace_size(), dtype=torch.uint8, device=DEV)
+    tensor_map = {
+        q_t: q,
+        k_t: buf[:, 0],
+        v_t: buf[:, 1],
+        pt_t: table_t,
+        lq_t: len_q,
+        lkv_t: len_kv,
+        o_t: out,
+    }
+
+    pos = torch.arange(mgr.past_tokens, mgr.past_tokens + s_q, device=DEV)
+    page_idx, slot_idx = mgr._slots(pos)
+
+    def run():
+        buf[page_idx, 0, :, slot_idx, :] = k
+        buf[page_idx, 1, :, slot_idx, :] = v
+        cudnn.set_stream(handle=handle, stream=torch.cuda.current_stream().cuda_stream)
+        g.execute(tensor_map, ws, handle=handle)
+        return out
+
+    return run
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", choices=["fused", "split", "naive", "all"], default="all")
+    ap.add_argument(
+        "--variant", choices=["fused", "split", "naive", "cudnn_paged", "all"], default="all"
+    )
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument(
@@ -332,7 +405,12 @@ def main() -> None:
     def run_naive():
         return sdpa(q, torch.cat((kp, k_hist, k)), torch.cat((vp, v_hist, v)))
 
-    variants = {"fused": run_fused, "split": run_split, "naive": run_naive}
+    variants = {
+        "fused": run_fused,
+        "split": run_split,
+        "naive": run_naive,
+        "cudnn_paged": cudnn_paged_attention(mgr, q, k, v),
+    }
     chosen = list(variants) if args.variant == "all" else [args.variant]
 
     square_pair = ()
@@ -408,10 +486,10 @@ def main() -> None:
             ).time(variants[name], name)
         rows.append((name, r))
 
-    print(f"\n{'variant':10s} {'median us':>10s} {'min us':>9s} {'p90 us':>9s} {'kernels':>8s}")
+    print(f"\n{'variant':12s} {'median us':>10s} {'min us':>9s} {'p90 us':>9s} {'kernels':>8s}")
     for name, r in rows:
         print(
-            f"{name:10s} {r['median_us']:10.1f} {r['min_us']:9.1f} {r['p90_us']:9.1f} {r['kernels']:8.0f}"
+            f"{name:12s} {r['median_us']:10.1f} {r['min_us']:9.1f} {r['p90_us']:9.1f} {r['kernels']:8.0f}"
         )
     print(f"\nsplit's small call: {small_name}")
     mgr.shutdown()
