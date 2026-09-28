@@ -5,12 +5,13 @@
 
 from .base import CacheAccelerator
 from .cache_dit_accelerator import CacheDiTAccelerator
-from .kv_causal_cache import CausalKVCacheManager
+from .kv_causal_cache import MAX_SEGMENTS, CausalKVCacheManager
 from .teacache_accelerator import TeaCacheAccelerator
 
 __all__ = [
     "CacheAccelerator",
     "CacheDiTAccelerator",
     "CausalKVCacheManager",
+    "MAX_SEGMENTS",
     "TeaCacheAccelerator",
 ]

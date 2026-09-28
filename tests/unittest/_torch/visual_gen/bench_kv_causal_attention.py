@@ -25,8 +25,8 @@ is cross-checked against an fp32 dense reference before anything is timed, so a
 silent kernel fallback (one that drops the cached prefix) fails here rather than
 being measured.
 
-    python bench_kv_causal_attention.py --prompt-len 512
-    python bench_kv_causal_attention.py --q-tokens 394 --kv-offset 1182   # last clean-pass frame
+    python bench_kv_causal_attention.py --prompt-len 512                # a denoising step
+    python bench_kv_causal_attention.py --prompt-len 512 --segment-len 394   # the clean pass
 """
 
 from __future__ import annotations
@@ -226,13 +226,11 @@ def main() -> None:
         help="chunks committed before timing; > window/chunk so the table has rotated",
     )
     ap.add_argument(
-        "--q-tokens", type=int, default=CHUNK, help="new tokens per call (394 = one frame)"
-    )
-    ap.add_argument(
-        "--kv-offset",
+        "--segment-len",
         type=int,
         default=0,
-        help="chunk tokens already written before this call (per-frame clean pass)",
+        help="cut the chunk into segments causal across each other (394 = the clean "
+        "pass, one segment per frame); 0 = one segment (a denoising step)",
     )
     ap.add_argument("--no-l2-flush", action="store_true")
     ap.add_argument("--no-graph", action="store_true")
@@ -241,28 +239,26 @@ def main() -> None:
         "--dump-kernels", action="store_true", help="print kernel names for iteration 0"
     )
     args = ap.parse_args()
-    if args.kv_offset + args.q_tokens > CHUNK:
-        raise SystemExit("--kv-offset + --q-tokens must fit in one chunk")
+    segment_len = args.segment_len or CHUNK
+    if CHUNK % segment_len:
+        raise SystemExit(f"--segment-len must divide the chunk of {CHUNK} tokens")
+    num_segments = CHUNK // segment_len
+    segments = [(i * segment_len, (i + 1) * segment_len) for i in range(num_segments)]
 
     gen = torch.Generator(device=DEV).manual_seed(args.seed)
     window = args.window_frames * TOKENS_PER_FRAME
     mgr, kp, vp, k_hist, v_hist = build_cache(args.prompt_len, window, args.history_chunks, gen)
-    n_new, off = args.q_tokens, args.kv_offset
-    start = mgr.past_tokens + off
-    seq_len = start + n_new
+    start = mgr.past_tokens
+    seq_len = start + CHUNK
 
-    # Chunk tokens before the offset were written by earlier per-frame calls.
-    k_pre = torch.randn(off, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
-    v_pre = torch.randn_like(k_pre)
-    mgr.write_range(0, mgr.past_tokens, k_pre, v_pre)
-
-    q = torch.randn(n_new, NUM_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
-    k = torch.randn(n_new, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
+    q = torch.randn(CHUNK, NUM_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
+    k = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
     v = torch.randn_like(k)
     print(
-        f"geometry: q={n_new} keys={seq_len} (prompt {args.prompt_len} + history "
-        f"{mgr.history_tokens} [{mgr.stale_tokens} stale] + chunk offset {off} + new {n_new}) "
-        f"heads={NUM_HEADS}/{NUM_KV_HEADS} d={HEAD_DIM} page={TOKENS_PER_BLOCK} bf16"
+        f"geometry: q={CHUNK} keys={seq_len} (prompt {args.prompt_len} + history "
+        f"{mgr.history_tokens} [{mgr.stale_tokens} stale] + chunk {CHUNK}) in {num_segments} "
+        f"segment(s) of {segment_len}; heads={NUM_HEADS}/{NUM_KV_HEADS} d={HEAD_DIM} "
+        f"page={TOKENS_PER_BLOCK} bf16"
     )
 
     trtllm_attn = TrtllmAttention(
@@ -278,30 +274,42 @@ def main() -> None:
         layer_idx=0, num_heads=NUM_HEADS, head_dim=HEAD_DIM, num_kv_heads=NUM_KV_HEADS, dtype=DTYPE
     )
     q4, k4, v4 = q[None], k[None], v[None]
+    seg_arg = segment_len if num_segments > 1 else None
 
     def run_trtllm():
         return trtllm_attn.forward(
-            q4, k4, v4, batch_size=1, seq_len=n_new, kv_cache=mgr, kv_cache_offset=off
+            q4, k4, v4, batch_size=1, seq_len=CHUNK, kv_cache=mgr, segment_len=seg_arg
         )
 
     def run_cudnn_paged():
-        return cudnn_attn.forward(q4, k4, v4, kv_cache=mgr, kv_cache_offset=off)
+        return cudnn_attn.forward(q4, k4, v4, kv_cache=mgr, segment_len=seg_arg)
+
+    # Dense paths have no per-row key count, so segments cost them one launch each:
+    # that is the per-frame clean pass as the reference runs it.
+    def segmented(attend):
+        if num_segments == 1:
+            return attend(q, seq_len)
+        return torch.cat([attend(q[lo:hi], start + hi) for lo, hi in segments])
 
     # Slab: what a contiguous per-layer buffer would cost. Prompt and history are
     # already in place; a call writes the new tokens and attends over a slice.
     slab_k = torch.empty(mgr.capacity, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE)
     slab_v = torch.empty_like(slab_k)
-    resident_k, resident_v = torch.cat((kp, k_hist, k_pre)), torch.cat((vp, v_hist, v_pre))
+    resident_k, resident_v = torch.cat((kp, k_hist)), torch.cat((vp, v_hist))
     slab_k[:start].copy_(resident_k)
     slab_v[:start].copy_(resident_v)
 
     def run_slab():
         slab_k[start:seq_len].copy_(k)
         slab_v[start:seq_len].copy_(v)
-        return sdpa(q, slab_k[:seq_len], slab_v[:seq_len])
+        return segmented(lambda qq, n: sdpa(qq, slab_k[:n], slab_v[:n]))
 
     def run_naive():
-        return sdpa(q, torch.cat((resident_k, k)), torch.cat((resident_v, v)))
+        return segmented(
+            lambda qq, n: sdpa(
+                qq, torch.cat((resident_k, k[: n - start])), torch.cat((resident_v, v[: n - start]))
+            )
+        )
 
     variants = {
         "trtllm": run_trtllm,
@@ -310,12 +318,23 @@ def main() -> None:
         "naive": run_naive,
     }
     chosen = list(variants) if args.variant == "all" else [args.variant]
+    if "trtllm" in chosen and any(
+        (start + i * segment_len) % TOKENS_PER_BLOCK for i in range(1, num_segments)
+    ):
+        # The fused update kernel zeroes each request's V tail to its page end;
+        # segments sharing a page corrupt each other. Not a measurable variant here.
+        print("trtllm: skipped, segments must start on page boundaries on this backend")
+        chosen.remove("trtllm")
 
-    # Cross-check before timing: a silent fallback that ignores the prefix shows up here.
-    ref = sdpa(q.float(), torch.cat((resident_k, k)).float(), torch.cat((resident_v, v)).float())
+    # Cross-check before timing: a silent fallback that ignores the prefix, or a
+    # segment that sees the segments after it, shows up here.
+    all_k, all_v = torch.cat((resident_k, k)).float(), torch.cat((resident_v, v)).float()
+    ref = torch.cat(
+        [sdpa(q[lo:hi].float(), all_k[: start + hi], all_v[: start + hi]) for lo, hi in segments]
+    )
     chunk_only = sdpa(q.float(), k.float(), v.float())
     for name in chosen:
-        out = variants[name]().reshape(n_new, NUM_HEADS, HEAD_DIM).float()
+        out = variants[name]().reshape(CHUNK, NUM_HEADS, HEAD_DIM).float()
         torch.cuda.synchronize()
         err = (out - ref).abs().max().item()
         err_chunk = (out - chunk_only).abs().max().item()

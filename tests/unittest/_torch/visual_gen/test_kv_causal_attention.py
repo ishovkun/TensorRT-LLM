@@ -90,7 +90,7 @@ def make_backend(name):
     )
 
 
-def run(attn, cache, q, k, v, offset=0):
+def run(attn, cache, q, k, v, segment_len=None):
     """Per-token [T, H, D] in, per-token [T, H, D] out, whichever backend."""
     out = attn.forward(
         q[None],
@@ -99,7 +99,7 @@ def run(attn, cache, q, k, v, offset=0):
         batch_size=1,
         seq_len=q.shape[0],
         kv_cache=cache,
-        kv_cache_offset=offset,
+        segment_len=segment_len,
     )
     return out.reshape(q.shape[0], NUM_HEADS, HEAD_DIM)
 
@@ -160,36 +160,83 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
     assert saw_stale, "test geometry should attend over stale tokens at some step"
 
 
-@pytest.mark.parametrize("backend", BACKENDS)
-def test_chunk_written_in_pieces(cache, backend):
-    """A per-frame clean pass writes the chunk in slices at increasing offsets."""
+def check_segments(attn, cache, prompt_k, prompt_v, num_segments, chunk):
+    """One call cut into segments: segment i sees the cache plus segments <= i."""
+    n_hist = cache.history_tokens
+    hist = torch.arange(cache.prompt_len, cache.prompt_len + n_hist, device=DEVICE)
+    hk, hv = cache.read_kv(0, hist)
+    segment_len = chunk // num_segments
+    q, k, v = rand_qkv(chunk)
+    out = run(attn, cache, q, k, v, segment_len=segment_len)
+    torch.cuda.synchronize()
+    for i in range(num_segments):
+        lo, hi = i * segment_len, (i + 1) * segment_len
+        expected = reference_attention(
+            q[lo:hi], torch.cat([prompt_k, hk, k[:hi]]), torch.cat([prompt_v, hv, v[:hi]])
+        )
+        torch.testing.assert_close(out[lo:hi], expected, rtol=2e-2, atol=2e-2, msg=f"segment {i}")
+        if i < num_segments - 1:  # a segment must not see the segments after it
+            leaky = reference_attention(
+                q[lo:hi], torch.cat([prompt_k, hk, k]), torch.cat([prompt_v, hv, v])
+            )
+            assert (out[lo:hi].float() - leaky.float()).abs().max() > 1e-2, f"segment {i} leaks"
+    positions = torch.arange(cache.past_tokens, cache.past_tokens + chunk, device=DEVICE)
+    k_back, v_back = cache.read_kv(0, positions)
+    torch.testing.assert_close(k_back, k)
+    torch.testing.assert_close(v_back, v)
+    with pytest.raises(ValueError):
+        run(attn, cache, q, k, v, segment_len=7)
+
+
+def test_cudnn_segments_at_any_alignment(cache):
+    """The clean pass: one launch, four segments of 10 sharing pages mid-way."""
     torch.manual_seed(3)
     cache.open(prompt_len=9)
-    attn = make_backend(backend)
     pk, pv = rand_qkv(9)[1:]
     cache.write_prompt_kv(0, pk, pv)
     for _ in range(3):
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
         cache.commit_chunk()
-    n_hist = cache.history_tokens
-    hist = torch.arange(9, 9 + n_hist, device=DEVICE)
-    hk, hv = cache.read_kv(0, hist)
+    check_segments(make_backend("cudnn"), cache, pk, pv, num_segments=4, chunk=CHUNK)
 
-    pieces = (24, 16)
+
+def test_trtllm_segments_need_page_aligned_starts(cache):
+    """The fused update kernel zeroes V after each request to its page end, so
+    segments that share a page are refused on this backend rather than corrupted."""
+    torch.manual_seed(3)
+    cache.open(prompt_len=9)
+    cache.write_prompt_kv(0, *rand_qkv(9)[1:])
     q, k, v = rand_qkv(CHUNK)
-    off = 0
-    for n in pieces:
-        out = run(attn, cache, q[off : off + n], k[off : off + n], v[off : off + n], offset=off)
-        torch.cuda.synchronize()
-        visible = off + n
-        expected = reference_attention(
-            q[off:visible],
-            torch.cat([pk, hk, k[:visible]]),
-            torch.cat([pv, hv, v[:visible]]),
-        )
-        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"offset {off}")
-        off += n
+    with pytest.raises(NotImplementedError, match="page boundary"):
+        run(make_backend("trtllm"), cache, q, k, v, segment_len=CHUNK // 4)
+
+
+def test_trtllm_page_aligned_segments():
+    """With segment starts on page boundaries the fused path handles segments too."""
+    torch.manual_seed(4)
+    chunk = 64
+    mgr = CausalKVCacheManager(
+        num_layers=1,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=DTYPE,
+        tokens_per_block=32,
+        prompt_capacity=32,
+        window_tokens=128,
+        chunk_tokens=chunk,
+    )
+    try:
+        mgr.open(prompt_len=32)
+        pk, pv = rand_qkv(32)[1:]
+        mgr.write_prompt_kv(0, pk, pv)
+        _, k, v = rand_qkv(chunk)
+        mgr.write_range(0, mgr.past_tokens, k, v)
+        mgr.commit_chunk()
+        assert mgr.past_tokens % 32 == 0
+        check_segments(make_backend("trtllm"), mgr, pk, pv, num_segments=2, chunk=chunk)
+    finally:
+        mgr.shutdown()
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

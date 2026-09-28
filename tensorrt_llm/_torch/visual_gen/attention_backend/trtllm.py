@@ -32,7 +32,7 @@ from ...attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ...metadata import KVCacheParams
-from ..cache import CausalKVCacheManager
+from ..cache import MAX_SEGMENTS, CausalKVCacheManager
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -259,7 +259,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
         kv_cache: Optional[CausalKVCacheManager] = None,
-        kv_cache_offset: int = 0,
+        segment_len: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -283,17 +283,17 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
-                tokens only: the fused kernel writes them at
-                ``past_tokens + kv_cache_offset`` and attends over everything cached
-                before them plus themselves.
-            kv_cache_offset: Tokens of the in-flight chunk already written by earlier
-                calls (a per-frame clean pass writes the chunk in pieces).
+                tokens only: the fused kernel writes them at ``past_tokens`` and
+                attends over everything cached before them plus themselves.
+            segment_len: With ``kv_cache``, cuts the new tokens into consecutive
+                segments that are causal across each other and full within (the
+                clean pass uses one segment per frame). ``None``: one segment.
 
         Returns:
             Output tensor [B, S, H*D]
         """
         if kv_cache is not None:
-            return self._forward_with_kv_cache(q, k, v, kv_cache, kv_cache_offset, attention_mask)
+            return self._forward_with_kv_cache(q, k, v, kv_cache, segment_len, attention_mask)
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
@@ -336,29 +336,36 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     @torch.compiler.disable
     def _kv_cache_metadata(
-        self, kv_cache: CausalKVCacheManager, num_tokens: int, start: int
+        self, kv_cache: CausalKVCacheManager, num_segments: int, segment_len: int
     ) -> BaseTrtllmAttentionMetadata:
-        """LLM-side metadata over ``kv_cache``: one context request of ``num_tokens``
-        tokens with ``start`` tokens already cached. Re-prepared only when the table,
-        ``start`` or ``num_tokens`` change, so denoising steps over one chunk reuse it."""
-        key = (id(kv_cache), kv_cache.table_version, start, num_tokens)
+        """LLM-side metadata over ``kv_cache``: ``num_segments`` context requests of
+        ``segment_len`` tokens, segment ``i`` with ``past + i*segment_len`` tokens already
+        cached, so the segments are causal across each other and full within. All
+        requests are the one sequence and share its table. Re-prepared only when the
+        table, ``past`` or the segmentation change, so denoising steps reuse it."""
+        past = kv_cache.past_tokens
+        key = (id(kv_cache), kv_cache.table_version, past, num_segments, segment_len)
         if key == self._cache_md_key:
             return self._cache_md
+        num_tokens = num_segments * segment_len
         md = self._cache_md
         if md is None or md.kv_cache_manager is not kv_cache or md.max_num_tokens < num_tokens:
             md = BaseTrtllmAttentionMetadata(
-                max_num_requests=1,
+                max_num_requests=MAX_SEGMENTS,
                 max_num_tokens=max(num_tokens, kv_cache.chunk_tokens),
-                max_num_sequences=1,
+                max_num_sequences=MAX_SEGMENTS,
                 kv_cache_manager=kv_cache,
                 mapping=kv_cache.mapping,
                 runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
             )
-        md.seq_lens = torch.tensor([num_tokens], dtype=torch.int32)
-        md.num_contexts = 1
-        md.request_ids = [kv_cache.REQUEST_ID]
-        md.prompt_lens = [num_tokens]
-        md.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[start])
+        md.seq_lens = torch.full((num_segments,), segment_len, dtype=torch.int32)
+        md.num_contexts = num_segments
+        md.request_ids = [kv_cache.REQUEST_ID] * num_segments
+        md.prompt_lens = [segment_len] * num_segments
+        md.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[past + i * segment_len for i in range(num_segments)],
+        )
         md.prepare()
         self._cache_md, self._cache_md_key = md, key
         return md
@@ -369,7 +376,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         kv_cache: CausalKVCacheManager,
-        kv_cache_offset: int,
+        segment_len: Optional[int],
         attention_mask: PredefinedAttentionMask,
     ) -> torch.Tensor:
         if attention_mask != PredefinedAttentionMask.FULL:
@@ -378,18 +385,36 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
         if k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v.")
-        b, s, _, _ = q.shape
-        if b != 1:
-            raise ValueError(f"the causal K/V cache holds one sequence; got batch {b}.")
-        if k.shape[1] != s:
-            raise ValueError("q and the new k/v must carry the same number of tokens.")
-        start = kv_cache.past_tokens + kv_cache_offset
-        metadata = self._kv_cache_metadata(kv_cache, s, start)
-        qkv = self._concat_qkv(q, k, v, 1, s, s)
+        batch, num_tokens, _, _ = q.shape
+        if batch != 1 or k.shape[1] != num_tokens:
+            raise ValueError(
+                "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
+            )
+        segment_len = segment_len or num_tokens
+        if num_tokens % segment_len:
+            raise ValueError(f"{num_tokens} tokens do not split into segments of {segment_len}.")
+        num_segments = num_tokens // segment_len
+        tpb = kv_cache.tokens_per_block
+        if num_segments > 1 and any(
+            (kv_cache.past_tokens + i * segment_len) % tpb for i in range(1, num_segments)
+        ):
+            # The fused cache-update kernel zeroes the V rows after each request's last
+            # token to the end of that page (its FMHA loads whole pages and NaNs in
+            # masked V rows would leak through BMM2). Segments that share a page
+            # therefore erase each other's V. Only page-aligned segment starts are safe.
+            raise NotImplementedError(
+                f"TRTLLM K/V cache attention needs every segment to start on a "
+                f"{tpb}-token page boundary (past={kv_cache.past_tokens}, "
+                f"segment_len={segment_len}); use the CUDNN backend for other segmentations."
+            )
+        # The fused kernel writes each segment's K/V at its own cached length, so the
+        # cache needs no separate write here.
+        metadata = self._kv_cache_metadata(kv_cache, num_segments, segment_len)
+        qkv = self._concat_qkv(q, k, v, 1, num_tokens, num_tokens)
         output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
         )
-        return output.view(1, s, -1)
+        return output.view(1, num_tokens, -1)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import MAX_SEGMENTS, CausalKVCacheManager
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a GPU for the K/V pool"
@@ -76,7 +76,7 @@ def test_open_backs_every_page_once_and_publishes_the_table(cache):
     assert min(table) >= 0
     assert cache._fixed == []  # 13 tokens do not fill a page
     torch.testing.assert_close(
-        cache.block_table_device().cpu(),
+        cache.page_table()[0].cpu(),
         torch.tensor(table, dtype=torch.int32) * cache.page_view_scale,
     )
 
@@ -172,49 +172,61 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
         table = cache.block_table()
         assert sorted(table) == allocated
         assert len(set(table)) == len(table)
-        torch.testing.assert_close(
-            cache.block_table_device().cpu(),
-            torch.tensor(table, dtype=torch.int32) * cache.page_view_scale,
-        )
+        scaled = torch.tensor(table, dtype=torch.int32) * cache.page_view_scale
+        for row in cache.page_table(MAX_SEGMENTS).cpu():
+            torch.testing.assert_close(row, scaled)
 
     assert saw_stale, "test geometry should produce stale tokens"
     assert saw_rotation, "test geometry should rotate the table"
 
 
-def test_length_tensors_are_persistent_and_rewritten_in_place(cache):
+def test_segment_lengths_are_causal_across_segments_and_persistent(cache):
     cache.open(prompt_len=3)
-    t = cache.seq_len_kv(43)
-    assert t.dtype == torch.int32 and t.item() == 43
-    assert cache.seq_len_kv(43) is t
-    assert cache.seq_len_kv(44) is t and t.item() == 44
+    chunk = cache.chunk_tokens
+    q, kv = cache.segment_lengths(1, chunk)
+    assert q.dtype == kv.dtype == torch.int32
+    assert q.tolist() == [chunk] and kv.tolist() == [3 + chunk]
+
+    q4, kv4 = cache.segment_lengths(4, chunk // 4)
+    assert q4.data_ptr() == q.data_ptr() and kv4.data_ptr() == kv.data_ptr(), "same buffers"
+    assert q4.tolist() == [chunk // 4] * 4
+    assert kv4.tolist() == [3 + (i + 1) * chunk // 4 for i in range(4)]
+
+    cache.commit_chunk()
+    _, kv_after = cache.segment_lengths(4, chunk // 4)
+    assert kv_after.tolist() == [3 + chunk + (i + 1) * chunk // 4 for i in range(4)]
+
     with pytest.raises(ValueError):
-        cache.seq_len_kv(cache.capacity + 1)
-    q = cache.seq_len_q(cache.chunk_tokens)
-    assert q is not t and q.item() == cache.chunk_tokens
-    assert cache.seq_len_q(5) is q and q.item() == 5
+        cache.segment_lengths(MAX_SEGMENTS + 1, 1)
     with pytest.raises(ValueError):
-        cache.seq_len_q(cache.chunk_tokens + 1)
+        cache.segment_lengths(2, chunk)  # two full chunks do not fit one chunk
+    with pytest.raises(ValueError):
+        cache.page_table(MAX_SEGMENTS + 1)
 
 
 def test_copy_batch_block_offsets_encodes_our_table(cache):
     cache.open(prompt_len=3)
     for _ in range(5):
         cache.commit_chunk()
-    dst = torch.full((1, 1, 2, cache.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda")
-    cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID], 1, 1, 1)
+    dst = torch.full((1, 4, 2, cache.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda")
+    cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID] * 3, 1, 3, 3)
     torch.cuda.synchronize()
     table = torch.tensor(cache.block_table(), dtype=torch.int32, device="cuda")
     n = table.numel()
     scale = int(cache.index_scales[0])
     kv_offset = int(cache.kv_offset[0])
-    torch.testing.assert_close(dst[0, 0, 0, :n], table * scale)
-    torch.testing.assert_close(dst[0, 0, 1, :n], table * scale + kv_offset)
-    assert torch.count_nonzero(dst[0, 0, :, n:]) == 0, "unused entries are the safe page 0"
+    for seg in range(3):  # every segment row is the one sequence
+        torch.testing.assert_close(dst[0, seg, 0, :n], table * scale)
+        torch.testing.assert_close(dst[0, seg, 1, :n], table * scale + kv_offset)
+        assert torch.count_nonzero(dst[0, seg, :, n:]) == 0, "unused entries are the safe page 0"
+    assert (dst[0, 3] == -7).all(), "rows beyond num_seqs are untouched"
 
     with pytest.raises(ValueError):
         cache.copy_batch_block_offsets(dst, [1], 1, 1, 1)
     with pytest.raises(ValueError):
         cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID, 1], 1, 2, 2)
+    with pytest.raises(ValueError):
+        cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID] * 2, 1, 2, 1)
 
 
 def test_rejects_bad_geometry():
