@@ -634,6 +634,8 @@ class CuDNNAttention(AttentionBackend):
         v: torch.Tensor,
         kv_cache: CausalKVCacheManager,
         segment_len: Optional[int],
+        attention_mask: PredefinedAttentionMask,
+        key_padding_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Write ``k``/``v`` at ``past_tokens``, then attend over the cache.
 
@@ -641,6 +643,8 @@ class CuDNNAttention(AttentionBackend):
         ``segment_len`` cuts the ``S`` new tokens into consecutive segments that are
         causal across each other (``None``: one segment). Output is ``[1, S, H, D]``.
         """
+        if self._resolve_mask(attention_mask, key_padding_mask):
+            raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_dtype is not None:
             raise NotImplementedError("cuDNN paged K/V cache attention runs unquantized only.")
         self._validate_inputs(q, k, v)
@@ -933,9 +937,7 @@ class CuDNNAttention(AttentionBackend):
             Output tensor ``[B, S_q, H, D_v]``.
         """
         if kv_cache is not None:
-            if self._resolve_mask(attention_mask, key_padding_mask):
-                raise NotImplementedError("K/V cache attention is full attention over the cache.")
-            return self._run_paged(q, k, v, kv_cache, segment_len)
+            return self._run_paged(q, k, v, kv_cache, segment_len, attention_mask, key_padding_mask)
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
