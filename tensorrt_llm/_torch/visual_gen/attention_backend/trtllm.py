@@ -177,6 +177,56 @@ class TrtllmAttentionMetadata:
 
         return self._metadata
 
+    def prepare_with_kv_cache(
+        self, kv_cache: CausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
+    ) -> BaseTrtllmAttentionMetadata:
+        """Metadata over ``kv_cache``: ``num_causal_blocks`` context requests of
+        ``causal_block_size`` tokens, request ``i`` with ``past + i*causal_block_size``
+        tokens already cached. All requests are the one sequence and share its table.
+
+        One prepared object per (cache, table, past, blocking), shared by every layer
+        through the model-scoped state; the key changes only on commit or when the
+        blocking changes, so denoising steps reuse it as-is.
+        """
+        past = kv_cache.past_tokens
+        cache_key = (
+            "kv_cache",
+            id(kv_cache),
+            kv_cache.table_version,
+            past,
+            num_causal_blocks,
+            causal_block_size,
+        )
+        cached = self._metadata_cache.get(cache_key)
+        if cached is None:
+            # Entries for this cache with an older table or past are dead.
+            for stale in [k for k in self._metadata_cache if k[:2] == cache_key[:2]]:
+                del self._metadata_cache[stale]
+            metadata = BaseTrtllmAttentionMetadata(
+                max_num_requests=kv_cache.MAX_CAUSAL_BLOCKS,
+                max_num_tokens=kv_cache.chunk_tokens,
+                max_num_sequences=kv_cache.MAX_CAUSAL_BLOCKS,
+                kv_cache_manager=kv_cache,
+                mapping=kv_cache.mapping,
+                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
+            )
+            metadata.seq_lens = torch.full(
+                (num_causal_blocks,), causal_block_size, dtype=torch.int32
+            )
+            metadata.num_contexts = num_causal_blocks
+            metadata.request_ids = [kv_cache.REQUEST_ID] * num_causal_blocks
+            metadata.prompt_lens = [causal_block_size] * num_causal_blocks
+            metadata.kv_cache_params = KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[
+                    past + i * causal_block_size for i in range(num_causal_blocks)
+                ],
+            )
+            metadata.prepare()
+            cached = {"metadata": metadata, "prepared": True, "seq_lens": metadata.seq_lens}
+            self._metadata_cache[cache_key] = cached
+        return cached["metadata"]
+
 
 class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     """
@@ -223,14 +273,18 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         )
 
         self.quant_attention_config = quant_attention_config
-        self._cache_md: Optional[BaseTrtllmAttentionMetadata] = None
-        self._cache_md_key: Optional[tuple] = None
 
     # Needed to work with torch compile cause of attention metadata
     # make attn metadata as input for it to work
     @torch.compiler.disable
     def _prepare_metadata(self, batch_size: int, seq_len: int):
         return self.metadata.prepare(batch_size, seq_len)
+
+    @torch.compiler.disable
+    def _prepare_kv_cache_metadata(
+        self, kv_cache: CausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
+    ):
+        return self.metadata.prepare_with_kv_cache(kv_cache, num_causal_blocks, causal_block_size)
 
     @torch.compile
     def _concat_qkv(
@@ -334,44 +388,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         output = output.view(batch_size, seq_len, -1)
         return output
 
-    @torch.compiler.disable
-    def _kv_cache_metadata(
-        self, kv_cache: CausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
-    ) -> BaseTrtllmAttentionMetadata:
-        """LLM-side metadata over ``kv_cache``: ``num_causal_blocks`` context requests of
-        ``causal_block_size`` tokens, causal block ``i`` with ``past + i*causal_block_size`` tokens already
-        cached, so the causal blocks are causal across each other and full within. All
-        requests are the one sequence and share its table. Re-prepared only when the
-        table, ``past`` or the block size change, so denoising steps reuse it."""
-        past = kv_cache.past_tokens
-        key = (id(kv_cache), kv_cache.table_version, past, num_causal_blocks, causal_block_size)
-        if key == self._cache_md_key:
-            return self._cache_md
-        num_tokens = num_causal_blocks * causal_block_size
-        md = self._cache_md
-        if md is None or md.kv_cache_manager is not kv_cache or md.max_num_tokens < num_tokens:
-            md = BaseTrtllmAttentionMetadata(
-                max_num_requests=kv_cache.MAX_CAUSAL_BLOCKS,
-                max_num_tokens=max(num_tokens, kv_cache.chunk_tokens),
-                max_num_sequences=kv_cache.MAX_CAUSAL_BLOCKS,
-                kv_cache_manager=kv_cache,
-                mapping=kv_cache.mapping,
-                runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
-            )
-        md.seq_lens = torch.full((num_causal_blocks,), causal_block_size, dtype=torch.int32)
-        md.num_contexts = num_causal_blocks
-        md.request_ids = [kv_cache.REQUEST_ID] * num_causal_blocks
-        md.prompt_lens = [causal_block_size] * num_causal_blocks
-        md.kv_cache_params = KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=[
-                past + i * causal_block_size for i in range(num_causal_blocks)
-            ],
-        )
-        md.prepare()
-        self._cache_md, self._cache_md_key = md, key
-        return md
-
     def _forward_with_kv_cache(
         self,
         q: torch.Tensor,
@@ -414,7 +430,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             )
         # The fused kernel writes each causal block's K/V at its own cached length, so the
         # cache needs no separate write here.
-        metadata = self._kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
+        metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
         qkv = self._concat_qkv(q, k, v, 1, num_tokens, num_tokens)
         output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
