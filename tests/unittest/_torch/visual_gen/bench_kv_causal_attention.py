@@ -195,7 +195,7 @@ def build_cache(prompt_len: int, window_tokens: int, history_chunks: int, gen):
         k = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
         v = torch.randn_like(k)
         mgr.write_range(0, mgr.past_tokens, k, v)
-        mgr.commit_chunk()
+        mgr.commit()
         hist_k.append(k)
         hist_v.append(v)
     n = mgr.history_tokens

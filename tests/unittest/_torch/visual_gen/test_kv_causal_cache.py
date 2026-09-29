@@ -57,6 +57,25 @@ def rand_kv(n):
     return k, torch.randn_like(k)
 
 
+def read_kv(cache, layer, positions):
+    """Gather ``[T, num_kv_heads, head_dim]`` K and V at logical ``positions`` straight from the pool."""
+    buf = cache.kv_buffer(layer)
+    table = cache.page_table()[0].long()
+    page = table[positions // cache.tokens_per_block]
+    slot = positions % cache.tokens_per_block
+    return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
+
+
+def write_kv_reference(cache, layer, positions, k, v):
+    """Scatter one token at a time; the slow, obviously-correct write ``write_range`` must match."""
+    buf = cache.kv_buffer(layer)
+    table = cache.page_table()[0].long()
+    page = table[positions // cache.tokens_per_block]
+    slot = positions % cache.tokens_per_block
+    buf[page, 0, :, slot, :] = k
+    buf[page, 1, :, slot, :] = v
+
+
 def test_geometry_holds_prompt_window_stale_and_chunk(cache):
     tpb = cache.tokens_per_block
     assert cache.page_view_scale == NUM_LAYERS, "layers share a slot; one layer's view is strided"
@@ -103,9 +122,13 @@ def test_write_range_matches_indexed_write(cache):
         k, v = rand_kv(n)
         positions = torch.arange(start, start + n, device=DEVICE)
         for layer in range(NUM_LAYERS):
-            cache.write_kv(layer, positions, -k, -v)  # poison first
+            write_kv_reference(cache, layer, positions, -k, -v)  # poison first
             cache.write_range(layer, start, k, v)
-            k_back, v_back = cache.read_kv(layer, positions)
+            k_back, v_back = read_kv(cache, layer, positions)
+            torch.testing.assert_close(k_back, k)
+            torch.testing.assert_close(v_back, v)
+            write_kv_reference(cache, layer, positions, k, v)  # and the reference agrees
+            k_back, v_back = read_kv(cache, layer, positions)
             torch.testing.assert_close(k_back, k)
             torch.testing.assert_close(v_back, v)
 
@@ -115,7 +138,7 @@ def test_write_range_matches_indexed_write(cache):
     assert buf.shape[1:] == (2, NUM_KV_HEADS, tpb, HEAD_DIM)
     table = cache.block_table()
     positions = torch.arange(cache.capacity, device=DEVICE)
-    k_back, _ = cache.read_kv(layer, positions)
+    k_back, _ = read_kv(cache, layer, positions)
     for t in (0, 19, 20, tpb - 1, tpb, cache.capacity - 1):
         page, slot = table[t // tpb] * cache.page_view_scale, t % tpb
         torch.testing.assert_close(buf[page, 0, :, slot, :], k_back[t])
@@ -144,7 +167,7 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
         for layer in range(NUM_LAYERS):
             cache.write_range(layer, cache.past_tokens, stamp, -stamp)
         before = cache.table_version
-        cache.commit_chunk()
+        cache.commit()
         written.extend([c] * chunk)
         saw_rotation |= cache.table_version != before
         versions.add(cache.table_version)
@@ -159,12 +182,12 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
         for layer in range(NUM_LAYERS):
             # Resident history, oldest first, is the tail of what was written.
             hist = torch.arange(prompt_len, prompt_len + cache.history_tokens, device=DEVICE)
-            k_back, v_back = cache.read_kv(layer, hist)
+            k_back, v_back = read_kv(cache, layer, hist)
             expect = torch.tensor(written[-cache.history_tokens :], device=DEVICE, dtype=DTYPE)
             torch.testing.assert_close(k_back[:, 0, 0], expect)
             torch.testing.assert_close(v_back[:, 0, 0], -expect)
             # The prompt survived every rotation of the page it shares with the history.
-            k_p, v_p = cache.read_kv(layer, torch.arange(prompt_len, device=DEVICE))
+            k_p, v_p = read_kv(cache, layer, torch.arange(prompt_len, device=DEVICE))
             torch.testing.assert_close(k_p, pk)
             torch.testing.assert_close(v_p, pv)
 
@@ -192,7 +215,7 @@ def test_segment_lengths_are_causal_across_segments_and_persistent(cache):
     assert q4.tolist() == [chunk // 4] * 4
     assert kv4.tolist() == [3 + (i + 1) * chunk // 4 for i in range(4)]
 
-    cache.commit_chunk()
+    cache.commit()
     _, kv_after = cache.segment_lengths(4, chunk // 4)
     assert kv_after.tolist() == [3 + chunk + (i + 1) * chunk // 4 for i in range(4)]
 
@@ -207,7 +230,7 @@ def test_segment_lengths_are_causal_across_segments_and_persistent(cache):
 def test_copy_batch_block_offsets_encodes_our_table(cache):
     cache.open(prompt_len=3)
     for _ in range(5):
-        cache.commit_chunk()
+        cache.commit()
     dst = torch.full((1, 4, 2, cache.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda")
     cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID] * 3, 1, 3, 3)
     torch.cuda.synchronize()

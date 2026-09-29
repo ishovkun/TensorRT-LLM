@@ -265,10 +265,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
     # ------------------------------------------------------------------ geometry
 
     @property
-    def is_open(self) -> bool:
-        return self._kv_cache is not None
-
-    @property
     def prompt_len(self) -> int:
         return self._prompt_len
 
@@ -341,7 +337,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._segment_key = key
         return self._seq_len_q[:num_segments], self._seq_len_kv[:num_segments]
 
-    def commit_chunk(self) -> None:
+    def commit(self) -> None:
         """The in-flight chunk's K/V are final; advance the window."""
         self._require_open()
         self._history_tokens += self.chunk_tokens
@@ -439,27 +435,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 f"prompt K/V has {k.shape[0]} tokens, cache was opened with {self._prompt_len}"
             )
         self.write_range(layer_idx, 0, k, v)
-
-    def _slots(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """View page index and slot of each logical position."""
-        table = torch.tensor(self.block_table(), dtype=torch.long, device=positions.device)
-        page = table[positions // self.tokens_per_block] * self.page_view_scale
-        return page, positions % self.tokens_per_block
-
-    def write_kv(
-        self, layer_idx: int, positions: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-    ) -> None:
-        """Gather-indexed write at arbitrary logical ``positions``; ``write_range`` is the fast path."""
-        buf = self.kv_buffer(layer_idx)
-        page, slot = self._slots(positions)
-        buf[page, 0, :, slot, :] = k
-        buf[page, 1, :, slot, :] = v
-
-    def read_kv(self, layer_idx: int, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Read back ``[T, num_kv_heads, head_dim]`` K and V at logical ``positions``."""
-        buf = self.kv_buffer(layer_idx)
-        page, slot = self._slots(positions)
-        return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
     # ------------------------------------------------------------------ manager hook
 

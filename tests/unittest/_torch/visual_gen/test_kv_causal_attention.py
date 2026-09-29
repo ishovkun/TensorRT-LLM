@@ -104,6 +104,15 @@ def run(attn, cache, q, k, v, segment_len=None):
     return out.reshape(q.shape[0], NUM_HEADS, HEAD_DIM)
 
 
+def read_kv(cache, layer, positions):
+    """Gather ``[T, num_kv_heads, head_dim]`` K and V at logical ``positions`` straight from the pool."""
+    buf = cache.kv_buffer(layer)
+    table = cache.page_table()[0].long()
+    page = table[positions // cache.tokens_per_block]
+    slot = positions % cache.tokens_per_block
+    return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
+
+
 def rand_qkv(n):
     q = torch.randn(n, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
     k = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
@@ -150,11 +159,11 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
 
         # The call wrote this chunk's K/V where the next forward expects them.
         positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
-        k_back, v_back = cache.read_kv(0, positions)
+        k_back, v_back = read_kv(cache, 0, positions)
         torch.testing.assert_close(k_back, k)
         torch.testing.assert_close(v_back, v)
 
-        cache.commit_chunk()
+        cache.commit()
         history_k.append(k)
         history_v.append(v)
     assert saw_stale, "test geometry should attend over stale tokens at some step"
@@ -164,7 +173,7 @@ def check_segments(attn, cache, prompt_k, prompt_v, num_segments, chunk):
     """One call cut into segments: segment i sees the cache plus segments <= i."""
     n_hist = cache.history_tokens
     hist = torch.arange(cache.prompt_len, cache.prompt_len + n_hist, device=DEVICE)
-    hk, hv = cache.read_kv(0, hist)
+    hk, hv = read_kv(cache, 0, hist)
     segment_len = chunk // num_segments
     q, k, v = rand_qkv(chunk)
     out = run(attn, cache, q, k, v, segment_len=segment_len)
@@ -181,7 +190,7 @@ def check_segments(attn, cache, prompt_k, prompt_v, num_segments, chunk):
             )
             assert (out[lo:hi].float() - leaky.float()).abs().max() > 1e-2, f"segment {i} leaks"
     positions = torch.arange(cache.past_tokens, cache.past_tokens + chunk, device=DEVICE)
-    k_back, v_back = cache.read_kv(0, positions)
+    k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, k)
     torch.testing.assert_close(v_back, v)
     with pytest.raises(ValueError):
@@ -197,7 +206,7 @@ def test_cudnn_segments_at_any_alignment(cache):
     for _ in range(3):
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
-        cache.commit_chunk()
+        cache.commit()
     check_segments(make_backend("cudnn"), cache, pk, pv, num_segments=4, chunk=CHUNK)
 
 
@@ -232,7 +241,7 @@ def test_trtllm_page_aligned_segments():
         mgr.write_prompt_kv(0, pk, pv)
         _, k, v = rand_qkv(chunk)
         mgr.write_range(0, mgr.past_tokens, k, v)
-        mgr.commit_chunk()
+        mgr.commit()
         assert mgr.past_tokens % 32 == 0
         check_segments(make_backend("trtllm"), mgr, pk, pv, num_segments=2, chunk=chunk)
     finally:
@@ -254,6 +263,6 @@ def test_dirty_steps_overwrite_in_place(cache, backend):
     torch.cuda.synchronize()
     assert cache.past_tokens == past, "dirty steps must not advance the window"
     positions = torch.arange(past, past + CHUNK, device=DEVICE)
-    k_back, v_back = cache.read_kv(0, positions)
+    k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, last_k)
     torch.testing.assert_close(v_back, last_v)
