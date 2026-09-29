@@ -541,16 +541,16 @@ class CuDNNAttention(AttentionBackend):
             compute_data_type=f32,
             name="visual_gen_sdpa_paged",
         )
-        # Every cuDNN graph tensor is rank 4, [batch, heads, seq, dim]. Here the batch
-        # axis is the segment axis: one cuDNN sequence per segment. The lengths and
-        # the page table are per sequence, shared by all heads, so those dims are 1.
-        shared_by_heads = 1
-        one_per_seq = 1
-        scalar = 1
+        # cuDNN graph tensors are [batch, heads, seq, dim]; the batch axis here is the
+        # segment axis, one cuDNN sequence per segment.
+        # One K/V length per sequence: the same for every head, no seq or feature axis.
+        length_heads, length_seq, length_dim = 1, 1, 1
+        length_dims = [s.num_segments, length_heads, length_seq, length_dim]
+        # One page id per (sequence, page): the same table for every K/V head.
+        table_heads, table_dim = 1, 1
+        table_dims = [s.num_segments, table_heads, s.table_len, table_dim]
         q_dims = [s.num_segments, s.h_q, s.segment_len, s.d]
         kv_container_dims = [s.num_pages, s.h_kv, s.tokens_per_block, s.d]
-        table_dims = [s.num_segments, shared_by_heads, s.table_len, scalar]
-        length_dims = [s.num_segments, shared_by_heads, one_per_seq, scalar]
         # The output lands in an [S, H, D] buffer per segment, described as [B, H, S, D].
         o_strides = [s.segment_len * s.h_q * s.d, s.d, s.h_q * s.d, 1]
 
