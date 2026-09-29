@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.cache import MAX_SEGMENTS, CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs a GPU for the K/V pool"
@@ -196,7 +196,7 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
         assert sorted(table) == allocated
         assert len(set(table)) == len(table)
         scaled = torch.tensor(table, dtype=torch.int32) * cache.page_view_scale
-        for row in cache.page_table(MAX_SEGMENTS).cpu():
+        for row in cache.page_table(cache.MAX_SEGMENTS).cpu():
             torch.testing.assert_close(row, scaled)
 
     assert saw_stale, "test geometry should produce stale tokens"
@@ -220,11 +220,11 @@ def test_segment_lengths_are_causal_across_segments_and_persistent(cache):
     assert kv_after.tolist() == [3 + chunk + (i + 1) * chunk // 4 for i in range(4)]
 
     with pytest.raises(ValueError):
-        cache.segment_lengths(MAX_SEGMENTS + 1, 1)
+        cache.segment_lengths(cache.MAX_SEGMENTS + 1, 1)
     with pytest.raises(ValueError):
         cache.segment_lengths(2, chunk)  # two full chunks do not fit one chunk
     with pytest.raises(ValueError):
-        cache.page_table(MAX_SEGMENTS + 1)
+        cache.page_table(cache.MAX_SEGMENTS + 1)
 
 
 def test_copy_batch_block_offsets_encodes_our_table(cache):

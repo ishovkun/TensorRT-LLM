@@ -62,11 +62,6 @@ _DTYPES = {
 # The only page size with shipped trtllm-gen paged context kernels.
 _TOKENS_PER_PAGE = 32
 
-# Most segments one forward may cut the in-flight chunk into (the clean pass uses
-# one per frame). Sizes the persistent per-segment tensors so their pointers are
-# stable across forwards of different segment counts.
-MAX_SEGMENTS = 8
-
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
@@ -101,6 +96,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
     """
 
     REQUEST_ID = 0
+    # Most segments one forward may cut the in-flight chunk into (the clean pass uses
+    # one per frame). Sizes the persistent per-segment tensors so their pointers are
+    # stable across forwards of different segment counts.
+    MAX_SEGMENTS = 8
 
     def __init__(
         self,
@@ -237,10 +236,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._ring = deque(pages[full_prompt_pages:])
         device = self.kv_buffer(0).device
         self._page_table = torch.empty(
-            MAX_SEGMENTS, self.num_pages, dtype=torch.int32, device=device
+            self.MAX_SEGMENTS, self.num_pages, dtype=torch.int32, device=device
         )
-        self._seq_len_q = torch.zeros(MAX_SEGMENTS, dtype=torch.int32, device=device)
-        self._seq_len_kv = torch.zeros(MAX_SEGMENTS, dtype=torch.int32, device=device)
+        self._seq_len_q = torch.zeros(self.MAX_SEGMENTS, dtype=torch.int32, device=device)
+        self._seq_len_kv = torch.zeros(self.MAX_SEGMENTS, dtype=torch.int32, device=device)
         self._segment_key = None
         self._publish_table()
 
@@ -305,8 +304,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
         page table for kernels that read the ``kv_buffer`` view directly (cuDNN).
         """
         self._require_open()
-        if not 0 < num_segments <= MAX_SEGMENTS:
-            raise ValueError(f"num_segments {num_segments} outside (0, {MAX_SEGMENTS}]")
+        if not 0 < num_segments <= self.MAX_SEGMENTS:
+            raise ValueError(f"num_segments {num_segments} outside (0, {self.MAX_SEGMENTS}]")
         return self._page_table[:num_segments]
 
     def segment_lengths(
@@ -322,8 +321,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
         and every denoising step over one chunk share a single write.
         """
         self._require_open()
-        if not 0 < num_segments <= MAX_SEGMENTS:
-            raise ValueError(f"num_segments {num_segments} outside (0, {MAX_SEGMENTS}]")
+        if not 0 < num_segments <= self.MAX_SEGMENTS:
+            raise ValueError(f"num_segments {num_segments} outside (0, {self.MAX_SEGMENTS}]")
         if not 0 < num_segments * segment_len <= self.chunk_tokens:
             raise ValueError(
                 f"{num_segments} segments of {segment_len} tokens do not fit a "
@@ -369,7 +368,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def _publish_table(self) -> None:
         self._table_version += 1
         table = torch.tensor(self.block_table(), dtype=torch.int32) * self.page_view_scale
-        self._page_table.copy_(table.expand(MAX_SEGMENTS, -1))
+        self._page_table.copy_(table.expand(self.MAX_SEGMENTS, -1))
 
     # ------------------------------------------------------------------ direct pool access
 
@@ -457,14 +456,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """
         ids = list(request_ids)
         if (
-            not 0 < len(ids) <= MAX_SEGMENTS
+            not 0 < len(ids) <= self.MAX_SEGMENTS
             or any(r != self.REQUEST_ID for r in ids)
             or num_seqs != len(ids)
             or beam_width != 1
         ):
             raise ValueError(
                 f"CausalKVCacheManager serves one sequence (id {self.REQUEST_ID}) in up to "
-                f"{MAX_SEGMENTS} segments; got request_ids={ids}, num_seqs={num_seqs}, "
+                f"{self.MAX_SEGMENTS} segments; got request_ids={ids}, num_seqs={num_seqs}, "
                 f"beam_width={beam_width}"
             )
         table = torch.tensor(self.block_table(), dtype=torch.int32)

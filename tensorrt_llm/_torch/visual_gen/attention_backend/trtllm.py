@@ -32,7 +32,7 @@ from ...attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from ...attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ...attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ...metadata import KVCacheParams
-from ..cache import MAX_SEGMENTS, CausalKVCacheManager
+from ..cache import CausalKVCacheManager
 from .interface import AttentionBackend, AttentionTensorLayout
 
 
@@ -351,9 +351,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         md = self._cache_md
         if md is None or md.kv_cache_manager is not kv_cache or md.max_num_tokens < num_tokens:
             md = BaseTrtllmAttentionMetadata(
-                max_num_requests=MAX_SEGMENTS,
+                max_num_requests=kv_cache.MAX_SEGMENTS,
                 max_num_tokens=max(num_tokens, kv_cache.chunk_tokens),
-                max_num_sequences=MAX_SEGMENTS,
+                max_num_sequences=kv_cache.MAX_SEGMENTS,
                 kv_cache_manager=kv_cache,
                 mapping=kv_cache.mapping,
                 runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
