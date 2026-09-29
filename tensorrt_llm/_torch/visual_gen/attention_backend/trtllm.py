@@ -259,7 +259,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
         kv_cache: Optional[CausalKVCacheManager] = None,
-        segment_len: Optional[int] = None,
+        causal_block_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -285,15 +285,15 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: the fused kernel writes them at ``past_tokens`` and
                 attends over everything cached before them plus themselves.
-            segment_len: With ``kv_cache``, cuts the new tokens into consecutive
-                segments that are causal across each other and full within (the
-                clean pass uses one segment per frame). ``None``: one segment.
+            causal_block_size: With ``kv_cache``, cuts the new tokens into consecutive
+                causal blocks: full attention within a block, causal across blocks (the
+                clean pass uses one block per frame). ``None``: one causal block.
 
         Returns:
             Output tensor [B, S, H*D]
         """
         if kv_cache is not None:
-            return self._forward_with_kv_cache(q, k, v, kv_cache, segment_len, attention_mask)
+            return self._forward_with_kv_cache(q, k, v, kv_cache, causal_block_size, attention_mask)
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
@@ -336,35 +336,37 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     @torch.compiler.disable
     def _kv_cache_metadata(
-        self, kv_cache: CausalKVCacheManager, num_segments: int, segment_len: int
+        self, kv_cache: CausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
     ) -> BaseTrtllmAttentionMetadata:
-        """LLM-side metadata over ``kv_cache``: ``num_segments`` context requests of
-        ``segment_len`` tokens, segment ``i`` with ``past + i*segment_len`` tokens already
-        cached, so the segments are causal across each other and full within. All
+        """LLM-side metadata over ``kv_cache``: ``num_causal_blocks`` context requests of
+        ``causal_block_size`` tokens, causal block ``i`` with ``past + i*causal_block_size`` tokens already
+        cached, so the causal blocks are causal across each other and full within. All
         requests are the one sequence and share its table. Re-prepared only when the
-        table, ``past`` or the segmentation change, so denoising steps reuse it."""
+        table, ``past`` or the block size change, so denoising steps reuse it."""
         past = kv_cache.past_tokens
-        key = (id(kv_cache), kv_cache.table_version, past, num_segments, segment_len)
+        key = (id(kv_cache), kv_cache.table_version, past, num_causal_blocks, causal_block_size)
         if key == self._cache_md_key:
             return self._cache_md
-        num_tokens = num_segments * segment_len
+        num_tokens = num_causal_blocks * causal_block_size
         md = self._cache_md
         if md is None or md.kv_cache_manager is not kv_cache or md.max_num_tokens < num_tokens:
             md = BaseTrtllmAttentionMetadata(
-                max_num_requests=kv_cache.MAX_SEGMENTS,
+                max_num_requests=kv_cache.MAX_CAUSAL_BLOCKS,
                 max_num_tokens=max(num_tokens, kv_cache.chunk_tokens),
-                max_num_sequences=kv_cache.MAX_SEGMENTS,
+                max_num_sequences=kv_cache.MAX_CAUSAL_BLOCKS,
                 kv_cache_manager=kv_cache,
                 mapping=kv_cache.mapping,
                 runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
             )
-        md.seq_lens = torch.full((num_segments,), segment_len, dtype=torch.int32)
-        md.num_contexts = num_segments
-        md.request_ids = [kv_cache.REQUEST_ID] * num_segments
-        md.prompt_lens = [segment_len] * num_segments
+        md.seq_lens = torch.full((num_causal_blocks,), causal_block_size, dtype=torch.int32)
+        md.num_contexts = num_causal_blocks
+        md.request_ids = [kv_cache.REQUEST_ID] * num_causal_blocks
+        md.prompt_lens = [causal_block_size] * num_causal_blocks
         md.kv_cache_params = KVCacheParams(
             use_cache=True,
-            num_cached_tokens_per_seq=[past + i * segment_len for i in range(num_segments)],
+            num_cached_tokens_per_seq=[
+                past + i * causal_block_size for i in range(num_causal_blocks)
+            ],
         )
         md.prepare()
         self._cache_md, self._cache_md_key = md, key
@@ -376,7 +378,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         kv_cache: CausalKVCacheManager,
-        segment_len: Optional[int],
+        causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
     ) -> torch.Tensor:
         if attention_mask != PredefinedAttentionMask.FULL:
@@ -390,26 +392,29 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise ValueError(
                 "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
             )
-        segment_len = segment_len or num_tokens
-        if num_tokens % segment_len:
-            raise ValueError(f"{num_tokens} tokens do not split into segments of {segment_len}.")
-        num_segments = num_tokens // segment_len
+        causal_block_size = causal_block_size or num_tokens
+        if num_tokens % causal_block_size:
+            raise ValueError(
+                f"{num_tokens} tokens do not split into causal blocks of {causal_block_size}."
+            )
+        num_causal_blocks = num_tokens // causal_block_size
         tpb = kv_cache.tokens_per_block
-        if num_segments > 1 and any(
-            (kv_cache.past_tokens + i * segment_len) % tpb for i in range(1, num_segments)
+        if num_causal_blocks > 1 and any(
+            (kv_cache.past_tokens + i * causal_block_size) % tpb
+            for i in range(1, num_causal_blocks)
         ):
             # The fused cache-update kernel zeroes the V rows after each request's last
             # token to the end of that page (its FMHA loads whole pages and NaNs in
-            # masked V rows would leak through BMM2). Segments that share a page
-            # therefore erase each other's V. Only page-aligned segment starts are safe.
+            # masked V rows would leak through BMM2). Causal blocks that share a page
+            # therefore erase each other's V. Only page-aligned causal block starts are safe.
             raise NotImplementedError(
-                f"TRTLLM K/V cache attention needs every segment to start on a "
+                f"TRTLLM K/V cache attention needs every causal block to start on a "
                 f"{tpb}-token page boundary (past={kv_cache.past_tokens}, "
-                f"segment_len={segment_len}); use the CUDNN backend for other segmentations."
+                f"causal_block_size={causal_block_size}); use the CUDNN backend for other block sizes."
             )
-        # The fused kernel writes each segment's K/V at its own cached length, so the
+        # The fused kernel writes each causal block's K/V at its own cached length, so the
         # cache needs no separate write here.
-        metadata = self._kv_cache_metadata(kv_cache, num_segments, segment_len)
+        metadata = self._kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
         qkv = self._concat_qkv(q, k, v, 1, num_tokens, num_tokens)
         output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL

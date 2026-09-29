@@ -196,35 +196,35 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
         assert sorted(table) == allocated
         assert len(set(table)) == len(table)
         scaled = torch.tensor(table, dtype=torch.int32) * cache.page_view_scale
-        for row in cache.page_table(cache.MAX_SEGMENTS).cpu():
+        for row in cache.page_table(cache.MAX_CAUSAL_BLOCKS).cpu():
             torch.testing.assert_close(row, scaled)
 
     assert saw_stale, "test geometry should produce stale tokens"
     assert saw_rotation, "test geometry should rotate the table"
 
 
-def test_segment_lengths_are_causal_across_segments_and_persistent(cache):
+def test_causal_block_lengths_are_causal_across_blocks_and_persistent(cache):
     cache.open(prompt_len=3)
     chunk = cache.chunk_tokens
-    q, kv = cache.segment_lengths(1, chunk)
+    q, kv = cache.causal_block_lengths(1, chunk)
     assert q.dtype == kv.dtype == torch.int32
     assert q.tolist() == [chunk] and kv.tolist() == [3 + chunk]
 
-    q4, kv4 = cache.segment_lengths(4, chunk // 4)
+    q4, kv4 = cache.causal_block_lengths(4, chunk // 4)
     assert q4.data_ptr() == q.data_ptr() and kv4.data_ptr() == kv.data_ptr(), "same buffers"
     assert q4.tolist() == [chunk // 4] * 4
     assert kv4.tolist() == [3 + (i + 1) * chunk // 4 for i in range(4)]
 
     cache.commit()
-    _, kv_after = cache.segment_lengths(4, chunk // 4)
+    _, kv_after = cache.causal_block_lengths(4, chunk // 4)
     assert kv_after.tolist() == [3 + chunk + (i + 1) * chunk // 4 for i in range(4)]
 
     with pytest.raises(ValueError):
-        cache.segment_lengths(cache.MAX_SEGMENTS + 1, 1)
+        cache.causal_block_lengths(cache.MAX_CAUSAL_BLOCKS + 1, 1)
     with pytest.raises(ValueError):
-        cache.segment_lengths(2, chunk)  # two full chunks do not fit one chunk
+        cache.causal_block_lengths(2, chunk)  # two full chunks do not fit one chunk
     with pytest.raises(ValueError):
-        cache.page_table(cache.MAX_SEGMENTS + 1)
+        cache.page_table(cache.MAX_CAUSAL_BLOCKS + 1)
 
 
 def test_copy_batch_block_offsets_encodes_our_table(cache):
@@ -238,10 +238,12 @@ def test_copy_batch_block_offsets_encodes_our_table(cache):
     n = table.numel()
     scale = int(cache.index_scales[0])
     kv_offset = int(cache.kv_offset[0])
-    for seg in range(3):  # every segment row is the one sequence
-        torch.testing.assert_close(dst[0, seg, 0, :n], table * scale)
-        torch.testing.assert_close(dst[0, seg, 1, :n], table * scale + kv_offset)
-        assert torch.count_nonzero(dst[0, seg, :, n:]) == 0, "unused entries are the safe page 0"
+    for block_size in range(3):  # every causal block row is the one sequence
+        torch.testing.assert_close(dst[0, block_size, 0, :n], table * scale)
+        torch.testing.assert_close(dst[0, block_size, 1, :n], table * scale + kv_offset)
+        assert torch.count_nonzero(dst[0, block_size, :, n:]) == 0, (
+            "unused entries are the safe page 0"
+        )
     assert (dst[0, 3] == -7).all(), "rows beyond num_seqs are untouched"
 
     with pytest.raises(ValueError):

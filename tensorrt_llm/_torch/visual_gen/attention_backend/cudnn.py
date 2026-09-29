@@ -208,9 +208,9 @@ class _CuDNNProblemShape:
 class _CuDNNPagedShape:
     """Geometry of one paged-cache forward: one sequence, K/V read through a page table.
 
-    The forward's new tokens are cut into ``num_segments`` consecutive segments of
-    ``segment_len``; each segment is one cuDNN sequence with its own K/V length,
-    which is how "full within a segment, causal across segments" is expressed.
+    The forward's new tokens are cut into ``num_causal_blocks`` consecutive causal blocks of
+    ``causal_block_size``; each causal block is one cuDNN sequence with its own K/V length,
+    which is how "full within a causal block, causal across causal blocks" is expressed.
     ``page_stride`` is the stride of one K (or V) block inside the pool, so the
     pool's own layout, K and V blocks interleaved per page, is described to cuDNN
     without a copy.
@@ -218,8 +218,8 @@ class _CuDNNPagedShape:
 
     h_q: int
     h_kv: int
-    num_segments: int
-    segment_len: int
+    num_causal_blocks: int
+    causal_block_size: int
     d: int
     num_pages: int  # pages in the pool view (K/V container length)
     table_len: int  # entries per page-table row (the sequence's own pages)
@@ -542,17 +542,17 @@ class CuDNNAttention(AttentionBackend):
             name="visual_gen_sdpa_paged",
         )
         # cuDNN graph tensors are [batch, heads, seq, dim]; the batch axis here is the
-        # segment axis, one cuDNN sequence per segment.
+        # causal block axis, one cuDNN sequence per block.
         # One K/V length per sequence: the same for every head, no seq or feature axis.
         length_heads, length_seq, length_dim = 1, 1, 1
-        length_dims = [s.num_segments, length_heads, length_seq, length_dim]
+        length_dims = [s.num_causal_blocks, length_heads, length_seq, length_dim]
         # One page id per (sequence, page): the same table for every K/V head.
         table_heads, table_dim = 1, 1
-        table_dims = [s.num_segments, table_heads, s.table_len, table_dim]
-        q_dims = [s.num_segments, s.h_q, s.segment_len, s.d]
+        table_dims = [s.num_causal_blocks, table_heads, s.table_len, table_dim]
+        q_dims = [s.num_causal_blocks, s.h_q, s.causal_block_size, s.d]
         kv_container_dims = [s.num_pages, s.h_kv, s.tokens_per_block, s.d]
-        # The output lands in an [S, H, D] buffer per segment, described as [B, H, S, D].
-        o_strides = [s.segment_len * s.h_q * s.d, s.d, s.h_q * s.d, 1]
+        # The output lands in an [S, H, D] buffer per block, described as [B, H, S, D].
+        o_strides = [s.causal_block_size * s.h_q * s.d, s.d, s.h_q * s.d, 1]
 
         q_t = graph.tensor(name="q", dim=q_dims, stride=list(s.q_strides), data_type=io)
         k_t = graph.tensor(
@@ -633,15 +633,15 @@ class CuDNNAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         kv_cache: CausalKVCacheManager,
-        segment_len: Optional[int],
+        causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
         key_padding_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Write ``k``/``v`` at ``past_tokens``, then attend over the cache.
 
         ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video.
-        ``segment_len`` cuts the ``S`` new tokens into consecutive segments that are
-        causal across each other (``None``: one segment). Output is ``[1, S, H, D]``.
+        ``causal_block_size`` cuts the ``S`` new tokens into consecutive causal blocks that are
+        causal across each other (``None``: one causal block). Output is ``[1, S, H, D]``.
         """
         if self._resolve_mask(attention_mask, key_padding_mask):
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
@@ -655,23 +655,25 @@ class CuDNNAttention(AttentionBackend):
             )
         if q.stride(3) != 1:
             raise ValueError("q must be contiguous along head_dim.")
-        segment_len = segment_len or num_tokens
-        if num_tokens % segment_len:
-            raise ValueError(f"{num_tokens} tokens do not split into segments of {segment_len}.")
-        num_segments = num_tokens // segment_len
+        causal_block_size = causal_block_size or num_tokens
+        if num_tokens % causal_block_size:
+            raise ValueError(
+                f"{num_tokens} tokens do not split into causal blocks of {causal_block_size}."
+            )
+        num_causal_blocks = num_tokens // causal_block_size
         device = q.device
         kv_cache.write_range(self.layer_idx, kv_cache.past_tokens, k[0], v[0])
-        seq_len_q, seq_len_kv = kv_cache.segment_lengths(num_segments, segment_len)
+        seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(num_causal_blocks, causal_block_size)
 
-        q_seg = q.view(num_segments, segment_len, num_heads, head_dim)
+        q_seg = q.view(num_causal_blocks, causal_block_size, num_heads, head_dim)
         buf = kv_cache.kv_buffer(self.layer_idx)
-        page_table = kv_cache.page_table(num_segments)
+        page_table = kv_cache.page_table(num_causal_blocks)
         num_pages, _, h_kv, tokens_per_block, _ = buf.shape
         shape = _CuDNNPagedShape(
             h_q=num_heads,
             h_kv=h_kv,
-            num_segments=num_segments,
-            segment_len=segment_len,
+            num_causal_blocks=num_causal_blocks,
+            causal_block_size=causal_block_size,
             d=head_dim,
             num_pages=num_pages,
             table_len=page_table.shape[1],
@@ -688,7 +690,9 @@ class CuDNNAttention(AttentionBackend):
             bundle.inputs["page_table"]: page_table,
             bundle.inputs["seq_len_q"]: seq_len_q,
             bundle.inputs["seq_len_kv"]: seq_len_kv,
-            bundle.outputs["o"]: output.view(num_segments, segment_len, num_heads, head_dim),
+            bundle.outputs["o"]: output.view(
+                num_causal_blocks, causal_block_size, num_heads, head_dim
+            ),
         }
         self._execute_graph(bundle, tensor_map, device)
         return output
@@ -915,7 +919,7 @@ class CuDNNAttention(AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[CausalKVCacheManager] = None,
-        segment_len: Optional[int] = None,
+        causal_block_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -929,15 +933,17 @@ class CuDNNAttention(AttentionBackend):
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: they are written at ``past_tokens`` and attention runs
                 over everything cached before them plus themselves.
-            segment_len: With ``kv_cache``, cuts the new tokens into consecutive
-                segments that are causal across each other and full within (the
-                clean pass uses one segment per frame). ``None``: one segment.
+            causal_block_size: With ``kv_cache``, cuts the new tokens into consecutive
+                causal blocks: full attention within a block, causal across blocks (the
+                clean pass uses one block per frame). ``None``: one causal block.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
         if kv_cache is not None:
-            return self._run_paged(q, k, v, kv_cache, segment_len, attention_mask, key_padding_mask)
+            return self._run_paged(
+                q, k, v, kv_cache, causal_block_size, attention_mask, key_padding_mask
+            )
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )

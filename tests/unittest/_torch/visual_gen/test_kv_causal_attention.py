@@ -90,7 +90,7 @@ def make_backend(name):
     )
 
 
-def run(attn, cache, q, k, v, segment_len=None):
+def run(attn, cache, q, k, v, causal_block_size=None):
     """Per-token [T, H, D] in, per-token [T, H, D] out, whichever backend."""
     out = attn.forward(
         q[None],
@@ -99,7 +99,7 @@ def run(attn, cache, q, k, v, segment_len=None):
         batch_size=1,
         seq_len=q.shape[0],
         kv_cache=cache,
-        segment_len=segment_len,
+        causal_block_size=causal_block_size,
     )
     return out.reshape(q.shape[0], NUM_HEADS, HEAD_DIM)
 
@@ -169,36 +169,40 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
     assert saw_stale, "test geometry should attend over stale tokens at some step"
 
 
-def check_segments(attn, cache, prompt_k, prompt_v, num_segments, chunk):
-    """One call cut into segments: segment i sees the cache plus segments <= i."""
+def check_causal_blocks(attn, cache, prompt_k, prompt_v, num_causal_blocks, chunk):
+    """One call cut into causal blocks: causal block i sees the cache plus causal blocks <= i."""
     n_hist = cache.history_tokens
     hist = torch.arange(cache.prompt_len, cache.prompt_len + n_hist, device=DEVICE)
     hk, hv = read_kv(cache, 0, hist)
-    segment_len = chunk // num_segments
+    causal_block_size = chunk // num_causal_blocks
     q, k, v = rand_qkv(chunk)
-    out = run(attn, cache, q, k, v, segment_len=segment_len)
+    out = run(attn, cache, q, k, v, causal_block_size=causal_block_size)
     torch.cuda.synchronize()
-    for i in range(num_segments):
-        lo, hi = i * segment_len, (i + 1) * segment_len
+    for i in range(num_causal_blocks):
+        lo, hi = i * causal_block_size, (i + 1) * causal_block_size
         expected = reference_attention(
             q[lo:hi], torch.cat([prompt_k, hk, k[:hi]]), torch.cat([prompt_v, hv, v[:hi]])
         )
-        torch.testing.assert_close(out[lo:hi], expected, rtol=2e-2, atol=2e-2, msg=f"segment {i}")
-        if i < num_segments - 1:  # a segment must not see the segments after it
+        torch.testing.assert_close(
+            out[lo:hi], expected, rtol=2e-2, atol=2e-2, msg=f"causal block {i}"
+        )
+        if i < num_causal_blocks - 1:  # a causal block must not see the causal blocks after it
             leaky = reference_attention(
                 q[lo:hi], torch.cat([prompt_k, hk, k]), torch.cat([prompt_v, hv, v])
             )
-            assert (out[lo:hi].float() - leaky.float()).abs().max() > 1e-2, f"segment {i} leaks"
+            assert (out[lo:hi].float() - leaky.float()).abs().max() > 1e-2, (
+                f"causal block {i} leaks"
+            )
     positions = torch.arange(cache.past_tokens, cache.past_tokens + chunk, device=DEVICE)
     k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, k)
     torch.testing.assert_close(v_back, v)
     with pytest.raises(ValueError):
-        run(attn, cache, q, k, v, segment_len=7)
+        run(attn, cache, q, k, v, causal_block_size=7)
 
 
-def test_cudnn_segments_at_any_alignment(cache):
-    """The clean pass: one launch, four segments of 10 sharing pages mid-way."""
+def test_cudnn_causal_blocks_at_any_alignment(cache):
+    """The clean pass: one launch, four causal blocks of 10 sharing pages mid-way."""
     torch.manual_seed(3)
     cache.open(prompt_len=9)
     pk, pv = rand_qkv(9)[1:]
@@ -207,22 +211,22 @@ def test_cudnn_segments_at_any_alignment(cache):
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
         cache.commit()
-    check_segments(make_backend("cudnn"), cache, pk, pv, num_segments=4, chunk=CHUNK)
+    check_causal_blocks(make_backend("cudnn"), cache, pk, pv, num_causal_blocks=4, chunk=CHUNK)
 
 
-def test_trtllm_segments_need_page_aligned_starts(cache):
+def test_trtllm_causal_blocks_need_page_aligned_starts(cache):
     """The fused update kernel zeroes V after each request to its page end, so
-    segments that share a page are refused on this backend rather than corrupted."""
+    causal blocks that share a page are refused on this backend rather than corrupted."""
     torch.manual_seed(3)
     cache.open(prompt_len=9)
     cache.write_prompt_kv(0, *rand_qkv(9)[1:])
     q, k, v = rand_qkv(CHUNK)
     with pytest.raises(NotImplementedError, match="page boundary"):
-        run(make_backend("trtllm"), cache, q, k, v, segment_len=CHUNK // 4)
+        run(make_backend("trtllm"), cache, q, k, v, causal_block_size=CHUNK // 4)
 
 
-def test_trtllm_page_aligned_segments():
-    """With segment starts on page boundaries the fused path handles segments too."""
+def test_trtllm_page_aligned_causal_blocks():
+    """With causal block starts on page boundaries the fused path handles causal blocks too."""
     torch.manual_seed(4)
     chunk = 64
     mgr = CausalKVCacheManager(
@@ -243,7 +247,7 @@ def test_trtllm_page_aligned_segments():
         mgr.write_range(0, mgr.past_tokens, k, v)
         mgr.commit()
         assert mgr.past_tokens % 32 == 0
-        check_segments(make_backend("trtllm"), mgr, pk, pv, num_segments=2, chunk=chunk)
+        check_causal_blocks(make_backend("trtllm"), mgr, pk, pv, num_causal_blocks=2, chunk=chunk)
     finally:
         mgr.shutdown()
 

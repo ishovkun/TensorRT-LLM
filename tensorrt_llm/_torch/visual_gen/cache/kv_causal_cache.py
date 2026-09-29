@@ -96,10 +96,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
     """
 
     REQUEST_ID = 0
-    # Most segments one forward may cut the in-flight chunk into (the clean pass uses
-    # one per frame). Sizes the persistent per-segment tensors so their pointers are
-    # stable across forwards of different segment counts.
-    MAX_SEGMENTS = 8
+    # Most causal blocks one forward may cut the in-flight chunk into (the clean pass uses
+    # one per frame). Sizes the persistent per-block tensors so their pointers are
+    # stable across forwards of different causal block counts.
+    MAX_CAUSAL_BLOCKS = 8
 
     def __init__(
         self,
@@ -189,7 +189,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._page_table: Optional[torch.Tensor] = None
         self._seq_len_q: Optional[torch.Tensor] = None
         self._seq_len_kv: Optional[torch.Tensor] = None
-        self._segment_key: Optional[tuple] = None
+        self._causal_block_key: Optional[tuple] = None
         self._table_version = 0
 
     # ------------------------------------------------------------------ lifecycle
@@ -236,11 +236,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._ring = deque(pages[full_prompt_pages:])
         device = self.kv_buffer(0).device
         self._page_table = torch.empty(
-            self.MAX_SEGMENTS, self.num_pages, dtype=torch.int32, device=device
+            self.MAX_CAUSAL_BLOCKS, self.num_pages, dtype=torch.int32, device=device
         )
-        self._seq_len_q = torch.zeros(self.MAX_SEGMENTS, dtype=torch.int32, device=device)
-        self._seq_len_kv = torch.zeros(self.MAX_SEGMENTS, dtype=torch.int32, device=device)
-        self._segment_key = None
+        self._seq_len_q = torch.zeros(self.MAX_CAUSAL_BLOCKS, dtype=torch.int32, device=device)
+        self._seq_len_kv = torch.zeros(self.MAX_CAUSAL_BLOCKS, dtype=torch.int32, device=device)
+        self._causal_block_key = None
         self._publish_table()
 
     def close(self) -> None:
@@ -297,44 +297,48 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._require_open()
         return self._fixed + list(self._ring)
 
-    def page_table(self, num_segments: int = 1) -> torch.Tensor:
-        """``[num_segments, num_pages]`` int32 device table in ``kv_buffer`` view indices.
+    def page_table(self, num_causal_blocks: int = 1) -> torch.Tensor:
+        """``[num_causal_blocks, num_pages]`` int32 device table in ``kv_buffer`` view indices.
 
         Every row is the one sequence. Persistent, refreshed in place on commit; the
         page table for kernels that read the ``kv_buffer`` view directly (cuDNN).
         """
         self._require_open()
-        if not 0 < num_segments <= self.MAX_SEGMENTS:
-            raise ValueError(f"num_segments {num_segments} outside (0, {self.MAX_SEGMENTS}]")
-        return self._page_table[:num_segments]
+        if not 0 < num_causal_blocks <= self.MAX_CAUSAL_BLOCKS:
+            raise ValueError(
+                f"num_causal_blocks {num_causal_blocks} outside (0, {self.MAX_CAUSAL_BLOCKS}]"
+            )
+        return self._page_table[:num_causal_blocks]
 
-    def segment_lengths(
-        self, num_segments: int, segment_len: int
+    def causal_block_lengths(
+        self, num_causal_blocks: int, causal_block_size: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Per-segment int32 device tensors ``(seq_len_q, seq_len_kv)``, each ``[num_segments]``.
+        """Per-block int32 device tensors ``(seq_len_q, seq_len_kv)``, each ``[num_causal_blocks]``.
 
-        A forward cuts the tokens it adds into consecutive segments. Segment ``i``
-        holds tokens ``[past + i*segment_len, past + (i+1)*segment_len)`` and attends
-        over ``[0, past + (i+1)*segment_len)``: full within a segment, causal across
-        segments. Paged kernels read these lengths from device memory; they are
+        A forward cuts the tokens it adds into consecutive causal blocks. Block ``i``
+        holds tokens ``[past + i*causal_block_size, past + (i+1)*causal_block_size)`` and attends
+        over ``[0, past + (i+1)*causal_block_size)``: full within a causal block, causal across
+        causal blocks. Paged kernels read these lengths from device memory; they are
         rewritten in place only when the values change, so every layer of a forward
         and every denoising step over one chunk share a single write.
         """
         self._require_open()
-        if not 0 < num_segments <= self.MAX_SEGMENTS:
-            raise ValueError(f"num_segments {num_segments} outside (0, {self.MAX_SEGMENTS}]")
-        if not 0 < num_segments * segment_len <= self.chunk_tokens:
+        if not 0 < num_causal_blocks <= self.MAX_CAUSAL_BLOCKS:
             raise ValueError(
-                f"{num_segments} segments of {segment_len} tokens do not fit a "
+                f"num_causal_blocks {num_causal_blocks} outside (0, {self.MAX_CAUSAL_BLOCKS}]"
+            )
+        if not 0 < num_causal_blocks * causal_block_size <= self.chunk_tokens:
+            raise ValueError(
+                f"{num_causal_blocks} causal blocks of {causal_block_size} tokens do not fit a "
                 f"{self.chunk_tokens}-token chunk"
             )
-        key = (self.past_tokens, num_segments, segment_len)
-        if key != self._segment_key:
-            ends = torch.arange(1, num_segments + 1, dtype=torch.int32) * segment_len
-            self._seq_len_q[:num_segments].fill_(segment_len)
-            self._seq_len_kv[:num_segments].copy_(ends + self.past_tokens)
-            self._segment_key = key
-        return self._seq_len_q[:num_segments], self._seq_len_kv[:num_segments]
+        key = (self.past_tokens, num_causal_blocks, causal_block_size)
+        if key != self._causal_block_key:
+            ends = torch.arange(1, num_causal_blocks + 1, dtype=torch.int32) * causal_block_size
+            self._seq_len_q[:num_causal_blocks].fill_(causal_block_size)
+            self._seq_len_kv[:num_causal_blocks].copy_(ends + self.past_tokens)
+            self._causal_block_key = key
+        return self._seq_len_q[:num_causal_blocks], self._seq_len_kv[:num_causal_blocks]
 
     def commit(self) -> None:
         """The in-flight chunk's K/V are final; advance the window."""
@@ -368,7 +372,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def _publish_table(self) -> None:
         self._table_version += 1
         table = torch.tensor(self.block_table(), dtype=torch.int32) * self.page_view_scale
-        self._page_table.copy_(table.expand(self.MAX_SEGMENTS, -1))
+        self._page_table.copy_(table.expand(self.MAX_CAUSAL_BLOCKS, -1))
 
     # ------------------------------------------------------------------ direct pool access
 
@@ -451,19 +455,19 @@ class CausalKVCacheManager(KVCacheManagerV2):
         ``dst_tensor`` is ``[num_pools, max_num_sequences, 2, max_blocks_per_seq]``
         of int32: K offsets then V offsets per sequence, each ``page * index_scale``
         (+ ``kv_offset`` for V) -- the same encoding the manager's device copy uses.
-        Every request is a segment of the one sequence, so every row gets the
+        Every request is a causal block of the one sequence, so every row gets the
         same table.
         """
         ids = list(request_ids)
         if (
-            not 0 < len(ids) <= self.MAX_SEGMENTS
+            not 0 < len(ids) <= self.MAX_CAUSAL_BLOCKS
             or any(r != self.REQUEST_ID for r in ids)
             or num_seqs != len(ids)
             or beam_width != 1
         ):
             raise ValueError(
                 f"CausalKVCacheManager serves one sequence (id {self.REQUEST_ID}) in up to "
-                f"{self.MAX_SEGMENTS} segments; got request_ids={ids}, num_seqs={num_seqs}, "
+                f"{self.MAX_CAUSAL_BLOCKS} causal blocks; got request_ids={ids}, num_seqs={num_seqs}, "
                 f"beam_width={beam_width}"
             )
         table = torch.tensor(self.block_table(), dtype=torch.int32)
