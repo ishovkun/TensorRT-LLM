@@ -192,6 +192,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._fixed_pages = 0
         self._k_rows: Optional[torch.Tensor] = None  # [chunk_tokens * num_kv_heads] int64 pool rows
         self._v_rows: Optional[torch.Tensor] = None  # same shape; the V rows
+        # Scratch for recomputing the rows without allocating: [chunk_tokens] each,
+        # int64 except _view_page, which gathers from the int32 table.
+        self._logical: Optional[torch.Tensor] = None
+        self._logical_page: Optional[torch.Tensor] = None
+        self._view_page: Optional[torch.Tensor] = None
+        self._slot: Optional[torch.Tensor] = None
+        self._head: Optional[torch.Tensor] = None  # [num_kv_heads] int64, constant
         # (num_blocks, block_size) -> (seq_len_q [num_blocks], seq_len_kv [num_blocks]) int32
         self._block_lengths: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         self._kv_heads_local = 0
@@ -247,6 +254,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
         rows = self.chunk_tokens * self._kv_heads_local
         self._k_rows = torch.empty(rows, dtype=torch.int64, device=device)
         self._v_rows = torch.empty(rows, dtype=torch.int64, device=device)
+        self._logical, self._logical_page, self._slot = (
+            torch.empty(self.chunk_tokens, dtype=torch.int64, device=device) for _ in range(3)
+        )
+        self._view_page = torch.empty(self.chunk_tokens, dtype=torch.int32, device=device)
+        self._head = torch.arange(self._kv_heads_local, dtype=torch.int64, device=device)
         self._block_lengths = {}
         self._table_version += 1
         self._refresh_device_state()
@@ -256,6 +268,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             return
         kv_cache, self._kv_cache = self._kv_cache, None
         self._table = self._k_rows = self._v_rows = None
+        self._logical = self._logical_page = self._view_page = self._slot = self._head = None
         self._block_lengths = {}
         self._release(kv_cache)
 
@@ -383,8 +396,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 self._history_tokens -= drop_pages * self.tokens_per_block
                 self._table_version += 1
             self._stale_tokens = self._history_tokens - self.window_tokens
-        assert 0 <= self._stale_tokens < self.tokens_per_block, self._stale_tokens
-        assert self.seq_len <= self.capacity
         self._refresh_device_state()
 
     def _refill_shared_page(self, old_page: torch.Tensor, new_page: torch.Tensor) -> None:
@@ -411,16 +422,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # Pool viewed as rows of head_dim: row of (page, kv, head, slot) is
         # ((page*2 + kv)*H + head)*tpb + slot, with page already a view index.
         tpb, heads = self.tokens_per_block, self._kv_heads_local
-        device = self._table.device
-        logical = torch.arange(
-            self.past_tokens, self.past_tokens + self.chunk_tokens, device=device
-        )
-        page = self._table[0][logical // tpb].to(torch.int64)
-        slot = (logical % tpb).to(torch.int64)
-        head = torch.arange(heads, device=device)
-        k_rows = (page[:, None] * 2 * heads + head[None, :]) * tpb + slot[:, None]
-        self._k_rows.copy_(k_rows.reshape(-1))
-        self._v_rows.copy_((k_rows + heads * tpb).reshape(-1))
+        torch.arange(self.past_tokens, self.past_tokens + self.chunk_tokens, out=self._logical)
+        torch.floor_divide(self._logical, tpb, out=self._logical_page)
+        torch.index_select(self._table[0], 0, self._logical_page, out=self._view_page)
+        torch.remainder(self._logical, tpb, out=self._slot)
+        k_rows = self._k_rows.view(self.chunk_tokens, heads)
+        k_rows.copy_(self._view_page[:, None]).mul_(2 * heads).add_(self._head).mul_(tpb)
+        k_rows.add_(self._slot[:, None])
+        self._v_rows.copy_(self._k_rows).add_(heads * tpb)
 
         for key, (_, kv_lengths) in self._block_lengths.items():
             self._fill_block_kv_lengths(key, kv_lengths)
