@@ -188,11 +188,12 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # first (never rotated), then the ring: the page shared with the prompt's
         # tail (if any), history, free pages. One identical row per causal block,
         # because cuDNN reads a [blocks, pages] table with a real row stride.
-        self._table: Optional[torch.Tensor] = None
-        self._table_scratch: Optional[torch.Tensor] = None
+        self._table: Optional[torch.Tensor] = None  # [MAX_CAUSAL_BLOCKS, num_pages] int32
+        self._table_scratch: Optional[torch.Tensor] = None  # same shape; rotation staging
         self._fixed_pages = 0
-        self._k_rows: Optional[torch.Tensor] = None
-        self._v_rows: Optional[torch.Tensor] = None
+        self._k_rows: Optional[torch.Tensor] = None  # [chunk_tokens * num_kv_heads] int64 pool rows
+        self._v_rows: Optional[torch.Tensor] = None  # same shape; the V rows
+        # (num_blocks, block_size) -> (seq_len_q [num_blocks], seq_len_kv [num_blocks]) int32
         self._block_lengths: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
         self._kv_heads_local = 0
         self._table_version = 0
