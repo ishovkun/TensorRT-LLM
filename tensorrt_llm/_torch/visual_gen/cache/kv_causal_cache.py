@@ -378,7 +378,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 # place, so the table's address, which captured graphs hold, never changes.
                 ring = self._table[:, self._fixed_pages :]  # [MAX_CAUSAL_BLOCKS, num_pages - fixed]
                 old_head = ring[0, 0].clone()
-                torch.ops.trtllm.rotate_rows_left_(ring, drop_pages)
+                torch.ops.trtllm.rotate_rows_(ring, -drop_pages)  # dropped pages go to the tail
                 self._refill_shared_page(old_head, ring[0, 0])
                 self._history_tokens -= drop_pages * self.tokens_per_block
                 self._table_version += 1

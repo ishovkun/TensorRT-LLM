@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""trtllm::rotate_rows_left_ against torch.roll: in place, no allocation, any shift."""
+"""trtllm::rotate_rows_ against torch.roll: same sign convention, in place, any shift."""
 
 import pytest
 import torch
@@ -44,8 +44,8 @@ def test_matches_torch_roll(dtype, shape, shift):
     # torch.roll lacks some dtypes (fp8); the reference rolls the raw bytes instead.
     raw = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64, 16: torch.complex128}
     as_raw = x.view(raw[x.element_size()])
-    expected = torch.roll(as_raw, -shift, dims=-1).view(dtype)
-    out = torch.ops.trtllm.rotate_rows_left_(x, shift)
+    expected = torch.roll(as_raw, shift, dims=-1).view(dtype)
+    out = torch.ops.trtllm.rotate_rows_(x, shift)
     torch.cuda.synchronize()
     assert out.data_ptr() == x.data_ptr(), "must rotate in place"
     torch.testing.assert_close(x.view(raw[x.element_size()]), expected.view(raw[x.element_size()]))
@@ -56,7 +56,7 @@ def test_strided_rows_view():
     table = torch.arange(8 * 20, device="cuda", dtype=torch.int32).view(8, 20)
     before = table.clone()
     ring = table[:, 5:]  # row stride 20, 15 columns
-    torch.ops.trtllm.rotate_rows_left_(ring, 4)
+    torch.ops.trtllm.rotate_rows_(ring, -4)
     torch.cuda.synchronize()
     torch.testing.assert_close(table[:, :5], before[:, :5])  # untouched prefix
     torch.testing.assert_close(table[:, 5:], torch.roll(before[:, 5:], -4, dims=1))
@@ -65,9 +65,9 @@ def test_strided_rows_view():
 def test_rejects_bad_inputs():
     x = torch.zeros(4, 8, device="cuda", dtype=torch.int32)
     with pytest.raises(RuntimeError):
-        torch.ops.trtllm.rotate_rows_left_(x.t(), 1)  # last dim not contiguous
+        torch.ops.trtllm.rotate_rows_(x.t(), 1)  # last dim not contiguous
     with pytest.raises(RuntimeError):
-        torch.ops.trtllm.rotate_rows_left_(x.cpu(), 1)
+        torch.ops.trtllm.rotate_rows_(x.cpu(), 1)
 
 
 def test_capturable_in_cuda_graph():
@@ -75,12 +75,12 @@ def test_capturable_in_cuda_graph():
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        torch.ops.trtllm.rotate_rows_left_(x, 1)
+        torch.ops.trtllm.rotate_rows_(x, 1)
     torch.cuda.current_stream().wait_stream(side)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        torch.ops.trtllm.rotate_rows_left_(x, 1)
+        torch.ops.trtllm.rotate_rows_(x, 1)
     start = x.clone()
     graph.replay()
     torch.cuda.synchronize()
-    torch.testing.assert_close(x, torch.roll(start, -1, dims=1))
+    torch.testing.assert_close(x, torch.roll(start, 1, dims=1))

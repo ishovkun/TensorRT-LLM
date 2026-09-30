@@ -22,18 +22,18 @@
 namespace torch_ext
 {
 
-//! In place: every row of ``self`` becomes ``torch.roll(row, -shift)``, i.e. rotated left by
-//! ``shift`` (any integer; normalized modulo the row length). ``self`` is 1-D or 2-D with a
+//! In place: every row of ``self`` becomes ``torch.roll(row, shift)``: a positive shift moves
+//! elements toward higher indices, a negative one toward lower. ``self`` is 1-D or 2-D with a
 //! unit-stride last dimension; rows may be strided; any dtype (the rotation permutes bytes).
 //! No scratch memory, no allocation, safe inside CUDA graph capture.
-torch::Tensor rotate_rows_left_(torch::Tensor self, int64_t shift)
+torch::Tensor rotate_rows_(torch::Tensor self, int64_t shift)
 {
     CHECK_TH_CUDA(self);
-    TORCH_CHECK(self.dim() == 1 || self.dim() == 2, "rotate_rows_left_: expected a 1-D or 2-D tensor");
-    TORCH_CHECK(self.stride(-1) == 1, "rotate_rows_left_: the last dimension must be contiguous");
+    TORCH_CHECK(self.dim() == 1 || self.dim() == 2, "rotate_rows_: expected a 1-D or 2-D tensor");
+    TORCH_CHECK(self.stride(-1) == 1, "rotate_rows_: the last dimension must be contiguous");
     int64_t const elemSize = self.element_size();
     TORCH_CHECK(elemSize == 1 || elemSize == 2 || elemSize == 4 || elemSize == 8 || elemSize == 16,
-        "rotate_rows_left_: unsupported element size");
+        "rotate_rows_: unsupported element size");
 
     int64_t const rows = self.dim() == 2 ? self.size(0) : 1;
     int64_t const cols = self.size(-1);
@@ -42,14 +42,9 @@ torch::Tensor rotate_rows_left_(torch::Tensor self, int64_t shift)
     {
         return self;
     }
-    int64_t const normalized = ((shift % cols) + cols) % cols;
-    if (normalized == 0)
-    {
-        return self;
-    }
     auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
-    tensorrt_llm::kernels::invokeRotateRowsLeft(
-        self.data_ptr(), rows, cols, rowStride, normalized, static_cast<int>(elemSize), stream);
+    tensorrt_llm::kernels::invokeRotateRows(
+        self.data_ptr(), rows, cols, rowStride, shift, static_cast<int>(elemSize), stream);
     return self;
 }
 
@@ -57,10 +52,10 @@ torch::Tensor rotate_rows_left_(torch::Tensor self, int64_t shift)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("rotate_rows_left_(Tensor(a!) self, int shift) -> Tensor(a!)");
+    m.def("rotate_rows_(Tensor(a!) self, int shift) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("rotate_rows_left_", &torch_ext::rotate_rows_left_);
+    m.impl("rotate_rows_", &torch_ext::rotate_rows_);
 }

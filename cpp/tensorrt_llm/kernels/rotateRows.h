@@ -26,15 +26,16 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-//! In place, for every row: row[i] <- row[(i + shift) mod cols], i.e. std::rotate(row, row + shift, row + cols).
+//! In place, for every row: row[i] <- row[(i - shift) mod cols], the same convention as torch.roll:
+//! a positive shift moves elements toward higher indices (right), a negative one toward lower (left).
 //! Columns must be unit-stride; rows may be strided. Three reversal passes, no scratch memory.
 //! \param data      device pointer to the first element
 //! \param rows      number of rows
 //! \param cols      elements per row
 //! \param rowStride elements between the starts of consecutive rows
-//! \param shift     0 <= shift < cols
+//! \param shift     any value; reduced modulo cols
 //! \param elemSize  element size in bytes: 1, 2, 4, 8 or 16 (the rotation is a byte permutation, so any dtype)
-void invokeRotateRowsLeft(
+void invokeRotateRows(
     void* data, int64_t rows, int64_t cols, int64_t rowStride, int64_t shift, int elemSize, cudaStream_t stream);
 
 } // namespace kernels

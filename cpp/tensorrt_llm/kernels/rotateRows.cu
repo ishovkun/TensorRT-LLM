@@ -69,21 +69,26 @@ void rotateRowsLeft(T* data, int64_t rows, int64_t cols, int64_t rowStride, int6
 
 } // namespace
 
-void invokeRotateRowsLeft(
+void invokeRotateRows(
     void* data, int64_t rows, int64_t cols, int64_t rowStride, int64_t shift, int elemSize, cudaStream_t stream)
 {
-    if (rows <= 0 || cols <= 1 || shift == 0)
+    if (rows <= 0 || cols <= 1)
     {
         return;
     }
-    TLLM_CHECK_WITH_INFO(0 < shift && shift < cols, "shift must be in (0, cols)");
+    // A right rotation by s is a left rotation by cols - s; reduce any shift to a left one in [0, cols).
+    int64_t const left = ((-shift % cols) + cols) % cols;
+    if (left == 0)
+    {
+        return;
+    }
     switch (elemSize)
     {
-    case 1: rotateRowsLeft(static_cast<uint8_t*>(data), rows, cols, rowStride, shift, stream); break;
-    case 2: rotateRowsLeft(static_cast<uint16_t*>(data), rows, cols, rowStride, shift, stream); break;
-    case 4: rotateRowsLeft(static_cast<uint32_t*>(data), rows, cols, rowStride, shift, stream); break;
-    case 8: rotateRowsLeft(static_cast<uint64_t*>(data), rows, cols, rowStride, shift, stream); break;
-    case 16: rotateRowsLeft(static_cast<uint4*>(data), rows, cols, rowStride, shift, stream); break;
+    case 1: rotateRowsLeft(static_cast<uint8_t*>(data), rows, cols, rowStride, left, stream); break;
+    case 2: rotateRowsLeft(static_cast<uint16_t*>(data), rows, cols, rowStride, left, stream); break;
+    case 4: rotateRowsLeft(static_cast<uint32_t*>(data), rows, cols, rowStride, left, stream); break;
+    case 8: rotateRowsLeft(static_cast<uint64_t*>(data), rows, cols, rowStride, left, stream); break;
+    case 16: rotateRowsLeft(static_cast<uint4*>(data), rows, cols, rowStride, left, stream); break;
     default: TLLM_THROW("rotateRows: unsupported element size %d bytes", elemSize);
     }
 }
