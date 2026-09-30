@@ -148,8 +148,6 @@ def test_write_range_matches_indexed_write(cache):
 
     with pytest.raises(ValueError):
         cache.write_range(0, cache.capacity - 1, *rand_kv(2))
-    with pytest.raises(ValueError):
-        cache.write_prompt_kv(0, *rand_kv(19))
 
 
 def test_eviction_keeps_the_window_and_the_prompt(cache):
@@ -160,7 +158,7 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
     allocated = sorted(cache.block_table())
     pk, pv = rand_kv(prompt_len)
     for layer in range(NUM_LAYERS):
-        cache.write_prompt_kv(layer, pk, pv)
+        cache.write_range(layer, 0, pk, pv)
     written = []  # one stamp per committed generator token, oldest first
     versions = {cache.table_version}
     saw_stale = saw_rotation = False

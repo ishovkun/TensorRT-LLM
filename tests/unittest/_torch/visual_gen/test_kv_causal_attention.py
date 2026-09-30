@@ -132,7 +132,7 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
     attn = make_backend(backend)
 
     prompt_k, prompt_v = rand_qkv(prompt_len)[1:]
-    cache.write_prompt_kv(0, prompt_k, prompt_v)
+    cache.write_range(0, 0, prompt_k, prompt_v)
     if backend == "trtllm" and cache.tokens_per_block != 32:
         # trtllm-gen has paged context kernels for 32-token pages only; other sizes
         # would silently drop the prefix, so the backend must refuse them.
@@ -213,7 +213,7 @@ def test_cudnn_causal_blocks_at_any_alignment(cache):
     torch.manual_seed(3)
     cache.open(prompt_len=9)
     pk, pv = rand_qkv(9)[1:]
-    cache.write_prompt_kv(0, pk, pv)
+    cache.write_range(0, 0, pk, pv)
     for _ in range(3):
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
@@ -228,7 +228,7 @@ def test_trtllm_causal_blocks_need_page_aligned_starts(cache):
     if cache.tokens_per_block != 32:
         pytest.skip("page-size refusal is covered by the rollout test")
     cache.open(prompt_len=9)
-    cache.write_prompt_kv(0, *rand_qkv(9)[1:])
+    cache.write_range(0, 0, *rand_qkv(9)[1:])
     q, k, v = rand_qkv(CHUNK)
     with pytest.raises(NotImplementedError, match="page boundary"):
         run(make_backend("trtllm"), cache, q, k, v, causal_block_size=CHUNK // 4)
@@ -251,7 +251,7 @@ def test_trtllm_page_aligned_causal_blocks():
     try:
         mgr.open(prompt_len=32)
         pk, pv = rand_qkv(32)[1:]
-        mgr.write_prompt_kv(0, pk, pv)
+        mgr.write_range(0, 0, pk, pv)
         _, k, v = rand_qkv(chunk)
         mgr.write_range(0, mgr.past_tokens, k, v)
         mgr.commit()
@@ -269,7 +269,7 @@ def test_dirty_steps_overwrite_in_place(cache, backend):
     torch.manual_seed(1)
     cache.open(prompt_len=9)
     attn = make_backend(backend)
-    cache.write_prompt_kv(0, *rand_qkv(9)[1:])
+    cache.write_range(0, 0, *rand_qkv(9)[1:])
     past = cache.past_tokens
     last_k = last_v = None
     for _ in range(4):
@@ -294,7 +294,7 @@ def test_graph_replay_survives_commit(cache, backend):
     cache.open(prompt_len=9)
     attn = make_backend(backend)
     pk, pv = rand_qkv(9)[1:]
-    cache.write_prompt_kv(0, pk, pv)
+    cache.write_range(0, 0, pk, pv)
     history_k, history_v = [], []
     for _ in range(2):
         _, k, v = rand_qkv(CHUNK)

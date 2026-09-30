@@ -454,9 +454,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def write_range(self, layer_idx: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write ``k``/``v`` ``[T, num_kv_heads, head_dim]`` at logical ``[start, start + T)``.
 
-        One copy per run of physically consecutive pages, plus one for each
-        partial page at either end. In steady state the ring is a cyclic shift of
-        consecutive pages, so a chunk costs two or three copies per tensor.
+        Eager, host-addressed: one copy per group of consecutive pages plus one per
+        partial page at either end. For the prompt (``start=0``) and for tests; the
+        per-forward write is ``write_chunk``.
         """
         self._require_open()
         n = k.shape[0]
@@ -518,15 +518,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         pool_rows = buf.view(-1, head_dim)
         pool_rows.index_copy_(0, self._k_rows[:rows], k.reshape(rows, head_dim))
         pool_rows.index_copy_(0, self._v_rows[:rows], v.reshape(rows, head_dim))
-
-    def write_prompt_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        """Write the prompt's K/V (``[prompt_len, num_kv_heads, head_dim]``) at logical 0."""
-        self._require_open()
-        if k.shape[0] != self._prompt_len:
-            raise ValueError(
-                f"prompt K/V has {k.shape[0]} tokens, cache was opened with {self._prompt_len}"
-            )
-        self.write_range(layer_idx, 0, k, v)
 
     # ------------------------------------------------------------------ manager hook
 

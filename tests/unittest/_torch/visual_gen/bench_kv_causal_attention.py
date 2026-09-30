@@ -190,7 +190,7 @@ def build_cache(
     mgr.open(prompt_len=prompt_len)
     kp = torch.randn(prompt_len, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
     vp = torch.randn_like(kp)
-    mgr.write_prompt_kv(0, kp, vp)
+    mgr.write_range(0, 0, kp, vp)
 
     hist_k, hist_v = [], []
     for _ in range(history_chunks):
