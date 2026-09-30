@@ -189,7 +189,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # tail (if any), history, free pages. One identical row per causal block,
         # because cuDNN reads a [blocks, pages] table with a real row stride.
         self._table: Optional[torch.Tensor] = None  # [MAX_CAUSAL_BLOCKS, num_pages] int32
-        self._table_scratch: Optional[torch.Tensor] = None  # same shape; rotation staging
         self._fixed_pages = 0
         self._k_rows: Optional[torch.Tensor] = None  # [chunk_tokens * num_kv_heads] int64 pool rows
         self._v_rows: Optional[torch.Tensor] = None  # same shape; the V rows
@@ -245,7 +244,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._kv_heads_local = buf.shape[2]
         scaled = torch.from_numpy(pages * self.page_view_scale).to(device=device, dtype=torch.int32)
         self._table = scaled.repeat(self.MAX_CAUSAL_BLOCKS, 1)
-        self._table_scratch = torch.empty_like(self._table)
         rows = self.chunk_tokens * self._kv_heads_local
         self._k_rows = torch.empty(rows, dtype=torch.int64, device=device)
         self._v_rows = torch.empty(rows, dtype=torch.int64, device=device)
@@ -257,7 +255,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if self._kv_cache is None:
             return
         kv_cache, self._kv_cache = self._kv_cache, None
-        self._table = self._table_scratch = self._k_rows = self._v_rows = None
+        self._table = self._k_rows = self._v_rows = None
         self._block_lengths = {}
         self._release(kv_cache)
 
@@ -376,17 +374,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if excess > 0:
             drop_pages = excess // self.tokens_per_block
             if drop_pages:
-                # Recycle: the oldest pages become the newest free pages. Rotated
-                # in place through the scratch rows; no allocation, and the table's
-                # address, which captured graphs hold, never changes.
-                ring = self._table[:, self._fixed_pages :]
-                scratch = self._table_scratch[:, self._fixed_pages :]
-                width = ring.shape[1]
-                drop_pages %= width
+                # Recycle: the oldest pages become the newest free pages. Rotated in
+                # place, so the table's address, which captured graphs hold, never changes.
+                ring = self._table[:, self._fixed_pages :]  # [MAX_CAUSAL_BLOCKS, num_pages - fixed]
                 old_head = ring[0, 0].clone()
-                scratch[:, : width - drop_pages].copy_(ring[:, drop_pages:])
-                scratch[:, width - drop_pages :].copy_(ring[:, :drop_pages])
-                ring.copy_(scratch)
+                torch.ops.trtllm.rotate_rows_left_(ring, drop_pages)
                 self._refill_shared_page(old_head, ring[0, 0])
                 self._history_tokens -= drop_pages * self.tokens_per_block
                 self._table_version += 1
