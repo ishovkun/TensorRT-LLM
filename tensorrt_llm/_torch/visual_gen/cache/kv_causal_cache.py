@@ -42,7 +42,7 @@ storage positions here never grow past the resident capacity.
 
 from __future__ import annotations
 
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -63,18 +63,6 @@ _DTYPES = {
 # integer id that normally comes from an LlmRequest; a rollout has none, so it
 # gets a fixed one, as V2's own guard-page and capture-dummy sequences do.
 _ROLLOUT_REQUEST_ID = 0
-
-
-def _consecutive_pages(pages: List[int]) -> Iterator[Tuple[int, int, int]]:
-    """Split a page list into maximal groups of consecutive page ids, as
-    ``(first_index, first_page, count)``; each group is one contiguous slab of pool memory."""
-    i = 0
-    while i < len(pages):
-        j = i + 1
-        while j < len(pages) and pages[j] == pages[j - 1] + 1:
-            j += 1
-        yield i, pages[i], j - i
-        i = j
 
 
 class CausalKVCacheManager(KVCacheManagerV2):
@@ -454,9 +442,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def write_range(self, layer_idx: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write ``k``/``v`` ``[T, num_kv_heads, head_dim]`` at logical ``[start, start + T)``.
 
-        Eager, host-addressed: one copy per group of consecutive pages plus one per
-        partial page at either end. For the prompt (``start=0``) and for tests; the
-        per-forward write is ``write_chunk``.
+        Eager, host-addressed, one copy per page touched. For the prompt (``start=0``)
+        and for tests; the per-forward write is ``write_chunk``.
         """
         self._require_open()
         n = k.shape[0]
@@ -472,28 +459,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if k.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
 
-        t = 0
-        head = (-start) % tpb  # tokens that complete the page `start` falls in
-        if head:
-            m = min(head, n)
-            page, slot = table[start // tpb] * vs, start % tpb
-            buf[page, 0, :, slot : slot + m].copy_(k[:m].transpose(0, 1))
-            buf[page, 1, :, slot : slot + m].copy_(v[:m].transpose(0, 1))
-            t = m
-        full = (n - t) // tpb
-        if full:
-            first = (start + t) // tpb
-            src_k = k[t : t + full * tpb].view(full, tpb, -1, k.shape[-1]).transpose(1, 2)
-            src_v = v[t : t + full * tpb].view(full, tpb, -1, v.shape[-1]).transpose(1, 2)
-            for i, page, count in _consecutive_pages(table[first : first + full]):
-                dst = slice(page * vs, (page + count) * vs, vs)
-                buf[dst, 0].copy_(src_k[i : i + count])
-                buf[dst, 1].copy_(src_v[i : i + count])
-            t += full * tpb
-        if t < n:
-            page = table[(start + t) // tpb] * vs
-            buf[page, 0, :, : n - t].copy_(k[t:].transpose(0, 1))
-            buf[page, 1, :, : n - t].copy_(v[t:].transpose(0, 1))
+        for page_idx in range(start // tpb, (start + n - 1) // tpb + 1):
+            lo = max(start, page_idx * tpb)  # first logical token of this page in range
+            hi = min(start + n, (page_idx + 1) * tpb)  # one past the last
+            page = table[page_idx] * vs
+            slot = lo - page_idx * tpb
+            buf[page, 0, :, slot : slot + hi - lo].copy_(k[lo - start : hi - start].transpose(0, 1))
+            buf[page, 1, :, slot : slot + hi - lo].copy_(v[lo - start : hi - start].transpose(0, 1))
 
     def write_chunk(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write the in-flight chunk's first ``T`` tokens of K/V at ``past_tokens``.
