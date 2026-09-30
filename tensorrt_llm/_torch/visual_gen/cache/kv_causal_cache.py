@@ -166,7 +166,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._kv_cache = None
         self._prompt_len = 0
         self._history_tokens = 0
-        self._stale_tokens = 0
         # Device-side state read by the kernels. Every tensor here lives for the
         # life of an open cache and is rewritten in place by open() and commit(),
         # never on the forward path, so a CUDA graph captured around a forward
@@ -232,7 +231,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._kv_cache = kv_cache
         self._prompt_len = prompt_len
         self._history_tokens = 0
-        self._stale_tokens = 0
         self._fixed_pages = prompt_len // self.tokens_per_block
         buf = self.kv_buffer(0)
         device = buf.device
@@ -283,19 +281,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         return self._history_tokens
 
     @property
-    def stale_tokens(self) -> int:
-        """Leading history tokens older than the window that whole-page eviction could not drop."""
-        return self._stale_tokens
-
-    @property
     def past_tokens(self) -> int:
         """Logical position where the in-flight chunk's K/V are written."""
         return self._prompt_len + self._history_tokens
-
-    @property
-    def seq_len(self) -> int:
-        """Logical length attended by a full-chunk forward: everything resident plus the chunk."""
-        return self.past_tokens + self.chunk_tokens
 
     @property
     def table_version(self) -> int:
@@ -383,7 +371,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 self._refill_shared_page(old_head, ring[0, 0])
                 self._history_tokens -= drop_pages * self.tokens_per_block
                 self._table_version += 1
-            self._stale_tokens = self._history_tokens - self.window_tokens
         self._refresh_device_state()
 
     def _refill_shared_page(self, old_page: torch.Tensor, new_page: torch.Tensor) -> None:

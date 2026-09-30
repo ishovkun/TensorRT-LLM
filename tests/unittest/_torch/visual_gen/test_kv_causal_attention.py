@@ -151,7 +151,7 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
 
         # Resident history is the tail of what was committed, stale tokens included.
         n_hist = cache.history_tokens
-        saw_stale |= cache.stale_tokens > 0
+        saw_stale |= cache.history_tokens > WINDOW
         hist_k = torch.cat(history_k)[-n_hist:] if n_hist else empty
         hist_v = torch.cat(history_v)[-n_hist:] if n_hist else empty
         expected = reference_attention(

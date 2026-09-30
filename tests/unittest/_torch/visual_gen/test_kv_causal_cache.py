@@ -175,9 +175,10 @@ def test_eviction_keeps_the_window_and_the_prompt(cache):
 
         # Whole-page eviction leaves fewer than one page of stale tokens, all attended.
         assert cache.history_tokens <= window + tpb - 1
-        assert 0 <= cache.stale_tokens < tpb
-        saw_stale |= cache.stale_tokens > 0
-        assert cache.history_tokens - cache.stale_tokens == min(len(written), window)
+        stale = max(0, cache.history_tokens - window)  # what whole-page eviction could not drop
+        assert stale < tpb
+        saw_stale |= stale > 0
+        assert cache.history_tokens - stale == min(len(written), window)
         assert cache.past_tokens == prompt_len + cache.history_tokens
 
         for layer in range(NUM_LAYERS):

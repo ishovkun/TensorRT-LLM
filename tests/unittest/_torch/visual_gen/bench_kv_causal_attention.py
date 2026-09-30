@@ -263,7 +263,8 @@ def main() -> None:
     v = torch.randn_like(k)
     print(
         f"geometry: q={CHUNK} keys={seq_len} (prompt {args.prompt_len} + history "
-        f"{mgr.history_tokens} [{mgr.stale_tokens} stale] + chunk {CHUNK}) in {num_causal_blocks} "
+        f"{mgr.history_tokens} [{max(0, mgr.history_tokens - window)} stale] + chunk {CHUNK}) "
+        f"in {num_causal_blocks} "
         f"causal block(s) of {causal_block_size}; heads={NUM_HEADS}/{NUM_KV_HEADS} d={HEAD_DIM} "
         f"page={mgr.tokens_per_block} bf16"
     )
