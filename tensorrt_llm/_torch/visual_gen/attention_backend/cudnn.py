@@ -662,7 +662,7 @@ class CuDNNAttention(AttentionBackend):
             )
         num_causal_blocks = num_tokens // causal_block_size
         device = q.device
-        kv_cache.write_range(self.layer_idx, kv_cache.past_tokens, k[0], v[0])
+        kv_cache.write_chunk(self.layer_idx, k[0], v[0])
         seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(num_causal_blocks, causal_block_size)
 
         q_seg = q.view(num_causal_blocks, causal_block_size, num_heads, head_dim)

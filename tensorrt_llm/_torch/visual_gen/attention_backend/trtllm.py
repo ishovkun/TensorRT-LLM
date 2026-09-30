@@ -189,24 +189,22 @@ class TrtllmAttentionMetadata:
         ``causal_block_size`` tokens, request ``i`` with ``past + i*causal_block_size``
         tokens already cached. All requests are the one sequence and share its table.
 
-        One prepared object per (cache, table, past, blocking), shared by every layer
-        through the model-scoped state; the key changes only on commit or when the
-        blocking changes, so denoising steps reuse it as-is.
+        One object per (cache, blocking) for the life of the cache, shared by every
+        layer through the model-scoped state. Its device buffers are allocated once
+        and ``prepare()`` re-fills them in place whenever the cache's table or
+        ``past`` moved, which is what keeps a CUDA graph captured around the
+        forward valid after ``commit()``. Neither creation nor re-preparation may
+        happen during capture: warm up eagerly first, and call this before replay.
         """
-        past = kv_cache.past_tokens
-        cache_key = (
-            "kv_cache",
-            id(kv_cache),
-            kv_cache.table_version,
-            past,
-            num_causal_blocks,
-            causal_block_size,
-        )
+        cache_key = ("kv_cache", id(kv_cache), num_causal_blocks, causal_block_size)
+        state = (kv_cache.table_version, kv_cache.past_tokens)
         cached = self._metadata_cache.get(cache_key)
         if cached is None:
-            # Entries for this cache with an older table or past are dead.
-            for stale in [k for k in self._metadata_cache if k[:2] == cache_key[:2]]:
-                del self._metadata_cache[stale]
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "K/V cache attention metadata first needed during CUDA graph capture; "
+                    "run the forward eagerly once before capturing"
+                )
             metadata = BaseTrtllmAttentionMetadata(
                 max_num_requests=kv_cache.MAX_CAUSAL_BLOCKS,
                 max_num_tokens=kv_cache.chunk_tokens,
@@ -219,8 +217,23 @@ class TrtllmAttentionMetadata:
                 (num_causal_blocks,), causal_block_size, dtype=torch.int32
             )
             metadata.num_contexts = num_causal_blocks
-            metadata.request_ids = [kv_cache.REQUEST_ID] * num_causal_blocks
+            metadata.request_ids = kv_cache.request_ids(num_causal_blocks)
             metadata.prompt_lens = [causal_block_size] * num_causal_blocks
+            cached = {
+                "metadata": metadata,
+                "prepared": False,
+                "seq_lens": metadata.seq_lens,
+                "kv_state": None,
+            }
+            self._metadata_cache[cache_key] = cached
+        metadata = cached["metadata"]
+        if cached["kv_state"] != state:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "K/V cache moved since the metadata was prepared; prepare before capture "
+                    "or replay, not inside it"
+                )
+            past = kv_cache.past_tokens
             metadata.kv_cache_params = KVCacheParams(
                 use_cache=True,
                 num_cached_tokens_per_seq=[
@@ -228,9 +241,9 @@ class TrtllmAttentionMetadata:
                 ],
             )
             metadata.prepare()
-            cached = {"metadata": metadata, "prepared": True, "seq_lens": metadata.seq_lens}
-            self._metadata_cache[cache_key] = cached
-        return cached["metadata"]
+            cached["prepared"] = True
+            cached["kv_state"] = state
+        return metadata
 
 
 class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):

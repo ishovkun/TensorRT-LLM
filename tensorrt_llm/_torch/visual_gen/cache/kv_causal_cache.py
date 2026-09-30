@@ -42,9 +42,9 @@ storage positions here never grow past the resident capacity.
 
 from __future__ import annotations
 
-from collections import deque
-from typing import Deque, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 import tensorrt_llm.bindings
@@ -52,19 +52,22 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.math_utils import ceil_div
 
 _DTYPES = {
     torch.bfloat16: tensorrt_llm.bindings.DataType.BF16,
     torch.float16: tensorrt_llm.bindings.DataType.HALF,
 }
 
+# The V2 sequence id of the one rollout. V2 registers every sequence under an
+# integer id that normally comes from an LlmRequest; a rollout has none, so it
+# gets a fixed one, as V2's own guard-page and capture-dummy sequences do.
+_ROLLOUT_REQUEST_ID = 0
 
-def _ceil_div(a: int, b: int) -> int:
-    return -(-a // b)
 
-
-def _contiguous_runs(pages: List[int]) -> Iterator[Tuple[int, int, int]]:
-    """Split a page list into ``(first_index, first_page, count)`` runs of consecutive pages."""
+def _consecutive_pages(pages: List[int]) -> Iterator[Tuple[int, int, int]]:
+    """Split a page list into maximal groups of consecutive page ids, as
+    ``(first_index, first_page, count)``; each group is one contiguous slab of pool memory."""
     i = 0
     while i < len(pages):
         j = i + 1
@@ -80,8 +83,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
     Args:
         num_layers: attention layers that persist K/V (the generator tower).
         num_kv_heads, head_dim, dtype: K/V geometry, per layer, per rank.
-        tokens_per_block: page size, a power of two. Each attention backend has
-            its own kernel constraint on it and raises if the cache's does not fit.
+        tokens_per_block: page size, a power of two (both paged kernels require
+            it). Each backend may add its own constraint and raises if unmet.
         prompt_capacity: largest prompt this cache accepts, in tokens
             (``text_cache_max_len``).
         window_tokens: generator history kept attendable, in tokens
@@ -91,7 +94,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
             head sharding done by Ulysses, since the manager divides heads by it.
     """
 
-    REQUEST_ID = 0
     # Most causal blocks one forward may cut the in-flight chunk into. Sizes the
     # persistent per-block tensors so their pointers are stable across forwards
     # of different causal block counts.
@@ -119,6 +121,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 "and prompt_capacity non-negative"
             )
         if tokens_per_block & (tokens_per_block - 1):
+            # cuDNN's paged SDPA and trtllm-gen's KV block array both require it.
             raise ValueError(f"tokens_per_block must be a power of two, got {tokens_per_block}")
 
         self.tokens_per_block = tokens_per_block
@@ -129,7 +132,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # Resident tokens peak at prompt + window + (tpb - 1) stale + chunk; the
         # extra page covers the stale tokens and an unaligned prompt start.
         self.num_pages = (
-            _ceil_div(prompt_capacity + window_tokens + chunk_tokens, tokens_per_block) + 1
+            ceil_div(prompt_capacity + window_tokens + chunk_tokens, tokens_per_block) + 1
         )
         self.capacity = self.num_pages * tokens_per_block
 
@@ -176,12 +179,22 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._prompt_len = 0
         self._history_tokens = 0
         self._stale_tokens = 0
-        self._fixed: List[int] = []  # prompt-only pages, never rotated
-        self._ring: Deque[int] = deque()  # shared page (if any), history, free pages
-        self._page_table: Optional[torch.Tensor] = None
-        self._seq_len_q: Optional[torch.Tensor] = None
-        self._seq_len_kv: Optional[torch.Tensor] = None
-        self._causal_block_key: Optional[tuple] = None
+        # Device-side state read by the kernels. Every tensor here lives for the
+        # life of an open cache and is rewritten in place by open() and commit(),
+        # never on the forward path, so a CUDA graph captured around a forward
+        # keeps reading correct values after the cache moves.
+        #
+        # The table: pool-view page indices in logical order, full prompt pages
+        # first (never rotated), then the ring: the page shared with the prompt's
+        # tail (if any), history, free pages. One identical row per causal block,
+        # because cuDNN reads a [blocks, pages] table with a real row stride.
+        self._table: Optional[torch.Tensor] = None
+        self._table_scratch: Optional[torch.Tensor] = None
+        self._fixed_pages = 0
+        self._k_rows: Optional[torch.Tensor] = None
+        self._v_rows: Optional[torch.Tensor] = None
+        self._block_lengths: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._kv_heads_local = 0
         self._table_version = 0
 
     # ------------------------------------------------------------------ lifecycle
@@ -195,7 +208,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 f"prompt_len {prompt_len} exceeds prompt_capacity {self.prompt_capacity}"
             )
 
-        kv_cache = self._create_kv_cache(self.REQUEST_ID, None, None, is_dummy=True)
+        kv_cache = self._create_kv_cache(_ROLLOUT_REQUEST_ID, None, None, is_dummy=True)
         if kv_cache is None:
             raise RuntimeError("KVCacheManagerV2 has no free sequence slot")
         try:
@@ -211,43 +224,48 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._release(kv_cache)
             raise
 
-        pages = [int(p) for p in kv_cache.get_base_page_indices(0)][: self.num_pages]
-        if len(pages) != self.num_pages or min(pages) < 0:
+        # V2 owns and may rewrite that buffer: copy it.
+        pages = np.array(kv_cache.get_base_page_indices(0), dtype=np.int64)[: self.num_pages]
+        if pages.size != self.num_pages or pages.min() < 0:
             self._release(kv_cache)
             raise RuntimeError(f"expected {self.num_pages} backed pages, got {pages}")
-        # Logical order is ours to choose; ascending keeps the ring a cyclic shift of
-        # consecutive pages, so a chunk's pages form at most two contiguous runs.
+        # Logical order is ours to choose. Ascending keeps consecutive page ids
+        # consecutive after rotation whenever V2 handed out a contiguous range, which
+        # lets write_range copy the prompt in few pieces; nothing depends on it.
         pages.sort()
 
         self._kv_cache = kv_cache
         self._prompt_len = prompt_len
         self._history_tokens = 0
         self._stale_tokens = 0
-        full_prompt_pages = prompt_len // self.tokens_per_block
-        self._fixed = pages[:full_prompt_pages]
-        self._ring = deque(pages[full_prompt_pages:])
-        device = self.kv_buffer(0).device
-        self._page_table = torch.empty(
-            self.MAX_CAUSAL_BLOCKS, self.num_pages, dtype=torch.int32, device=device
-        )
-        self._seq_len_q = torch.zeros(self.MAX_CAUSAL_BLOCKS, dtype=torch.int32, device=device)
-        self._seq_len_kv = torch.zeros(self.MAX_CAUSAL_BLOCKS, dtype=torch.int32, device=device)
-        self._causal_block_key = None
-        self._publish_table()
+        self._fixed_pages = prompt_len // self.tokens_per_block
+        buf = self.kv_buffer(0)
+        device = buf.device
+        self._kv_heads_local = buf.shape[2]
+        scaled = torch.from_numpy(pages * self.page_view_scale).to(device=device, dtype=torch.int32)
+        self._table = scaled.repeat(self.MAX_CAUSAL_BLOCKS, 1)
+        self._table_scratch = torch.empty_like(self._table)
+        rows = self.chunk_tokens * self._kv_heads_local
+        self._k_rows = torch.empty(rows, dtype=torch.int64, device=device)
+        self._v_rows = torch.empty(rows, dtype=torch.int64, device=device)
+        self._block_lengths = {}
+        self._table_version += 1
+        self._refresh_device_state()
 
     def close(self) -> None:
         if self._kv_cache is None:
             return
         kv_cache, self._kv_cache = self._kv_cache, None
-        self._page_table = self._seq_len_q = self._seq_len_kv = None
+        self._table = self._table_scratch = self._k_rows = self._v_rows = None
+        self._block_lengths = {}
         self._release(kv_cache)
 
     def _release(self, kv_cache) -> None:
-        self.kv_cache_map.pop(self.REQUEST_ID, None)
+        self.kv_cache_map.pop(_ROLLOUT_REQUEST_ID, None)
         kv_cache.discard_pending_stats()
         kv_cache.close()
-        self.impl.clear_stats_excluded(self.REQUEST_ID)
-        self.index_mapper.remove_sequence(self.REQUEST_ID)
+        self.impl.clear_stats_excluded(_ROLLOUT_REQUEST_ID)
+        self.index_mapper.remove_sequence(_ROLLOUT_REQUEST_ID)
 
     def shutdown(self) -> None:
         self.close()
@@ -284,10 +302,16 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """Increments whenever the block table changes; lets callers cache derived metadata."""
         return self._table_version
 
+    def request_ids(self, num_causal_blocks: int) -> List[int]:
+        """The request ids attention metadata must carry: one per causal block, all the
+        one rollout sequence."""
+        return [_ROLLOUT_REQUEST_ID] * num_causal_blocks
+
     def block_table(self) -> List[int]:
-        """Every base page in logical order. Kernels read only the first ``ceil(seq_len / tpb)``."""
+        """Every base page in logical order, read back from the device table. For the
+        prompt write and for tests; kernels read ``page_table`` directly."""
         self._require_open()
-        return self._fixed + list(self._ring)
+        return (self._table[0] // self.page_view_scale).tolist()
 
     def page_table(self, num_causal_blocks: int = 1) -> torch.Tensor:
         """``[num_causal_blocks, num_pages]`` int32 device table in ``kv_buffer`` view indices.
@@ -300,7 +324,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             raise ValueError(
                 f"num_causal_blocks {num_causal_blocks} outside (0, {self.MAX_CAUSAL_BLOCKS}]"
             )
-        return self._page_table[:num_causal_blocks]
+        return self._table[:num_causal_blocks]
 
     def causal_block_lengths(
         self, num_causal_blocks: int, causal_block_size: int
@@ -309,10 +333,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
         A forward cuts the tokens it adds into consecutive causal blocks. Block ``i``
         holds tokens ``[past + i*causal_block_size, past + (i+1)*causal_block_size)`` and attends
-        over ``[0, past + (i+1)*causal_block_size)``: full within a causal block, causal across
-        causal blocks. Paged kernels read these lengths from device memory; they are
-        rewritten in place only when the values change, so every layer of a forward
-        and every denoising step over one chunk share a single write.
+        over ``[0, past + (i+1)*causal_block_size)``: full within a block, causal across
+        blocks. One persistent pair per blocking, created on first use (never during
+        graph capture) and refreshed by ``commit()``, so a captured forward keeps
+        reading the right lengths.
         """
         self._require_open()
         if not 0 < num_causal_blocks <= self.MAX_CAUSAL_BLOCKS:
@@ -324,13 +348,24 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 f"{num_causal_blocks} causal blocks of {causal_block_size} tokens do not fit a "
                 f"{self.chunk_tokens}-token chunk"
             )
-        key = (self.past_tokens, num_causal_blocks, causal_block_size)
-        if key != self._causal_block_key:
-            ends = torch.arange(1, num_causal_blocks + 1, dtype=torch.int32) * causal_block_size
-            self._seq_len_q[:num_causal_blocks].fill_(causal_block_size)
-            self._seq_len_kv[:num_causal_blocks].copy_(ends + self.past_tokens)
-            self._causal_block_key = key
-        return self._seq_len_q[:num_causal_blocks], self._seq_len_kv[:num_causal_blocks]
+        key = (num_causal_blocks, causal_block_size)
+        pair = self._block_lengths.get(key)
+        if pair is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"causal blocking {key} first seen during CUDA graph capture; run the "
+                    "forward eagerly once before capturing"
+                )
+            device = self._table.device
+            pair = (
+                torch.full(
+                    (num_causal_blocks,), causal_block_size, dtype=torch.int32, device=device
+                ),
+                torch.empty(num_causal_blocks, dtype=torch.int32, device=device),
+            )
+            self._block_lengths[key] = pair
+            self._fill_block_kv_lengths(key, pair[1])
+        return pair
 
     def commit(self) -> None:
         """The in-flight chunk's K/V are final; advance the window."""
@@ -340,31 +375,67 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if excess > 0:
             drop_pages = excess // self.tokens_per_block
             if drop_pages:
-                old_head = self._ring[0]
-                for _ in range(drop_pages):
-                    # Recycle: the oldest page becomes the newest free page.
-                    self._ring.append(self._ring.popleft())
-                self._refill_shared_page(old_head, self._ring[0])
+                # Recycle: the oldest pages become the newest free pages. Rotated
+                # in place through the scratch rows; no allocation, and the table's
+                # address, which captured graphs hold, never changes.
+                ring = self._table[:, self._fixed_pages :]
+                scratch = self._table_scratch[:, self._fixed_pages :]
+                width = ring.shape[1]
+                drop_pages %= width
+                old_head = ring[0, 0].clone()
+                scratch[:, : width - drop_pages].copy_(ring[:, drop_pages:])
+                scratch[:, width - drop_pages :].copy_(ring[:, :drop_pages])
+                ring.copy_(scratch)
+                self._refill_shared_page(old_head, ring[0, 0])
                 self._history_tokens -= drop_pages * self.tokens_per_block
-                self._publish_table()
+                self._table_version += 1
             self._stale_tokens = self._history_tokens - self.window_tokens
         assert 0 <= self._stale_tokens < self.tokens_per_block, self._stale_tokens
         assert self.seq_len <= self.capacity
+        self._refresh_device_state()
 
-    def _refill_shared_page(self, old_page: int, new_page: int) -> None:
-        """Copy the prompt's tail into the page that now starts the history."""
+    def _refill_shared_page(self, old_page: torch.Tensor, new_page: torch.Tensor) -> None:
+        """Copy the prompt's tail into the page that now starts the history.
+
+        ``old_page``/``new_page`` are 0-d int32 view indices on the device; indexing
+        with them keeps the commit free of host syncs.
+        """
         tail = self._prompt_len % self.tokens_per_block
         if tail == 0:
             return
-        old_page, new_page = old_page * self.page_view_scale, new_page * self.page_view_scale
+        old_page, new_page = old_page.long().view(1), new_page.long().view(1)
         for layer in range(self._num_layers):
             buf = self.kv_buffer(layer)
-            buf[new_page, :, :, :tail].copy_(buf[old_page, :, :, :tail])
+            buf[new_page, :, :, :tail] = buf[old_page, :, :, :tail]
 
-    def _publish_table(self) -> None:
-        self._table_version += 1
-        table = torch.tensor(self.block_table(), dtype=torch.int32) * self.page_view_scale
-        self._page_table.copy_(table.expand(self.MAX_CAUSAL_BLOCKS, -1))
+    def _refresh_device_state(self) -> None:
+        """Rewrite every kernel-facing device tensor for the current table and ``past``.
+
+        Runs on the host in ``open()`` and ``commit()``, never on the forward path:
+        the page table, the pool row of every (token, head) of the in-flight chunk,
+        and the K/V lengths of every blocking seen so far.
+        """
+        # Pool viewed as rows of head_dim: row of (page, kv, head, slot) is
+        # ((page*2 + kv)*H + head)*tpb + slot, with page already a view index.
+        tpb, heads = self.tokens_per_block, self._kv_heads_local
+        device = self._table.device
+        logical = torch.arange(
+            self.past_tokens, self.past_tokens + self.chunk_tokens, device=device
+        )
+        page = self._table[0][logical // tpb].to(torch.int64)
+        slot = (logical % tpb).to(torch.int64)
+        head = torch.arange(heads, device=device)
+        k_rows = (page[:, None] * 2 * heads + head[None, :]) * tpb + slot[:, None]
+        self._k_rows.copy_(k_rows.reshape(-1))
+        self._v_rows.copy_((k_rows + heads * tpb).reshape(-1))
+
+        for key, (_, kv_lengths) in self._block_lengths.items():
+            self._fill_block_kv_lengths(key, kv_lengths)
+
+    def _fill_block_kv_lengths(self, key: Tuple[int, int], kv_lengths: torch.Tensor) -> None:
+        num_blocks, block_size = key
+        ends = torch.arange(1, num_blocks + 1, dtype=torch.int32, device=kv_lengths.device)
+        kv_lengths.copy_(ends * block_size + self.past_tokens)
 
     # ------------------------------------------------------------------ direct pool access
 
@@ -412,7 +483,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             first = (start + t) // tpb
             src_k = k[t : t + full * tpb].view(full, tpb, -1, k.shape[-1]).transpose(1, 2)
             src_v = v[t : t + full * tpb].view(full, tpb, -1, v.shape[-1]).transpose(1, 2)
-            for i, page, count in _contiguous_runs(table[first : first + full]):
+            for i, page, count in _consecutive_pages(table[first : first + full]):
                 dst = slice(page * vs, (page + count) * vs, vs)
                 buf[dst, 0].copy_(src_k[i : i + count])
                 buf[dst, 1].copy_(src_v[i : i + count])
@@ -421,6 +492,30 @@ class CausalKVCacheManager(KVCacheManagerV2):
             page = table[(start + t) // tpb] * vs
             buf[page, 0, :, : n - t].copy_(k[t:].transpose(0, 1))
             buf[page, 1, :, : n - t].copy_(v[t:].transpose(0, 1))
+
+    def write_chunk(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Write the in-flight chunk's first ``T`` tokens of K/V at ``past_tokens``.
+
+        ``k``/``v`` are ``[T, num_kv_heads, head_dim]``. Two ``index_copy_`` kernels over
+        the pool viewed as rows of ``head_dim``, driven by row indices the cache
+        rebuilds on ``commit()``, so the write replays correctly inside a CUDA graph.
+        """
+        self._require_open()
+        num_tokens, heads, head_dim = k.shape
+        if v.shape != k.shape:
+            raise ValueError(f"k/v shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}")
+        if num_tokens > self.chunk_tokens or heads != self._kv_heads_local:
+            raise ValueError(
+                f"chunk write of [{num_tokens}, {heads}] does not fit "
+                f"[{self.chunk_tokens}, {self._kv_heads_local}]"
+            )
+        buf = self.kv_buffer(layer_idx)
+        if k.dtype != buf.dtype:
+            raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
+        rows = num_tokens * heads
+        pool_rows = buf.view(-1, head_dim)
+        pool_rows.index_copy_(0, self._k_rows[:rows], k.reshape(rows, head_dim))
+        pool_rows.index_copy_(0, self._v_rows[:rows], v.reshape(rows, head_dim))
 
     def write_prompt_kv(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write the prompt's K/V (``[prompt_len, num_kv_heads, head_dim]``) at logical 0."""
@@ -453,23 +548,50 @@ class CausalKVCacheManager(KVCacheManagerV2):
         ids = list(request_ids)
         if (
             not 0 < len(ids) <= self.MAX_CAUSAL_BLOCKS
-            or any(r != self.REQUEST_ID for r in ids)
+            or any(r != _ROLLOUT_REQUEST_ID for r in ids)
             or num_seqs != len(ids)
             or beam_width != 1
         ):
             raise ValueError(
-                f"CausalKVCacheManager serves one sequence (id {self.REQUEST_ID}) in up to "
+                f"CausalKVCacheManager serves one sequence (id {_ROLLOUT_REQUEST_ID}) in up to "
                 f"{self.MAX_CAUSAL_BLOCKS} causal blocks; got request_ids={ids}, num_seqs={num_seqs}, "
                 f"beam_width={beam_width}"
             )
-        table = torch.tensor(self.block_table(), dtype=torch.int32)
-        scale = int(self.index_scales[0])
-        kv_offset = int(self.kv_offset[0])
-        n = table.numel()
-        offsets = torch.stack((table * scale, table * scale + kv_offset))
-        dst_tensor[0, :num_seqs, :, :n].copy_(offsets.expand(num_seqs, -1, -1), non_blocking=True)
+        # The op wants base_page * index_scale; the table holds view indices, which
+        # are base_page * index_scale / kv_factor.
+        n = self.num_pages
+        k_offsets = self._table[0] * self.kv_factor
+        dst_tensor[0, :num_seqs, 0, :n] = k_offsets
+        dst_tensor[0, :num_seqs, 1, :n] = k_offsets + int(self.kv_offset[0])
         if n < dst_tensor.shape[-1]:
             dst_tensor[0, :num_seqs, :, n:].zero_()
+
+    def get_batch_cache_indices(
+        self,
+        request_ids: List[int],
+        layer_idx: Optional[int] = None,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
+    ) -> List[List[int]]:
+        """The rotated table in V2's per-layer view units, one row per request.
+
+        Overrides the inherited accessor, which would report the pages in
+        allocation order and disagree with what the attention backends read.
+        Every request is the one sequence.
+        """
+        ids = list(request_ids)
+        if any(r != _ROLLOUT_REQUEST_ID for r in ids):
+            raise ValueError(
+                f"CausalKVCacheManager serves request {_ROLLOUT_REQUEST_ID} only; got {ids}"
+            )
+        row = self._table[0].tolist()
+        widths = [len(row)] * len(ids) if num_blocks_per_seq is None else list(num_blocks_per_seq)
+        return [row[:n] for n in widths]
+
+    def get_batch_cache_indices_flat(
+        self, request_ids: List[int], num_blocks: List[int], layer_idx: Optional[int] = None
+    ) -> torch.Tensor:
+        rows = self.get_batch_cache_indices(request_ids, layer_idx, num_blocks)
+        return torch.tensor([p for row in rows for p in row], dtype=torch.int32)
 
     def _require_open(self) -> None:
         if self._kv_cache is None:

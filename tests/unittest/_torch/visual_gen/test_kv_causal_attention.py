@@ -281,3 +281,55 @@ def test_dirty_steps_overwrite_in_place(cache, backend):
     k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, last_k)
     torch.testing.assert_close(v_back, last_v)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_graph_replay_survives_commit(cache, backend):
+    """A forward captured in a CUDA graph stays correct after commit() moves the cache,
+    including across a page rotation: writes land on the new pages and attention
+    reads the new lengths. The step loop refreshes TRTLLM metadata before replay."""
+    if backend == "trtllm" and cache.tokens_per_block != 32:
+        pytest.skip("trtllm-gen: 32-token pages only")
+    torch.manual_seed(5)
+    cache.open(prompt_len=9)
+    attn = make_backend(backend)
+    pk, pv = rand_qkv(9)[1:]
+    cache.write_prompt_kv(0, pk, pv)
+    history_k, history_v = [], []
+    for _ in range(2):
+        _, k, v = rand_qkv(CHUNK)
+        cache.write_range(0, cache.past_tokens, k, v)
+        cache.commit()
+        history_k.append(k)
+        history_v.append(v)
+
+    q, k, v = rand_qkv(CHUNK)  # static buffers the graph reads
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):  # eager warmup creates lengths and metadata before capture
+            run(attn, cache, q, k, v)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run(attn, cache, q, k, v)
+
+    for step in range(3):  # the third commit rotates the table
+        history_k.append(k.clone())
+        history_v.append(v.clone())
+        cache.commit()
+        if backend == "trtllm":
+            attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)  # the step loop's job
+        q2, k2, v2 = rand_qkv(CHUNK)
+        q.copy_(q2), k.copy_(k2), v.copy_(v2)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        n_hist = cache.history_tokens
+        hk, hv = torch.cat(history_k)[-n_hist:], torch.cat(history_v)[-n_hist:]
+        expected = reference_attention(q, torch.cat([pk, hk, k]), torch.cat([pv, hv, v]))
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"replay {step}")
+        positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+        k_back, v_back = read_kv(cache, 0, positions)
+        torch.testing.assert_close(k_back, k, msg=f"replay {step}: K landed on stale pages")
+        torch.testing.assert_close(v_back, v, msg=f"replay {step}: V landed on stale pages")

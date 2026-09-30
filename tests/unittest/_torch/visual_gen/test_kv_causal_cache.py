@@ -96,7 +96,7 @@ def test_open_backs_every_page_once_and_publishes_the_table(cache):
     assert len(table) == cache.num_pages
     assert len(set(table)) == cache.num_pages, "pages must be distinct"
     assert min(table) >= 0
-    assert cache._fixed == []  # 13 tokens do not fill a page
+    assert cache._fixed_pages == 0  # 13 tokens do not fill a page
     torch.testing.assert_close(
         cache.page_table()[0].cpu(),
         torch.tensor(table, dtype=torch.int32) * cache.page_view_scale,
@@ -104,7 +104,7 @@ def test_open_backs_every_page_once_and_publishes_the_table(cache):
 
     cache.close()
     cache.open(prompt_len=cache.tokens_per_block + 5)
-    assert len(cache._fixed) == 1, "the full prompt page never rotates"
+    assert cache._fixed_pages == 1, "the full prompt page never rotates"
 
 
 def test_open_twice_is_an_error_and_close_is_idempotent(cache):
@@ -214,13 +214,14 @@ def test_causal_block_lengths_are_causal_across_blocks_and_persistent(cache):
     assert q.tolist() == [chunk] and kv.tolist() == [3 + chunk]
 
     q4, kv4 = cache.causal_block_lengths(4, chunk // 4)
-    assert q4.data_ptr() == q.data_ptr() and kv4.data_ptr() == kv.data_ptr(), "same buffers"
     assert q4.tolist() == [chunk // 4] * 4
     assert kv4.tolist() == [3 + (i + 1) * chunk // 4 for i in range(4)]
+    assert cache.causal_block_lengths(4, chunk // 4)[1] is kv4, "one persistent pair per blocking"
 
     cache.commit()
-    _, kv_after = cache.causal_block_lengths(4, chunk // 4)
-    assert kv_after.tolist() == [3 + chunk + (i + 1) * chunk // 4 for i in range(4)]
+    # Refreshed in place by commit(), without anyone asking for them again.
+    assert kv.tolist() == [3 + chunk + chunk]
+    assert kv4.tolist() == [3 + chunk + (i + 1) * chunk // 4 for i in range(4)]
 
     with pytest.raises(ValueError):
         cache.causal_block_lengths(cache.MAX_CAUSAL_BLOCKS + 1, 1)
@@ -235,7 +236,7 @@ def test_copy_batch_block_offsets_encodes_our_table(cache):
     for _ in range(5):
         cache.commit()
     dst = torch.full((1, 4, 2, cache.max_blocks_per_seq), -7, dtype=torch.int32, device="cuda")
-    cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID] * 3, 1, 3, 3)
+    cache.copy_batch_block_offsets(dst, cache.request_ids(3), 1, 3, 3)
     torch.cuda.synchronize()
     table = torch.tensor(cache.block_table(), dtype=torch.int32, device="cuda")
     n = table.numel()
@@ -252,9 +253,42 @@ def test_copy_batch_block_offsets_encodes_our_table(cache):
     with pytest.raises(ValueError):
         cache.copy_batch_block_offsets(dst, [1], 1, 1, 1)
     with pytest.raises(ValueError):
-        cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID, 1], 1, 2, 2)
+        cache.copy_batch_block_offsets(dst, cache.request_ids(1) + [1], 1, 2, 2)
     with pytest.raises(ValueError):
-        cache.copy_batch_block_offsets(dst, [cache.REQUEST_ID] * 2, 1, 2, 1)
+        cache.copy_batch_block_offsets(dst, cache.request_ids(2), 1, 2, 1)
+
+
+def test_write_chunk_matches_write_range(cache):
+    """The device-indexed chunk write lands exactly where the host-sliced write does."""
+    cache.open(prompt_len=13)
+    for _ in range(3):
+        cache.commit()  # move past off a page boundary and rotate once
+    chunk = cache.chunk_tokens
+    positions = torch.arange(cache.past_tokens, cache.past_tokens + chunk, device=DEVICE)
+    for layer in range(NUM_LAYERS):
+        k, v = rand_kv(chunk)
+        cache.write_range(layer, cache.past_tokens, -k, -v)  # poison first
+        cache.write_chunk(layer, k, v)
+        k_back, v_back = read_kv(cache, layer, positions)
+        torch.testing.assert_close(k_back, k)
+        torch.testing.assert_close(v_back, v)
+    with pytest.raises(ValueError):
+        cache.write_chunk(0, *rand_kv(chunk + 1))
+
+
+def test_inherited_table_accessors_report_the_rotated_table(cache):
+    """V2's own accessors must agree with what the backends read, or raise."""
+    cache.open(prompt_len=13)
+    for _ in range(6):  # rotate at least once
+        cache.commit()
+    expected = cache.page_table()[0].tolist()
+    assert cache.get_batch_cache_indices(cache.request_ids(1)) == [expected]
+    two = cache.get_batch_cache_indices(cache.request_ids(2), num_blocks_per_seq=[3, 2])
+    assert two == [expected[:3], expected[:2]]
+    flat = cache.get_batch_cache_indices_flat(cache.request_ids(2), [3, 2])
+    assert flat.dtype == torch.int32 and flat.tolist() == expected[:3] + expected[:2]
+    with pytest.raises(ValueError):
+        cache.get_batch_cache_indices([7])
 
 
 def test_rejects_bad_geometry():
