@@ -442,8 +442,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def write_range(self, layer_idx: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write ``k``/``v`` ``[T, num_kv_heads, head_dim]`` at logical ``[start, start + T)``.
 
-        Eager, host-addressed, one copy per page touched. For the prompt (``start=0``)
-        and for tests; the per-forward write is ``write_chunk``.
+        Eager, host-addressed: a partial page at either end is one copy each, whole
+        pages go one group of physically consecutive pages at a time. For the prompt
+        (``start=0``) and for tests; the per-forward write is ``write_chunk``.
         """
         self._require_open()
         n = k.shape[0]
@@ -454,18 +455,48 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if not 0 <= start <= start + n <= self.capacity:
             raise ValueError(f"[{start}, {start + n}) outside the cache's {self.capacity} tokens")
         buf = self.kv_buffer(layer_idx)
-        tpb, vs = self.tokens_per_block, self.page_view_scale
+        tpb = self.tokens_per_block
         table = self.block_table()
         if k.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
 
-        for page_idx in range(start // tpb, (start + n - 1) // tpb + 1):
-            lo = max(start, page_idx * tpb)  # first logical token of this page in range
-            hi = min(start + n, (page_idx + 1) * tpb)  # one past the last
-            page = table[page_idx] * vs
-            slot = lo - page_idx * tpb
-            buf[page, 0, :, slot : slot + hi - lo].copy_(k[lo - start : hi - start].transpose(0, 1))
-            buf[page, 1, :, slot : slot + hi - lo].copy_(v[lo - start : hi - start].transpose(0, 1))
+        end = start + n
+        first_whole, end_whole = ceil_div(start, tpb), end // tpb  # whole pages [first, end)
+        if first_whole > end_whole:  # the whole range lies inside one page
+            self._write_page_slots(buf, table[start // tpb], start % tpb, k, v)
+            return
+        if start % tpb:
+            head = first_whole * tpb - start
+            self._write_page_slots(buf, table[start // tpb], start % tpb, k[:head], v[:head])
+        page_idx = first_whole
+        while page_idx < end_whole:
+            run_end = page_idx + 1
+            while run_end < end_whole and table[run_end] == table[run_end - 1] + 1:
+                run_end += 1
+            t0 = page_idx * tpb - start
+            t1 = run_end * tpb - start
+            self._write_whole_pages(buf, table[page_idx], run_end - page_idx, k[t0:t1], v[t0:t1])
+            page_idx = run_end
+        if end % tpb:
+            tail = end_whole * tpb - start
+            self._write_page_slots(buf, table[end_whole], 0, k[tail:], v[tail:])
+
+    def _write_page_slots(
+        self, buf: torch.Tensor, page: int, slot: int, k: torch.Tensor, v: torch.Tensor
+    ) -> None:
+        """A run of tokens inside one page, at ``slot`` onward; one copy per tensor."""
+        page *= self.page_view_scale
+        buf[page, 0, :, slot : slot + k.shape[0]].copy_(k.transpose(0, 1))
+        buf[page, 1, :, slot : slot + v.shape[0]].copy_(v.transpose(0, 1))
+
+    def _write_whole_pages(
+        self, buf: torch.Tensor, first_page: int, count: int, k: torch.Tensor, v: torch.Tensor
+    ) -> None:
+        """``count`` whole, physically consecutive pages starting at ``first_page``; one copy per tensor."""
+        tpb, vs = self.tokens_per_block, self.page_view_scale
+        dst = slice(first_page * vs, (first_page + count) * vs, vs)
+        buf[dst, 0].copy_(k.view(count, tpb, -1, k.shape[-1]).transpose(1, 2))
+        buf[dst, 1].copy_(v.view(count, tpb, -1, v.shape[-1]).transpose(1, 2))
 
     def write_chunk(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write the in-flight chunk's first ``T`` tokens of K/V at ``past_tokens``.
