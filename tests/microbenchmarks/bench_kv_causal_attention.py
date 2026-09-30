@@ -25,8 +25,8 @@ is cross-checked against an fp32 dense reference before anything is timed, so a
 silent kernel fallback (one that drops the cached prefix) fails here rather than
 being measured.
 
-    python bench_kv_causal_attention.py --prompt-len 512                # a denoising step
-    python bench_kv_causal_attention.py --prompt-len 512 --causal-block-size 394   # the clean pass
+    python tests/microbenchmarks/bench_kv_causal_attention.py --prompt-len 512   # a denoising step
+    python tests/microbenchmarks/bench_kv_causal_attention.py --prompt-len 512 --causal-block-size 394   # clean pass
 """
 
 from __future__ import annotations
