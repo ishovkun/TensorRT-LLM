@@ -52,14 +52,14 @@ def reference_attention(q, keys, values):
     return out.squeeze(0).transpose(0, 1).to(q.dtype)
 
 
-@pytest.fixture
-def cache():
+@pytest.fixture(params=[32, 64], ids=["tpb32", "tpb64"])
+def cache(request):
     mgr = CausalKVCacheManager(
         num_layers=1,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=32,
+        tokens_per_block=request.param,
         prompt_capacity=PROMPT_CAPACITY,
         window_tokens=WINDOW,
         chunk_tokens=CHUNK,
@@ -133,6 +133,13 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
 
     prompt_k, prompt_v = rand_qkv(prompt_len)[1:]
     cache.write_prompt_kv(0, prompt_k, prompt_v)
+    if backend == "trtllm" and cache.tokens_per_block != 32:
+        # trtllm-gen has paged context kernels for 32-token pages only; other sizes
+        # would silently drop the prefix, so the backend must refuse them.
+        q, k, v = rand_qkv(CHUNK)
+        with pytest.raises(NotImplementedError, match="32-token"):
+            run(attn, cache, q, k, v)
+        return
 
     history_k, history_v = [], []  # the reference's dense copy of committed generator K/V
     empty = prompt_k.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
@@ -218,6 +225,8 @@ def test_trtllm_causal_blocks_need_page_aligned_starts(cache):
     """The fused update kernel zeroes V after each request to its page end, so
     causal blocks that share a page are refused on this backend rather than corrupted."""
     torch.manual_seed(3)
+    if cache.tokens_per_block != 32:
+        pytest.skip("page-size refusal is covered by the rollout test")
     cache.open(prompt_len=9)
     cache.write_prompt_kv(0, *rand_qkv(9)[1:])
     q, k, v = rand_qkv(CHUNK)
@@ -255,6 +264,8 @@ def test_trtllm_page_aligned_causal_blocks():
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_dirty_steps_overwrite_in_place(cache, backend):
     """Several forwards at the same ``past`` leave only the last K/V in the cache."""
+    if backend == "trtllm" and cache.tokens_per_block != 32:
+        pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(1)
     cache.open(prompt_len=9)
     attn = make_backend(backend)

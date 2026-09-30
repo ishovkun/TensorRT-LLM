@@ -45,7 +45,7 @@ from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttent
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
 
 NUM_HEADS, NUM_KV_HEADS, HEAD_DIM = 32, 8, 128
-TOKENS_PER_FRAME, FRAMES_PER_CHUNK, TOKENS_PER_BLOCK = 394, 4, 32
+TOKENS_PER_FRAME, FRAMES_PER_CHUNK = 394, 4
 CHUNK = TOKENS_PER_FRAME * FRAMES_PER_CHUNK
 DTYPE = torch.bfloat16
 DEV = torch.device("cuda")
@@ -169,7 +169,9 @@ class CuptiTimer:
 # ------------------------------------------------------------------ variants
 
 
-def build_cache(prompt_len: int, window_tokens: int, history_chunks: int, gen):
+def build_cache(
+    prompt_len: int, window_tokens: int, history_chunks: int, tokens_per_block: int, gen
+):
     """Open a cache, write the prompt, commit ``history_chunks`` chunks.
 
     Returns the manager plus dense copies of the prompt and of the *resident*
@@ -180,7 +182,7 @@ def build_cache(prompt_len: int, window_tokens: int, history_chunks: int, gen):
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=TOKENS_PER_BLOCK,
+        tokens_per_block=tokens_per_block,
         prompt_capacity=max(prompt_len, 1),
         window_tokens=window_tokens,
         chunk_tokens=CHUNK,
@@ -218,6 +220,7 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--prompt-len", type=int, default=512)
+    ap.add_argument("--tokens-per-block", type=int, default=32, help="cache page size")
     ap.add_argument("--window-frames", type=int, default=96)
     ap.add_argument(
         "--history-chunks",
@@ -249,7 +252,9 @@ def main() -> None:
 
     gen = torch.Generator(device=DEV).manual_seed(args.seed)
     window = args.window_frames * TOKENS_PER_FRAME
-    mgr, kp, vp, k_hist, v_hist = build_cache(args.prompt_len, window, args.history_chunks, gen)
+    mgr, kp, vp, k_hist, v_hist = build_cache(
+        args.prompt_len, window, args.history_chunks, args.tokens_per_block, gen
+    )
     start = mgr.past_tokens
     seq_len = start + CHUNK
 
@@ -260,7 +265,7 @@ def main() -> None:
         f"geometry: q={CHUNK} keys={seq_len} (prompt {args.prompt_len} + history "
         f"{mgr.history_tokens} [{mgr.stale_tokens} stale] + chunk {CHUNK}) in {num_causal_blocks} "
         f"causal block(s) of {causal_block_size}; heads={NUM_HEADS}/{NUM_KV_HEADS} d={HEAD_DIM} "
-        f"page={TOKENS_PER_BLOCK} bf16"
+        f"page={mgr.tokens_per_block} bf16"
     )
 
     trtllm_attn = TrtllmAttention(
@@ -321,7 +326,7 @@ def main() -> None:
     }
     chosen = list(variants) if args.variant == "all" else [args.variant]
     if "trtllm" in chosen and any(
-        (start + i * causal_block_size) % TOKENS_PER_BLOCK for i in range(1, num_causal_blocks)
+        (start + i * causal_block_size) % mgr.tokens_per_block for i in range(1, num_causal_blocks)
     ):
         # The fused update kernel zeroes each request's V tail to its page end;
         # causal blocks sharing a page corrupt each other. Not a measurable variant here.

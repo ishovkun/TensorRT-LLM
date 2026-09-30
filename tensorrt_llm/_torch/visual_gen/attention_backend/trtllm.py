@@ -35,6 +35,11 @@ from ...metadata import KVCacheParams
 from ..cache import CausalKVCacheManager
 from .interface import AttentionBackend, AttentionTensorLayout
 
+# The only page size with shipped trtllm-gen paged context kernels. The page size
+# is part of the kernel hash; any other value misses the lookup and the attention
+# op falls back to an unfused path that silently ignores the cached prefix.
+_TRTLLM_GEN_TOKENS_PER_BLOCK = 32
+
 
 class TrtllmAttentionMetadata:
     """
@@ -313,7 +318,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         seq_len_kv: Optional[int] = None,
         kv_cache: Optional[CausalKVCacheManager] = None,
-        causal_block_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -339,15 +343,50 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: the fused kernel writes them at ``past_tokens`` and
                 attends over everything cached before them plus themselves.
-            causal_block_size: With ``kv_cache``, cuts the new tokens into consecutive
-                causal blocks: full attention within a block, causal across blocks (the
-                clean pass uses one block per frame). ``None``: one causal block.
+            timestep: Keyword; normalized diffusion timestep forwarded to
+                timestep-varying sparse attention (no effect otherwise).
+            causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts
+                the new tokens into consecutive causal blocks: full attention within a
+                block, causal across blocks. Use it when the cache must hold each
+                block's K/V as if the blocks had been generated one at a time, so later
+                blocks never leak into earlier ones. Absent: one causal block.
 
         Returns:
             Output tensor [B, S, H*D]
         """
         if kv_cache is not None:
-            return self._forward_with_kv_cache(q, k, v, kv_cache, causal_block_size, attention_mask)
+            output = self._forward_with_kv_cache(
+                q,
+                k,
+                v,
+                batch_size,
+                seq_len,
+                kv_cache,
+                kwargs.pop("causal_block_size", None),
+                attention_mask,
+            )
+        else:
+            output = self._forward_without_kv_cache(
+                q, k, v, batch_size, seq_len, attention_mask, seq_len_kv, **kwargs
+            )
+        return output.view(batch_size, seq_len, -1)
+
+    def _forward_without_kv_cache(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
+        attention_mask: PredefinedAttentionMask,
+        seq_len_kv: Optional[int],
+        **kwargs,
+    ) -> torch.Tensor:
+        """Plain diffusion attention; returns ``[B*S, H*D]``."""
+        if "causal_block_size" in kwargs:
+            raise NotImplementedError(
+                "block-causal attention is only implemented over a K/V cache; pass kv_cache."
+            )
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
@@ -385,7 +424,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 attention_mask=attention_mask,
                 timestep=timestep,
             )
-        output = output.view(batch_size, seq_len, -1)
         return output
 
     def _forward_with_kv_cache(
@@ -393,18 +431,27 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
+        batch_size: int,
+        seq_len: int,
         kv_cache: CausalKVCacheManager,
         causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
     ) -> torch.Tensor:
+        """Attention over ``kv_cache`` with the new tokens; returns ``[S, H*D]``."""
         if attention_mask != PredefinedAttentionMask.FULL:
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_attention_config is not None:
             raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
         if k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v.")
+        if kv_cache.tokens_per_block != _TRTLLM_GEN_TOKENS_PER_BLOCK:
+            raise NotImplementedError(
+                f"trtllm-gen ships paged context kernels for {_TRTLLM_GEN_TOKENS_PER_BLOCK}-token "
+                f"pages only; the cache uses {kv_cache.tokens_per_block}. Build the cache with "
+                f"tokens_per_block={_TRTLLM_GEN_TOKENS_PER_BLOCK} or use the CUDNN backend."
+            )
         batch, num_tokens, _, _ = q.shape
-        if batch != 1 or k.shape[1] != num_tokens:
+        if (batch, num_tokens) != (1, seq_len) or batch_size != 1 or k.shape[1] != num_tokens:
             raise ValueError(
                 "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
             )
@@ -432,10 +479,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # cache needs no separate write here.
         metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
         qkv = self._concat_qkv(q, k, v, 1, num_tokens, num_tokens)
-        output = super().forward(
+        return super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
         )
-        return output.view(1, num_tokens, -1)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

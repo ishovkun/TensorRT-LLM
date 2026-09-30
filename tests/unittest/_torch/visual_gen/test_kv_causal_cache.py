@@ -30,20 +30,23 @@ DEVICE = torch.device("cuda")
 DTYPE = torch.bfloat16
 
 
-def make_cache(tokens_per_block: int, *, prompt_capacity=40, window_tokens=64, chunk_tokens=40):
+def make_cache(tokens_per_block: int):
+    """Geometry that scales with the page size so every test exercises partial
+    pages, stale tokens and rotation: chunk is a page plus 8 tokens, window two pages."""
+    tpb = tokens_per_block
     return CausalKVCacheManager(
         num_layers=NUM_LAYERS,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=tokens_per_block,
-        prompt_capacity=prompt_capacity,
-        window_tokens=window_tokens,
-        chunk_tokens=chunk_tokens,
+        tokens_per_block=tpb,
+        prompt_capacity=tpb + 8,
+        window_tokens=2 * tpb,
+        chunk_tokens=tpb + 8,
     )
 
 
-@pytest.fixture(params=[32], ids=["tpb32"])
+@pytest.fixture(params=[32, 128], ids=["tpb32", "tpb128"])
 def cache(request):
     mgr = make_cache(request.param)
     try:
@@ -257,8 +260,8 @@ def test_copy_batch_block_offsets_encodes_our_table(cache):
 def test_rejects_bad_geometry():
     with pytest.raises(ValueError):
         make_cache(0)
-    for bad in (8, 12, 16, 64, 128):
-        with pytest.raises(ValueError, match="must be 32"):
+    for bad in (12, 24, 100):
+        with pytest.raises(ValueError, match="power of two"):
             make_cache(bad)
     with pytest.raises(ValueError):
         CausalKVCacheManager(

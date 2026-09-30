@@ -59,10 +59,6 @@ _DTYPES = {
 }
 
 
-# The only page size with shipped trtllm-gen paged context kernels.
-_TOKENS_PER_PAGE = 32
-
-
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
@@ -84,8 +80,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
     Args:
         num_layers: attention layers that persist K/V (the generator tower).
         num_kv_heads, head_dim, dtype: K/V geometry, per layer, per rank.
-        tokens_per_block: page size; must be 32, the only value with shipped
-            trtllm-gen paged context kernels.
+        tokens_per_block: page size, a power of two. Each attention backend has
+            its own kernel constraint on it and raises if the cache's does not fit.
         prompt_capacity: largest prompt this cache accepts, in tokens
             (``text_cache_max_len``).
         window_tokens: generator history kept attendable, in tokens
@@ -96,9 +92,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
     """
 
     REQUEST_ID = 0
-    # Most causal blocks one forward may cut the in-flight chunk into (the clean pass uses
-    # one per frame). Sizes the persistent per-block tensors so their pointers are
-    # stable across forwards of different causal block counts.
+    # Most causal blocks one forward may cut the in-flight chunk into. Sizes the
+    # persistent per-block tensors so their pointers are stable across forwards
+    # of different causal block counts.
     MAX_CAUSAL_BLOCKS = 8
 
     def __init__(
@@ -122,12 +118,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 "tokens_per_block, window_tokens, chunk_tokens must be positive "
                 "and prompt_capacity non-negative"
             )
-        if tokens_per_block != _TOKENS_PER_PAGE:
-            # The page size is part of the trtllm-gen kernel hash and the only paged
-            # context cubins shipped are for 32 tokens per page. Any other value misses
-            # the lookup, and the attention op then falls back to an unfused path that
-            # silently ignores the cached prefix instead of raising.
-            raise ValueError(f"tokens_per_block must be {_TOKENS_PER_PAGE}, got {tokens_per_block}")
+        if tokens_per_block & (tokens_per_block - 1):
+            raise ValueError(f"tokens_per_block must be a power of two, got {tokens_per_block}")
 
         self.tokens_per_block = tokens_per_block
         self.prompt_capacity = prompt_capacity

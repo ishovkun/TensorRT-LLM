@@ -919,7 +919,6 @@ class CuDNNAttention(AttentionBackend):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
         key_padding_mask: Optional[torch.Tensor] = None,
         kv_cache: Optional[CausalKVCacheManager] = None,
-        causal_block_size: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run attention.
@@ -933,16 +932,28 @@ class CuDNNAttention(AttentionBackend):
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: they are written at ``past_tokens`` and attention runs
                 over everything cached before them plus themselves.
-            causal_block_size: With ``kv_cache``, cuts the new tokens into consecutive
-                causal blocks: full attention within a block, causal across blocks (the
-                clean pass uses one block per frame). ``None``: one causal block.
+            causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts
+                the new tokens into consecutive causal blocks: full attention within a
+                block, causal across blocks. Use it when the cache must hold each
+                block's K/V as if the blocks had been generated one at a time, so later
+                blocks never leak into earlier ones. Absent: one causal block.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
         """
         if kv_cache is not None:
             return self._run_paged(
-                q, k, v, kv_cache, causal_block_size, attention_mask, key_padding_mask
+                q,
+                k,
+                v,
+                kv_cache,
+                kwargs.pop("causal_block_size", None),
+                attention_mask,
+                key_padding_mask,
+            )
+        if "causal_block_size" in kwargs:
+            raise NotImplementedError(
+                "block-causal attention is only implemented over a K/V cache; pass kv_cache."
             )
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
