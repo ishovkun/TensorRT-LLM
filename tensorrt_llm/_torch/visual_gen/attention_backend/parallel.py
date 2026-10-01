@@ -83,7 +83,8 @@ class UlyssesAttention(AttentionBackend):
     Two modes (auto-selected via ``inner_backend.support_fused_qkv()``):
     - Unfused: 3 separate all-to-all for Q/K/V + 1 for output (4 collectives)
     - Fused: stacks Q/K/V into [B, S/P, 3, H, D], 1 fused 5D all-to-all
-      + 1 for output (2 collectives total)
+      + 1 for output (2 collectives total). Requires equal Q and K/V head
+      counts; grouped-query attention always uses the unfused mode.
     """
 
     # One side stream shared across all UlyssesAttention instances on the
@@ -157,7 +158,9 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
-        if self.inner_backend.support_fused_qkv():
+        # The fused path stacks q/k/v on one axis, which needs equal head counts;
+        # grouped-query models take the per-tensor path.
+        if self.inner_backend.support_fused_qkv() and q.shape[2] == k.shape[2]:
             return self._forward_fused(q, k, v, **kwargs)
         return self._forward_unfused(q, k, v, **kwargs)
 

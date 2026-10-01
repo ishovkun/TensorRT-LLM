@@ -15,8 +15,10 @@
 """Attention backends over CausalKVCacheManager against a dense SDPA reference.
 
 Random inputs; the reference keeps its own dense copy of every K/V ever written
-and attends over exactly what is resident: prompt, history (stale tokens
-included), and the new tokens.
+and attends over exactly what the model's window allows: the fixed region (the
+prompt), the ``WINDOW`` tokens before each block, the earlier blocks of the chunk
+and the block itself. Stale tokens the whole-page eviction keeps resident must
+not be seen.
 """
 
 import pytest
@@ -52,6 +54,17 @@ def reference_attention(q, keys, values):
     return out.squeeze(0).transpose(0, 1).to(q.dtype)
 
 
+def exact_reference(q, pk, pv, hk, hv, k, v, start, end):
+    """Attention of the new tokens ``[start, end)`` of the chunk ``k``/``v`` over what the
+    window allows: the prompt, the ``WINDOW`` keys before ``start`` and the chunk up
+    to ``end``. ``hk``/``hv`` are every history token committed so far, oldest first."""
+    keys = torch.cat([pk, hk, k[:end]])
+    values = torch.cat([pv, hv, v[:end]])
+    pos = torch.arange(keys.shape[0], device=keys.device)
+    visible = (pos < pk.shape[0]) | (pos >= pk.shape[0] + hk.shape[0] + start - WINDOW)
+    return reference_attention(q[start:end], keys[visible], values[visible])
+
+
 @pytest.fixture(params=[32, 64], ids=["tpb32", "tpb64"])
 def cache(request):
     mgr = CausalKVCacheManager(
@@ -60,9 +73,10 @@ def cache(request):
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_block=request.param,
-        prompt_capacity=PROMPT_CAPACITY,
+        fixed_capacity=PROMPT_CAPACITY,
         window_tokens=WINDOW,
         chunk_tokens=CHUNK,
+        causal_block_sizes=(CHUNK, CHUNK // 4),
     )
     try:
         yield mgr
@@ -107,7 +121,7 @@ def run(attn, cache, q, k, v, causal_block_size=None):
 def read_kv(cache, layer, positions):
     """Gather ``[T, num_kv_heads, head_dim]`` K and V at logical ``positions`` straight from the pool."""
     buf = cache.kv_buffer(layer)
-    table = cache.page_table()[0].long()
+    table = cache.table.long()
     page = table[positions // cache.tokens_per_block]
     slot = positions % cache.tokens_per_block
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
@@ -119,6 +133,16 @@ def rand_qkv(n):
     return q, k, torch.randn_like(k)
 
 
+def open_with_prompt(cache, prompt_len):
+    """Open, write a random prompt at position 0 and pin it; returns its K and V."""
+    cache.open()
+    pk, pv = rand_qkv(prompt_len)[1:]
+    cache.write_range(0, 0, pk, pv)
+    if prompt_len:
+        cache.pin(prompt_len)
+    return pk, pv
+
+
 BACKENDS = ["cudnn", "trtllm"]
 
 
@@ -128,11 +152,8 @@ BACKENDS = ["cudnn", "trtllm"]
 )
 def test_rollout_matches_dense_reference(cache, backend, prompt_len):
     torch.manual_seed(0)
-    cache.open(prompt_len=prompt_len)
+    prompt_k, prompt_v = open_with_prompt(cache, prompt_len)
     attn = make_backend(backend)
-
-    prompt_k, prompt_v = rand_qkv(prompt_len)[1:]
-    cache.write_range(0, 0, prompt_k, prompt_v)
     if backend == "trtllm" and cache.tokens_per_block != 32:
         # trtllm-gen has paged context kernels for 32-token pages only; other sizes
         # would silently drop the prefix, so the backend must refuse them.
@@ -149,14 +170,10 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
         out = run(attn, cache, q, k, v)
         torch.cuda.synchronize()
 
-        # Resident history is the tail of what was committed, stale tokens included.
-        n_hist = cache.history_tokens
         saw_stale |= cache.history_tokens > WINDOW
-        hist_k = torch.cat(history_k)[-n_hist:] if n_hist else empty
-        hist_v = torch.cat(history_v)[-n_hist:] if n_hist else empty
-        expected = reference_attention(
-            q, torch.cat([prompt_k, hist_k, k]), torch.cat([prompt_v, hist_v, v])
-        )
+        hk = torch.cat(history_k) if history_k else empty
+        hv = torch.cat(history_v) if history_v else empty
+        expected = exact_reference(q, prompt_k, prompt_v, hk, hv, k, v, 0, CHUNK)
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"step {step}")
         if step > 0 or prompt_len > 0:
             chunk_only = reference_attention(q, k, v)
@@ -173,23 +190,19 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
         cache.commit()
         history_k.append(k)
         history_v.append(v)
-    assert saw_stale, "test geometry should attend over stale tokens at some step"
+    assert saw_stale, "test geometry should hold stale tokens at some step"
 
 
-def check_causal_blocks(attn, cache, prompt_k, prompt_v, num_causal_blocks, chunk):
-    """One call cut into causal blocks: causal block i sees the cache plus causal blocks <= i."""
-    n_hist = cache.history_tokens
-    hist = torch.arange(cache.prompt_len, cache.prompt_len + n_hist, device=DEVICE)
-    hk, hv = read_kv(cache, 0, hist)
+def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_blocks, chunk):
+    """One call cut into causal blocks: block i sees the prompt, its own window of
+    history, the blocks before it and itself. ``hk``/``hv``: all committed history."""
     causal_block_size = chunk // num_causal_blocks
     q, k, v = rand_qkv(chunk)
     out = run(attn, cache, q, k, v, causal_block_size=causal_block_size)
     torch.cuda.synchronize()
     for i in range(num_causal_blocks):
         lo, hi = i * causal_block_size, (i + 1) * causal_block_size
-        expected = reference_attention(
-            q[lo:hi], torch.cat([prompt_k, hk, k[:hi]]), torch.cat([prompt_v, hv, v[:hi]])
-        )
+        expected = exact_reference(q, prompt_k, prompt_v, hk, hv, k, v, lo, hi)
         torch.testing.assert_close(
             out[lo:hi], expected, rtol=2e-2, atol=2e-2, msg=f"causal block {i}"
         )
@@ -208,57 +221,73 @@ def check_causal_blocks(attn, cache, prompt_k, prompt_v, num_causal_blocks, chun
         run(attn, cache, q, k, v, causal_block_size=7)
 
 
-def test_cudnn_causal_blocks_at_any_alignment(cache):
-    """The clean pass: one launch, four causal blocks of 10 sharing pages mid-way."""
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_causal_blocks_at_any_alignment(cache, backend):
+    """The clean pass: one launch, four causal blocks of 10 sharing pages mid-way,
+    each with its own window start, over a rotated table with stale tokens."""
     torch.manual_seed(3)
-    cache.open(prompt_len=9)
-    pk, pv = rand_qkv(9)[1:]
-    cache.write_range(0, 0, pk, pv)
-    for _ in range(3):
+    if backend == "trtllm" and cache.tokens_per_block != 32:
+        pytest.skip("trtllm-gen: 32-token pages only")
+    pk, pv = open_with_prompt(cache, 9)
+    history_k, history_v = [], []
+    for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
         _, k, v = rand_qkv(CHUNK)
         cache.write_range(0, cache.past_tokens, k, v)
         cache.commit()
-    check_causal_blocks(make_backend("cudnn"), cache, pk, pv, num_causal_blocks=4, chunk=CHUNK)
-
-
-def test_trtllm_causal_blocks_need_page_aligned_starts(cache):
-    """The fused update kernel zeroes V after each request to its page end, so
-    causal blocks that share a page are refused on this backend rather than corrupted."""
-    torch.manual_seed(3)
-    if cache.tokens_per_block != 32:
-        pytest.skip("page-size refusal is covered by the rollout test")
-    cache.open(prompt_len=9)
-    cache.write_range(0, 0, *rand_qkv(9)[1:])
-    q, k, v = rand_qkv(CHUNK)
-    with pytest.raises(NotImplementedError, match="page boundary"):
-        run(make_backend("trtllm"), cache, q, k, v, causal_block_size=CHUNK // 4)
-
-
-def test_trtllm_page_aligned_causal_blocks():
-    """With causal block starts on page boundaries the fused path handles causal blocks too."""
-    torch.manual_seed(4)
-    chunk = 64
-    mgr = CausalKVCacheManager(
-        num_layers=1,
-        num_kv_heads=NUM_KV_HEADS,
-        head_dim=HEAD_DIM,
-        dtype=DTYPE,
-        tokens_per_block=32,
-        prompt_capacity=32,
-        window_tokens=128,
-        chunk_tokens=chunk,
+        history_k.append(k)
+        history_v.append(v)
+    assert cache.history_tokens > WINDOW, "test geometry should hold stale tokens here"
+    check_causal_blocks(
+        make_backend(backend),
+        cache,
+        pk,
+        pv,
+        torch.cat(history_k),
+        torch.cat(history_v),
+        num_causal_blocks=4,
+        chunk=CHUNK,
     )
-    try:
-        mgr.open(prompt_len=32)
-        pk, pv = rand_qkv(32)[1:]
-        mgr.write_range(0, 0, pk, pv)
-        _, k, v = rand_qkv(chunk)
-        mgr.write_range(0, mgr.past_tokens, k, v)
-        mgr.commit()
-        assert mgr.past_tokens % 32 == 0
-        check_causal_blocks(make_backend("trtllm"), mgr, pk, pv, num_causal_blocks=2, chunk=chunk)
-    finally:
-        mgr.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
+    """``num_valid_tokens``: a padded chunk behaves exactly like the unpadded one."""
+    if backend == "trtllm" and cache.tokens_per_block != 32:
+        pytest.skip("trtllm-gen: 32-token pages only")
+    torch.manual_seed(6)
+    pk, pv = open_with_prompt(cache, 9)
+    attn = make_backend(backend)
+    pad = 8
+    q, k, v = rand_qkv(CHUNK + pad)
+    out = attn.forward(
+        q[None],
+        k[None],
+        v[None],
+        batch_size=1,
+        seq_len=CHUNK + pad,
+        kv_cache=cache,
+        num_valid_tokens=CHUNK,
+    ).reshape(CHUNK + pad, NUM_HEADS, HEAD_DIM)
+    torch.cuda.synchronize()
+    expected = reference_attention(
+        q[:CHUNK], torch.cat([pk, k[:CHUNK]]), torch.cat([pv, v[:CHUNK]])
+    )
+    torch.testing.assert_close(out[:CHUNK], expected, rtol=2e-2, atol=2e-2)
+    assert out[CHUNK:].abs().max().item() == 0.0, "padding rows must be zero"
+    positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+    k_back, v_back = read_kv(cache, 0, positions)
+    torch.testing.assert_close(k_back, k[:CHUNK])
+    torch.testing.assert_close(v_back, v[:CHUNK])
+    with pytest.raises(ValueError):
+        attn.forward(
+            q[None],
+            k[None],
+            v[None],
+            batch_size=1,
+            seq_len=CHUNK + pad,
+            kv_cache=cache,
+            num_valid_tokens=0,
+        )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -267,9 +296,8 @@ def test_dirty_steps_overwrite_in_place(cache, backend):
     if backend == "trtllm" and cache.tokens_per_block != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(1)
-    cache.open(prompt_len=9)
+    open_with_prompt(cache, 9)
     attn = make_backend(backend)
-    cache.write_range(0, 0, *rand_qkv(9)[1:])
     past = cache.past_tokens
     last_k = last_v = None
     for _ in range(4):
@@ -291,10 +319,8 @@ def test_graph_replay_survives_commit(cache, backend):
     if backend == "trtllm" and cache.tokens_per_block != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(5)
-    cache.open(prompt_len=9)
+    pk, pv = open_with_prompt(cache, 9)
     attn = make_backend(backend)
-    pk, pv = rand_qkv(9)[1:]
-    cache.write_range(0, 0, pk, pv)
     history_k, history_v = [], []
     for _ in range(2):
         _, k, v = rand_qkv(CHUNK)
@@ -325,9 +351,8 @@ def test_graph_replay_survives_commit(cache, backend):
         graph.replay()
         torch.cuda.synchronize()
 
-        n_hist = cache.history_tokens
-        hk, hv = torch.cat(history_k)[-n_hist:], torch.cat(history_v)[-n_hist:]
-        expected = reference_attention(q, torch.cat([pk, hk, k]), torch.cat([pv, hv, v]))
+        hk, hv = torch.cat(history_k), torch.cat(history_v)
+        expected = exact_reference(q, pk, pv, hk, hv, k, v, 0, CHUNK)
         torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"replay {step}")
         positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
         k_back, v_back = read_kv(cache, 0, positions)

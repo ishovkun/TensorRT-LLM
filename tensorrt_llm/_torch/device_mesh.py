@@ -29,8 +29,14 @@ class SingleProcessGroup:
 
     @staticmethod
     def get_group():
-        return dist.group.WORLD if dist.is_initialized(
-        ) else SingleProcessGroup()
+        # Return the world process group when the whole job is a single rank,
+        # so callers can pass it to torch collectives. In a larger job there
+        # is no single-rank process group to return, so return this object:
+        # its rank() is 0 and size() is 1, which is all a single-rank mapping
+        # needs.
+        if dist.is_initialized() and dist.get_world_size() == 1:
+            return dist.group.WORLD
+        return SingleProcessGroup()
 
     @staticmethod
     def rank():
@@ -150,7 +156,15 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     def _get_mesh_dim_by_name(self, name: str) -> dist.DeviceMesh:
         cls = DeviceMeshTopologyImpl
 
-        if cls.device_mesh is None and self.world_size == 1:
+        if self.world_size == 1:
+            # This mapping has a single rank. Reuse the mesh's process group
+            # for this dimension when that group also has a single rank;
+            # otherwise the mesh belongs to a larger job and must not be
+            # used here.
+            mesh = cls.device_mesh
+            if mesh is not None and name in mesh.mesh_dim_names and mesh[
+                    name].size() == 1:
+                return mesh[name]
             return SingleProcessGroup()
 
         if name == 'tp':

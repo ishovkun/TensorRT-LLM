@@ -27,6 +27,12 @@ being measured.
 
     python tests/microbenchmarks/bench_kv_causal_attention.py --prompt-len 512   # a denoising step
     python tests/microbenchmarks/bench_kv_causal_attention.py --prompt-len 512 --causal-block-size 394   # clean pass
+    python tests/microbenchmarks/bench_kv_causal_attention.py --chunk-cycle --layers 36   # a chunk + commit
+
+The paged variants read exactly the model's window (the prompt, ``window``
+tokens before each block, the earlier blocks, the block) and are checked
+against that; the dense variants read the whole resident history, stale tokens
+included, and are checked against that.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ import argparse
 import bisect
 import statistics
 import sys
+import time
 from functools import partial
 
 import torch
@@ -170,44 +177,172 @@ class CuptiTimer:
 
 
 def build_cache(
-    prompt_len: int, window_tokens: int, history_chunks: int, tokens_per_block: int, gen
+    prompt_len: int,
+    window_tokens: int,
+    history_chunks: int,
+    tokens_per_block: int,
+    gen,
+    num_layers: int = 1,
 ):
-    """Open a cache, write the prompt, commit ``history_chunks`` chunks.
+    """Open a cache, write and pin the prompt, commit ``history_chunks`` chunks.
 
-    Returns the manager plus dense copies of the prompt and of the *resident*
-    history (the tail of everything committed, stale tokens included).
+    Returns the manager plus dense copies of the prompt and of every committed
+    history token, oldest first (layer 0's values; other layers get the same).
     """
     mgr = CausalKVCacheManager(
-        num_layers=1,
+        num_layers=num_layers,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_block=tokens_per_block,
-        prompt_capacity=max(prompt_len, 1),
+        fixed_capacity=max(prompt_len, 1),
         window_tokens=window_tokens,
         chunk_tokens=CHUNK,
+        causal_block_sizes=(CHUNK, TOKENS_PER_FRAME),
     )
-    mgr.open(prompt_len=prompt_len)
+    mgr.open()
     kp = torch.randn(prompt_len, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
     vp = torch.randn_like(kp)
-    mgr.write_range(0, 0, kp, vp)
+    for layer in range(num_layers):
+        mgr.write_range(layer, 0, kp, vp)
+    if prompt_len:
+        mgr.pin(prompt_len)
 
     hist_k, hist_v = [], []
     for _ in range(history_chunks):
         k = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
         v = torch.randn_like(k)
-        mgr.write_range(0, mgr.past_tokens, k, v)
+        for layer in range(num_layers):
+            mgr.write_range(layer, mgr.past_tokens, k, v)
         mgr.commit()
         hist_k.append(k)
         hist_v.append(v)
-    n = mgr.history_tokens
-    return mgr, kp, vp, torch.cat(hist_k)[-n:], torch.cat(hist_v)[-n:]
+    return mgr, kp, vp, torch.cat(hist_k), torch.cat(hist_v)
 
 
 def sdpa(q, k, v):
     return F.scaled_dot_product_attention(
         q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None], enable_gqa=True
     )[0].transpose(0, 1)
+
+
+def exact_reference(q, kp, vp, hk, hv, k, v, lo, hi, window):
+    """Reference for block ``[lo, hi)`` of the chunk.
+
+    Over the prompt, the ``window`` keys before the block and the chunk up to
+    ``hi``; ``hk``/``hv`` are every committed history token.
+    """
+    keys, values = torch.cat((kp, hk, k[:hi])), torch.cat((vp, hv, v[:hi]))
+    pos = torch.arange(keys.shape[0], device=keys.device)
+    visible = (pos < kp.shape[0]) | (pos >= kp.shape[0] + hk.shape[0] + lo - window)
+    return sdpa(q[lo:hi].float(), keys[visible].float(), values[visible].float())
+
+
+def chunk_cycle(args, gen) -> None:
+    """One chunk's worth of work across ``--layers`` layers.
+
+    Four denoising forwards and one clean pass per layer under CUDA graphs, then
+    one commit, with the commit's device kernels (CUPTI) and host time measured
+    separately.
+    """
+    window = args.window_frames * TOKENS_PER_FRAME
+    layers = args.layers
+    mgr, _, _, _, _ = build_cache(
+        args.prompt_len, window, args.history_chunks, args.tokens_per_block, gen, layers
+    )
+    q = torch.randn(CHUNK, NUM_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
+    k = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
+    v = torch.randn_like(k)
+    q4, k4, v4 = q[None], k[None], v[None]
+    if args.backend == "trtllm":
+        state: dict = {}
+        attns = [
+            TrtllmAttention(
+                layer_idx=i,
+                num_heads=NUM_HEADS,
+                head_dim=HEAD_DIM,
+                num_kv_heads=NUM_KV_HEADS,
+                dtype=DTYPE,
+                max_seq_len=mgr.capacity,
+                attention_metadata_state=state,
+            )
+            for i in range(layers)
+        ]
+
+        def forward(block):
+            for attn in attns:
+                attn.forward(
+                    q4, k4, v4, batch_size=1, seq_len=CHUNK, kv_cache=mgr, causal_block_size=block
+                )
+    else:
+        attns = [
+            CuDNNAttention(
+                layer_idx=i,
+                num_heads=NUM_HEADS,
+                head_dim=HEAD_DIM,
+                num_kv_heads=NUM_KV_HEADS,
+                dtype=DTYPE,
+            )
+            for i in range(layers)
+        ]
+
+        def forward(block):
+            for attn in attns:
+                attn.forward(q4, k4, v4, kv_cache=mgr, causal_block_size=block)
+
+    print(
+        f"chunk cycle: {layers} layers, backend {args.backend}, prompt {args.prompt_len}, "
+        f"history {mgr.history_tokens} [{max(0, mgr.history_tokens - window)} stale], "
+        f"chunk {CHUNK}, clean pass in {CHUNK // TOKENS_PER_FRAME} blocks of {TOKENS_PER_FRAME}"
+    )
+    timer = CuptiTimer(args.iters, args.warmup, not args.no_l2_flush, not args.no_graph)
+    denoise = timer.time(lambda: forward(None), "denoise")
+    clean = timer.time(lambda: forward(TOKENS_PER_FRAME), "clean")
+
+    # Commit: device kernels by CUPTI (eager, no graph), host time by the wall clock.
+    # Each commit at steady state drops pages, so the rotation and the private-page
+    # copies for both blockings are exercised every time.
+    def refresh_and_commit():
+        mgr.commit()
+        if args.backend == "trtllm":
+            for n, size in ((1, CHUNK), (CHUNK // TOKENS_PER_FRAME, TOKENS_PER_FRAME)):
+                attns[0].metadata.prepare_with_kv_cache(mgr, n, size)
+
+    commit_dev = CuptiTimer(args.iters, args.warmup, False, False).time(
+        refresh_and_commit, "commit"
+    )
+    host = []
+    for _ in range(args.iters):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        refresh_and_commit()
+        torch.cuda.synchronize()
+        host.append((time.perf_counter() - t0) * 1e3)
+    host_ms = statistics.median(host)
+
+    forwards = 4 * denoise["median_us"] + clean["median_us"]
+    total = forwards + commit_dev["median_us"]
+    print(f"\n{'per chunk, all layers':34s} {'median':>10s}")
+    print(f"{'4 denoising forwards':34s} {4 * denoise['median_us'] / 1e3:9.2f} ms")
+    print(f"{'1 clean pass':34s} {clean['median_us'] / 1e3:9.2f} ms")
+    print(
+        f"{'commit, device kernels':34s} {commit_dev['median_us'] / 1e3:9.2f} ms  "
+        f"({commit_dev['kernels']:.0f} kernels)"
+    )
+    print(f"{'commit, host wall (incl. above)':34s} {host_ms:9.2f} ms")
+    print(
+        f"{'total device per chunk':34s} {total / 1e3:9.2f} ms  "
+        f"(commit share {100 * commit_dev['median_us'] / total:.2f}%)"
+    )
+    print(
+        f"{'per layer per forward':34s} denoise {denoise['median_us'] / layers:.1f} us, "
+        f"clean {clean['median_us'] / layers:.1f} us"
+    )
+    mgr.shutdown()
+    try:
+        timer.cupti.finalize()
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -241,7 +376,18 @@ def main() -> None:
     ap.add_argument(
         "--dump-kernels", action="store_true", help="print kernel names for iteration 0"
     )
+    ap.add_argument(
+        "--chunk-cycle",
+        action="store_true",
+        help="time one chunk across --layers layers: 4 denoising forwards, the clean "
+        "pass, and the commit with its bookkeeping",
+    )
+    ap.add_argument("--layers", type=int, default=36)
+    ap.add_argument("--backend", choices=["cudnn_paged", "trtllm"], default="cudnn_paged")
     args = ap.parse_args()
+    if args.chunk_cycle:
+        chunk_cycle(args, torch.Generator(device=DEV).manual_seed(args.seed))
+        return
     causal_block_size = args.causal_block_size or CHUNK
     if CHUNK % causal_block_size:
         raise SystemExit(f"--causal-block-size must divide the chunk of {CHUNK} tokens")
@@ -299,11 +445,13 @@ def main() -> None:
             return attend(q, seq_len)
         return torch.cat([attend(q[lo:hi], start + hi) for lo, hi in blocks])
 
-    # Slab: what a contiguous per-layer buffer would cost. Prompt and history are
-    # already in place; a call writes the new tokens and attends over a slice.
+    # Slab: what a contiguous per-layer buffer would cost. Prompt and the resident
+    # history (stale tokens included: a slab has no per-block start) are already in
+    # place; a call writes the new tokens and attends over a slice.
     slab_k = torch.empty(mgr.capacity, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE)
     slab_v = torch.empty_like(slab_k)
-    resident_k, resident_v = torch.cat((kp, k_hist)), torch.cat((vp, v_hist))
+    n_res = mgr.history_tokens
+    resident_k, resident_v = torch.cat((kp, k_hist[-n_res:])), torch.cat((vp, v_hist[-n_res:]))
     slab_k[:start].copy_(resident_k)
     slab_v[:start].copy_(resident_v)
 
@@ -326,28 +474,25 @@ def main() -> None:
         "naive": run_naive,
     }
     chosen = list(variants) if args.variant == "all" else [args.variant]
-    if "trtllm" in chosen and any(
-        (start + i * causal_block_size) % mgr.tokens_per_block for i in range(1, num_causal_blocks)
-    ):
-        # The fused update kernel zeroes each request's V tail to its page end;
-        # causal blocks sharing a page corrupt each other. Not a measurable variant here.
-        print("trtllm: skipped, causal blocks must start on page boundaries on this backend")
-        chosen.remove("trtllm")
-
     # Cross-check before timing: a silent fallback that ignores the prefix, or a
     # causal block that sees the causal blocks after it, shows up here.
     all_k, all_v = torch.cat((resident_k, k)).float(), torch.cat((resident_v, v)).float()
-    ref = torch.cat(
+    ref_resident = torch.cat(
         [sdpa(q[lo:hi].float(), all_k[: start + hi], all_v[: start + hi]) for lo, hi in blocks]
+    )
+    ref_exact = torch.cat(
+        [exact_reference(q, kp, vp, k_hist, v_hist, k, v, lo, hi, window) for lo, hi in blocks]
     )
     chunk_only = sdpa(q.float(), k.float(), v.float())
     for name in chosen:
         out = variants[name]().reshape(CHUNK, NUM_HEADS, HEAD_DIM).float()
         torch.cuda.synchronize()
-        err = (out - ref).abs().max().item()
+        exact = name in ("trtllm", "cudnn_paged")
+        err = (out - (ref_exact if exact else ref_resident)).abs().max().item()
         err_chunk = (out - chunk_only).abs().max().item()
         print(
-            f"check {name:12s} max|err| vs dense fp32 = {err:.4f}   vs new-only = {err_chunk:.4f}"
+            f"check {name:12s} max|err| vs fp32 {'exact window' if exact else 'resident'} = "
+            f"{err:.4f}   vs new-only = {err_chunk:.4f}"
         )
         if err > 2e-2 or err_chunk < 1e-2:
             raise SystemExit(f"{name}: wrong result -- not benchmarking a broken path")

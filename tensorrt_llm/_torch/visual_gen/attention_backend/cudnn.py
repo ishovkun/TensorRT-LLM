@@ -636,12 +636,15 @@ class CuDNNAttention(AttentionBackend):
         causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
         key_padding_mask: Optional[torch.Tensor],
+        num_valid_tokens: Optional[int],
     ) -> torch.Tensor:
         """Write ``k``/``v`` at ``past_tokens``, then attend over the cache.
 
         ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video.
         ``causal_block_size`` cuts the ``S`` new tokens into consecutive causal blocks that are
         causal across each other (``None``: one causal block). Output is ``[1, S, H, D]``.
+        With ``num_valid_tokens`` only that prefix of the ``S`` tokens is real: it alone is
+        written and attended, and the output rows beyond it are zero.
         """
         if self._resolve_mask(attention_mask, key_padding_mask):
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
@@ -653,8 +656,19 @@ class CuDNNAttention(AttentionBackend):
             raise ValueError(
                 "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
             )
+        if k.shape[2] != kv_cache.num_kv_heads:
+            raise ValueError(
+                f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
+            )
         if q.stride(3) != 1:
             raise ValueError("q must be contiguous along head_dim.")
+        total_tokens = num_tokens
+        if num_valid_tokens is not None:
+            if not 0 < num_valid_tokens <= num_tokens:
+                raise ValueError(f"num_valid_tokens {num_valid_tokens} outside (0, {num_tokens}]")
+            if num_valid_tokens < num_tokens:
+                num_tokens = num_valid_tokens
+                q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
         causal_block_size = causal_block_size or num_tokens
         if num_tokens % causal_block_size:
             raise ValueError(
@@ -662,12 +676,13 @@ class CuDNNAttention(AttentionBackend):
             )
         num_causal_blocks = num_tokens // causal_block_size
         device = q.device
-        kv_cache.write_chunk(self.layer_idx, k[0], v[0])
-        seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(num_causal_blocks, causal_block_size)
+        kv_cache.write_chunk(self.layer_idx, k[0], v[0], causal_block_size)
+        seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(causal_block_size)
+        seq_len_q, seq_len_kv = seq_len_q[:num_causal_blocks], seq_len_kv[:num_causal_blocks]
 
         q_seg = q.view(num_causal_blocks, causal_block_size, num_heads, head_dim)
         buf = kv_cache.kv_buffer(self.layer_idx)
-        page_table = kv_cache.page_table(num_causal_blocks)
+        page_table = kv_cache.page_table(causal_block_size)[:num_causal_blocks]
         num_pages, _, h_kv, tokens_per_block, _ = buf.shape
         shape = _CuDNNPagedShape(
             h_q=num_heads,
@@ -682,7 +697,10 @@ class CuDNNAttention(AttentionBackend):
             page_stride=tuple(buf[:, 0].stride()),
         )
         bundle = self._get_or_build_paged_graph(shape, self.scale, buf.dtype, device)
-        output = torch.empty(1, num_tokens, num_heads, head_dim, dtype=buf.dtype, device=device)
+        full = torch.empty(1, total_tokens, num_heads, head_dim, dtype=buf.dtype, device=device)
+        output = full[:, :num_tokens]
+        if num_tokens < total_tokens:
+            full[:, num_tokens:].zero_()
         tensor_map = {
             bundle.inputs["q"]: q_seg,
             bundle.inputs["k"]: buf[:, 0],
@@ -695,7 +713,7 @@ class CuDNNAttention(AttentionBackend):
             ),
         }
         self._execute_graph(bundle, tensor_map, device)
-        return output
+        return full
 
     # ------------------------------------------------------------------
     # Forward
@@ -937,6 +955,10 @@ class CuDNNAttention(AttentionBackend):
                 block, causal across blocks. Use it when the cache must hold each
                 block's K/V as if the blocks had been generated one at a time, so later
                 blocks never leak into earlier ones. Absent: one causal block.
+            num_valid_tokens: Keyword understood by the ``kv_cache`` path only. The
+                number of leading tokens of ``S_q`` that are real; the rest is
+                padding added so the sequence splits evenly across ranks. Padding is
+                neither written nor attended, and its output rows are zero.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
@@ -950,11 +972,13 @@ class CuDNNAttention(AttentionBackend):
                 kwargs.pop("causal_block_size", None),
                 attention_mask,
                 key_padding_mask,
+                kwargs.pop("num_valid_tokens", None),
             )
-        if "causal_block_size" in kwargs:
-            raise NotImplementedError(
-                "block-causal attention is only implemented over a K/V cache; pass kv_cache."
-            )
+        for keyword in ("causal_block_size", "num_valid_tokens"):
+            if keyword in kwargs:
+                raise NotImplementedError(
+                    f"{keyword} is only implemented over a K/V cache; pass kv_cache."
+                )
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )

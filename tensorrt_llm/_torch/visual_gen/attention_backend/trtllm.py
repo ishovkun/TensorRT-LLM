@@ -35,10 +35,13 @@ from ...metadata import KVCacheParams
 from ..cache import CausalKVCacheManager
 from .interface import AttentionBackend, AttentionTensorLayout
 
-# The only page size with shipped trtllm-gen paged context kernels. The page size
-# is part of the kernel hash; any other value misses the lookup and the attention
-# op falls back to an unfused path that silently ignores the cached prefix.
-_TRTLLM_GEN_TOKENS_PER_BLOCK = 32
+# The only page size with shipped trtllm-gen paged context kernels: every paged
+# context cubin under kernels/trtllmGenKernels/fmha/cubin is a ``P32`` variant, and
+# log2(tokens per page) is part of the kernel hash, so any other value misses the
+# lookup and the attention op falls back to an unfused path that silently ignores
+# the cached prefix. Nothing in the tree exposes this number; it lives in the cubin
+# inventory only.
+TRTLLM_GEN_TOKENS_PER_BLOCK = 32
 
 
 class TrtllmAttentionMetadata:
@@ -206,9 +209,9 @@ class TrtllmAttentionMetadata:
                     "run the forward eagerly once before capturing"
                 )
             metadata = BaseTrtllmAttentionMetadata(
-                max_num_requests=kv_cache.MAX_CAUSAL_BLOCKS,
+                max_num_requests=kv_cache.max_causal_blocks,
                 max_num_tokens=kv_cache.chunk_tokens,
-                max_num_sequences=kv_cache.MAX_CAUSAL_BLOCKS,
+                max_num_sequences=kv_cache.max_causal_blocks,
                 kv_cache_manager=kv_cache,
                 mapping=kv_cache.mapping,
                 runtime_features=AttentionRuntimeFeatures(chunked_prefill=True),
@@ -233,13 +236,16 @@ class TrtllmAttentionMetadata:
                     "K/V cache moved since the metadata was prepared; prepare before capture "
                     "or replay, not inside it"
                 )
-            past = kv_cache.past_tokens
+            # Each block's row holds the fixed region, its window, the earlier blocks
+            # and then its own tokens; the kernel writes the block right after the
+            # cached count, inside the block's private pages.
             metadata.kv_cache_params = KVCacheParams(
                 use_cache=True,
-                num_cached_tokens_per_seq=[
-                    past + i * causal_block_size for i in range(num_causal_blocks)
+                num_cached_tokens_per_seq=kv_cache.cached_tokens(causal_block_size)[
+                    :num_causal_blocks
                 ],
             )
+            kv_cache.set_block_offsets_block_size(causal_block_size)
             metadata.prepare()
             cached["prepared"] = True
             cached["kv_state"] = state
@@ -363,6 +369,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 block, causal across blocks. Use it when the cache must hold each
                 block's K/V as if the blocks had been generated one at a time, so later
                 blocks never leak into earlier ones. Absent: one causal block.
+            num_valid_tokens: Keyword understood by the ``kv_cache`` path only. The
+                number of leading tokens of ``S`` that are real; the rest is padding
+                added so the sequence splits evenly across ranks. Padding is neither
+                written nor attended, and its output rows are zero.
 
         Returns:
             Output tensor [B, S, H*D]
@@ -377,6 +387,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 kv_cache,
                 kwargs.pop("causal_block_size", None),
                 attention_mask,
+                kwargs.pop("num_valid_tokens", None),
             )
         else:
             output = self._forward_without_kv_cache(
@@ -396,10 +407,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Plain diffusion attention; returns ``[B*S, H*D]``."""
-        if "causal_block_size" in kwargs:
-            raise NotImplementedError(
-                "block-causal attention is only implemented over a K/V cache; pass kv_cache."
-            )
+        for keyword in ("causal_block_size", "num_valid_tokens"):
+            if keyword in kwargs:
+                raise NotImplementedError(
+                    f"{keyword} is only implemented over a K/V cache; pass kv_cache."
+                )
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
@@ -449,6 +461,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         kv_cache: CausalKVCacheManager,
         causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
+        num_valid_tokens: Optional[int],
     ) -> torch.Tensor:
         """Attention over ``kv_cache`` with the new tokens; returns ``[S, H*D]``."""
         if attention_mask != PredefinedAttentionMask.FULL:
@@ -457,44 +470,49 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
         if k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v.")
-        if kv_cache.tokens_per_block != _TRTLLM_GEN_TOKENS_PER_BLOCK:
+        if kv_cache.tokens_per_block != TRTLLM_GEN_TOKENS_PER_BLOCK:
             raise NotImplementedError(
-                f"trtllm-gen ships paged context kernels for {_TRTLLM_GEN_TOKENS_PER_BLOCK}-token "
+                f"trtllm-gen ships paged context kernels for {TRTLLM_GEN_TOKENS_PER_BLOCK}-token "
                 f"pages only; the cache uses {kv_cache.tokens_per_block}. Build the cache with "
-                f"tokens_per_block={_TRTLLM_GEN_TOKENS_PER_BLOCK} or use the CUDNN backend."
+                f"tokens_per_block={TRTLLM_GEN_TOKENS_PER_BLOCK} or use the CUDNN backend."
             )
         batch, num_tokens, _, _ = q.shape
         if (batch, num_tokens) != (1, seq_len) or batch_size != 1 or k.shape[1] != num_tokens:
             raise ValueError(
                 "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
             )
+        if k.shape[2] != kv_cache.num_kv_heads:
+            raise ValueError(
+                f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
+            )
+        total_tokens = num_tokens
+        if num_valid_tokens is not None:
+            if not 0 < num_valid_tokens <= num_tokens:
+                raise ValueError(f"num_valid_tokens {num_valid_tokens} outside (0, {num_tokens}]")
+            if num_valid_tokens < num_tokens:
+                num_tokens = num_valid_tokens
+                q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
         causal_block_size = causal_block_size or num_tokens
         if num_tokens % causal_block_size:
             raise ValueError(
                 f"{num_tokens} tokens do not split into causal blocks of {causal_block_size}."
             )
         num_causal_blocks = num_tokens // causal_block_size
-        tpb = kv_cache.tokens_per_block
-        if num_causal_blocks > 1 and any(
-            (kv_cache.past_tokens + i * causal_block_size) % tpb
-            for i in range(1, num_causal_blocks)
-        ):
-            # The fused cache-update kernel zeroes the V rows after each request's last
-            # token to the end of that page (its FMHA loads whole pages and NaNs in
-            # masked V rows would leak through BMM2). Causal blocks that share a page
-            # therefore erase each other's V. Only page-aligned causal block starts are safe.
-            raise NotImplementedError(
-                f"TRTLLM K/V cache attention needs every causal block to start on a "
-                f"{tpb}-token page boundary (past={kv_cache.past_tokens}, "
-                f"causal_block_size={causal_block_size}); use the CUDNN backend for other block sizes."
-            )
-        # The fused kernel writes each causal block's K/V at its own cached length, so the
-        # cache needs no separate write here.
+        # The fused kernel writes each block's own tokens into the block's private
+        # pages; the shared pages, which later blocks and later chunks read, get
+        # the chunk here.
+        kv_cache.write_chunk(self.layer_idx, k[0], v[0], causal_block_size, own_tokens=False)
         metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
         qkv = self._concat_qkv(q, k, v, 1, num_tokens, num_tokens)
-        return super().forward(
+        output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
         )
+        if num_tokens == total_tokens:
+            return output
+        full = output.new_empty(total_tokens, output.shape[-1])
+        full[:num_tokens].copy_(output.view(num_tokens, -1))
+        full[num_tokens:].zero_()
+        return full
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
