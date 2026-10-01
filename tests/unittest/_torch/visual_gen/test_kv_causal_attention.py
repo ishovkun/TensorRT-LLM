@@ -139,7 +139,7 @@ def open_with_prompt(cache, prompt_len):
     pk, pv = rand_qkv(prompt_len)[1:]
     cache.write_range(0, 0, pk, pv)
     if prompt_len:
-        cache.pin(prompt_len)
+        cache.pin_prefix(prompt_len)
     return pk, pv
 
 

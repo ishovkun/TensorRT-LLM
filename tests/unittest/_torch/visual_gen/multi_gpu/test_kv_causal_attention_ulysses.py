@@ -194,7 +194,7 @@ def _logic_rollout(rank, world_size, backend):
         cache.open()
         _, pk, pv = rand_qkv(PROMPT)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
-        cache.pin(PROMPT)
+        cache.pin_prefix(PROMPT)
         history_k, history_v = [], []
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
         per = chunk // world_size
@@ -233,7 +233,7 @@ def _logic_causal_blocks(
         cache.open()
         _, pk, pv = rand_qkv(prompt)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
-        cache.pin(prompt)
+        cache.pin_prefix(prompt)
         history_k, history_v = [], []
         for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
             _, k, v = rand_qkv(chunk)

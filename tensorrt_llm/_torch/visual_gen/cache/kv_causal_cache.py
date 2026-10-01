@@ -24,7 +24,7 @@ here uses the manager's own sliding-window eviction, block reuse, or request
 scheduling, and no ``LlmRequest`` is ever created.
 
 The fixed region is whatever the model wants every frame to see for the whole
-rollout: it is written with ``write_range`` and then ``pin``-ned. The cache does
+rollout: it is written with ``write_range`` and then ``pin_prefix``-ed. The cache does
 not know whether it holds a text prompt, sink frames, or both. The rolling
 history slides: ``commit`` turns the in-flight chunk into history and drops
 whole pages from the front once the history exceeds the window, by rotating
@@ -81,10 +81,10 @@ class _CausalBlockLayout:
     legitimate pages (at most three: where the fixed region ends, where the window
     starts, where the block starts) and the block's own tokens. ``cached[i]`` counts
     the keys before the block's own tokens. Slots holding fixed or history tokens
-    are copied at ``commit``/``pin``; slots holding this forward's chunk tokens
+    are copied at ``commit``/``pin_prefix``; slots holding this forward's chunk tokens
     (earlier blocks' tokens in the block's start page, and the block's own) are
     written by every ``write_chunk``. All tensors are persistent and rewritten in
-    place by ``commit``/``pin``, never on the forward path.
+    place by ``commit``/``pin_prefix``, never on the forward path.
     """
 
     num_blocks: int
@@ -222,7 +222,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._fixed_tokens = 0
         self._history_tokens = 0
         # Device-side state read by the kernels. Every tensor here lives for the
-        # life of an open cache and is rewritten in place by open(), pin() and
+        # life of an open cache and is rewritten in place by open(), pin_prefix() and
         # commit(), never on the forward path, so a CUDA graph captured around a
         # forward keeps reading correct values after the cache moves.
         #
@@ -382,29 +382,37 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     # ------------------------------------------------------------------ the window
 
-    def pin(self, num_tokens: int) -> None:
-        """Make the ``num_tokens`` tokens right after the fixed region fixed too.
+    def pin_prefix(self, num_tokens: int) -> None:
+        """Make the first ``num_tokens`` tokens of the sequence the fixed region.
 
-        They are either the oldest resident history (sink frames, pinned after their
-        clean pass) or, when the history is empty, tokens just written with
-        ``write_range`` at ``past_tokens`` (a prompt). No data moves.
+        ``num_tokens`` is the total, not an increment. Growing the region takes the
+        tokens right after it: either the oldest resident history (sink frames,
+        pinned after their clean pass) or, when the history is empty, tokens just
+        written with ``write_range`` at ``past_tokens`` (a prompt). No data moves.
+        Shrinking is not supported.
         """
         self._require_open()
-        if num_tokens <= 0:
-            raise ValueError(f"pin of {num_tokens} tokens")
-        if self._fixed_tokens + num_tokens > self.fixed_capacity:
-            raise ValueError(
-                f"pinning {num_tokens} tokens exceeds fixed_capacity {self.fixed_capacity} "
-                f"(fixed so far: {self._fixed_tokens})"
+        grow = num_tokens - self._fixed_tokens
+        if grow < 0:
+            raise NotImplementedError(
+                f"pin_prefix({num_tokens}) would shrink the fixed region from "
+                f"{self._fixed_tokens} tokens; unpinning is not supported"
             )
-        if 0 < self._history_tokens < num_tokens:
+        if grow == 0:
+            return
+        if num_tokens > self.fixed_capacity:
             raise ValueError(
-                f"pin of {num_tokens} tokens but only {self._history_tokens} history tokens are "
-                "resident; pin the oldest history or fresh tokens, not a mix"
+                f"pin_prefix({num_tokens}) exceeds fixed_capacity {self.fixed_capacity}"
+            )
+        if 0 < self._history_tokens < grow:
+            raise ValueError(
+                f"pin_prefix({num_tokens}) takes {grow} tokens but only "
+                f"{self._history_tokens} history tokens are resident; pin the oldest "
+                "history or fresh tokens, not a mix"
             )
         if self._history_tokens:
-            self._history_tokens -= num_tokens
-        self._fixed_tokens += num_tokens
+            self._history_tokens -= grow
+        self._fixed_tokens = num_tokens
         self._fixed_pages = self._fixed_tokens // self.tokens_per_block
         self._table_version += 1
         self._refresh_device_state()
@@ -493,7 +501,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
         ``seq_len_kv[i]`` is the number of keys in block ``i``'s table row: the fixed
         region, the window before the block, the earlier blocks and the block itself.
-        Persistent, refreshed by ``commit``/``pin``, so a captured forward keeps
+        Persistent, refreshed by ``commit``/``pin_prefix``, so a captured forward keeps
         reading the right lengths.
         """
         layout = self._layout(causal_block_size)
@@ -507,7 +515,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """``[num_blocks, row_len]`` int32 device table of layer-0 view indices.
 
         Row ``i`` is block ``i``'s key sequence; entries past its length are 0 and
-        never read. Persistent, refreshed in place by ``commit``/``pin``.
+        never read. Persistent, refreshed in place by ``commit``/``pin_prefix``.
         """
         return self._layout(causal_block_size).rows
 
@@ -520,7 +528,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     def _refresh_device_state(self) -> None:
         """Rewrite every kernel-facing device tensor for the current table, fixed region
-        and ``past``. Runs on the host in ``open``, ``pin`` and ``commit``, never on the
+        and ``past``. Runs on the host in ``open``, ``pin_prefix`` and ``commit``, never on the
         forward path."""
         # Pool viewed as rows of head_dim: row of (page, kv, head, slot) is
         # ((page*2 + kv)*H + head)*tpb + slot, with page already a view index.
@@ -717,7 +725,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         chunks read them) and to the blocks' private regions: the earlier blocks'
         tokens each block's start page holds, and, with ``own_tokens``, each block's
         own tokens. ``index_copy_`` kernels over the pool viewed as rows of
-        ``head_dim``, driven by row indices rebuilt on ``commit``/``pin``, so the
+        ``head_dim``, driven by row indices rebuilt on ``commit``/``pin_prefix``, so the
         write replays correctly inside a CUDA graph. A kernel that writes the new
         tokens into the region itself (trtllm-gen) passes ``own_tokens=False``.
         """

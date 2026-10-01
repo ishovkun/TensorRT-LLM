@@ -206,7 +206,7 @@ def build_cache(
     for layer in range(num_layers):
         mgr.write_range(layer, 0, kp, vp)
     if prompt_len:
-        mgr.pin(prompt_len)
+        mgr.pin_prefix(prompt_len)
 
     hist_k, hist_v = [], []
     for _ in range(history_chunks):

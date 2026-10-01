@@ -93,7 +93,7 @@ def open_with_fixed(cache, fixed_len):
     for layer in range(NUM_LAYERS):
         cache.write_range(layer, 0, k, v)
     if fixed_len:
-        cache.pin(fixed_len)
+        cache.pin_prefix(fixed_len)
     return k, v
 
 
@@ -143,13 +143,16 @@ def test_pin_makes_fresh_tokens_or_the_oldest_history_fixed(cache):
     k, v = rand_kv(13)
     for layer in range(NUM_LAYERS):
         cache.write_range(layer, 0, k, v)
-    cache.pin(13)
+    cache.pin_prefix(13)
     assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (13, 0, 13)
     assert cache._fixed_pages == 0  # 13 tokens do not fill a page; the page is shared
+    version = cache.table_version
+    cache.pin_prefix(13)  # same total: no-op
+    assert cache.table_version == version
+    with pytest.raises(NotImplementedError):
+        cache.pin_prefix(12)  # shrinking
     with pytest.raises(ValueError):
-        cache.pin(0)
-    with pytest.raises(ValueError):
-        cache.pin(cache.fixed_capacity)  # over capacity
+        cache.pin_prefix(cache.fixed_capacity + 1)  # over capacity
 
     # A chunk becomes history; its oldest 8 tokens become fixed (sink frames).
     chunk = cache.chunk_tokens
@@ -158,9 +161,9 @@ def test_pin_makes_fresh_tokens_or_the_oldest_history_fixed(cache):
         cache.write_range(layer, cache.past_tokens, hk, hv)
     cache.commit()
     with pytest.raises(ValueError):
-        cache.pin(chunk + 1)  # more than the resident history
+        cache.pin_prefix(13 + chunk + 1)  # more than the resident history
     version = cache.table_version
-    cache.pin(8)
+    cache.pin_prefix(13 + 8)
     assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (
         21,
         chunk - 8,
@@ -270,7 +273,7 @@ def test_block_rows_present_exactly_the_window(cache):
     cache.open()
     for layer in range(NUM_LAYERS):
         cache.write_range(layer, 0, *stamped_kv(torch.arange(fixed, device=DEVICE)))
-    cache.pin(fixed)
+    cache.pin_prefix(fixed)
     num_blocks, size = 4, chunk // 4
 
     written: list = []  # stamp of every committed token, oldest first
