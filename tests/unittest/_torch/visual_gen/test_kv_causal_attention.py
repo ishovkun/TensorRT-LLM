@@ -421,6 +421,67 @@ def test_graph_replay_survives_commit(cache, backend):
         torch.testing.assert_close(v_back, v, msg=f"replay {step}: V landed on stale pages")
 
 
+@pytest.mark.parametrize("num_causal_blocks", [1, 4])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_graph_captured_while_the_window_fills(backend, num_causal_blocks):
+    """A forward captured on the rollout's first chunk, with no history yet, replays
+    correctly through a dozen commits: while the window fills, once it is full, and
+    across many rotations of a pool of five 32-token pages. Lengths the kernels
+    read must come from the cache at replay, not from the moment of capture."""
+    torch.manual_seed(8)
+    prompt, size = 8, CHUNK // num_causal_blocks
+    cache = CausalKVCacheManager(
+        num_layers=1,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=DTYPE,
+        tokens_per_page=32,
+        fixed_capacity=prompt,
+        window_tokens=WINDOW,
+        chunk_tokens=CHUNK,
+        causal_block_sizes=(CHUNK, CHUNK // 4),
+    )
+    try:
+        assert cache.num_pages == 5
+        pk, pv = open_with_prompt(cache, prompt)
+        attn = make_backend(backend)
+        q, k, v = rand_qkv(CHUNK)  # static buffers the graph reads
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):  # eager warmup creates lengths and metadata before capture
+                run(attn, cache, q, k, v, causal_block_size=size)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = run(attn, cache, q, k, v, causal_block_size=size)
+
+        history_k, history_v = [], []
+        empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        for step in range(12):
+            q2, k2, v2 = rand_qkv(CHUNK)
+            q.copy_(q2), k.copy_(k2), v.copy_(v2)
+            if backend == "trtllm":  # the step loop's job, after every commit
+                attn.metadata.prepare_with_kv_cache(cache, num_causal_blocks, size)
+            graph.replay()
+            torch.cuda.synchronize()
+            hk = torch.cat(history_k) if history_k else empty
+            hv = torch.cat(history_v) if history_v else empty
+            expected = torch.cat(
+                [
+                    exact_reference(q, pk, pv, hk, hv, k, v, i * size, (i + 1) * size)
+                    for i in range(num_causal_blocks)
+                ]
+            )
+            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2, msg=f"step {step}")
+            history_k.append(k.clone())
+            history_v.append(v.clone())
+            cache.commit()
+        assert len(history_k) * CHUNK >= 3 * cache.capacity, "the pool should cycle three times"
+    finally:
+        cache.shutdown()
+
+
 def test_backend_without_cache_support_refuses_a_cache(cache):
     """A cache routed to a backend that cannot use it raises instead of being ignored."""
     config = DiffusionModelConfig(
