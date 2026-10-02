@@ -618,61 +618,118 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def _refresh_layout(self, blk: _CausalBlockLayout, num_pieces: int) -> int:
         """Rebuild one block size's host twins for the current state. Appends the fixed
         and history slots its private regions need to the pieces area from index
-        ``num_pieces`` on; returns the new count."""
-        tpb, rpp = self.tokens_per_page, self._rows_per_page
-        table, host = self._host_table, blk.host
-        fixed, past, window = self._fixed_tokens, self.past_tokens, self.window_tokens
-        size, per_block = blk.block_size, tpb - 1
-        host["rows"].fill(0)
+        ``num_pieces`` on; returns the new count.
+
+        Block ``i``'s row is every page it may see in full, then its private region:
+        first the visible slots of the pages it sees only partly, in logical order,
+        then its own tokens.
+        """
+        past, size = self.past_tokens, blk.block_size
+        blk.host["rows"].fill(0)
         for i in range(blk.num_blocks):
-            start = past + i * size
-            win_start = max(fixed, start - window)
-            # Keys block i may see before its own tokens: [0, fixed) and [win_start,
-            # start), one interval when they touch.
-            spans = [(0, start)] if win_start <= fixed else [(0, fixed), (win_start, start)]
-            spans = [(lo, hi) for lo, hi in spans if hi > lo]
-            whole_runs = [(ceil_div(lo, tpb), hi // tpb) for lo, hi in spans]
-            # Pages a span only partly covers: at most three, where the fixed region
-            # ends, where the window starts and where the block starts.
-            edges = sorted({p for lo, hi in spans for p in (lo // tpb, (hi - 1) // tpb)})
-            partial = [p for p in edges if not any(a <= p < b for a, b in whole_runs)]
-            pos = (np.asarray(partial, dtype=np.int64)[:, None] * tpb + np.arange(tpb)).ravel()
-            legit = np.zeros(pos.shape, dtype=bool)
-            for lo, hi in spans:
-                legit |= (pos >= lo) & (pos < hi)
-            pos = pos[legit]
-            # The legitimate slots of the partial pages fill the private region in
-            # logical order, then the block's own tokens follow.
+            spans = self._visible_spans(past + i * size)
+            runs = self._whole_page_runs(spans)
+            partial = self._partial_page_positions(spans, runs)
             region = blk.regions[i]
-            k = np.arange(pos.size)
-            piece_page, piece_slot = region[k // tpb], k % tpb
-            static = pos < past  # fixed or history: copied now, for every layer
-            count = int(static.sum())
-            stop = num_pieces + count
-            self._host_piece_src[num_pieces:stop] = (
-                table[pos[static] // tpb] * rpp + pos[static] % tpb
-            )
-            self._host_piece_dst[num_pieces:stop] = piece_page[static] * rpp + piece_slot[static]
-            num_pieces = stop
-            # This chunk's earlier blocks in the start page: written by write_chunk.
-            dyn_src = pos[~static] - past
-            if dyn_src.size > per_block:
-                raise RuntimeError("more chunk tokens in a start page than a page holds")
-            whole = np.concatenate([table[a:b] for a, b in whole_runs] or [np.zeros(0, np.int64)])
-            host["rows"][i, : whole.size] = whole
-            host["rows"][i, whole.size : whole.size + region.size] = region
-            blk.cached[i] = whole.size * tpb + pos.size
-            j = pos.size + np.arange(size)
-            own = host["own_slots"][i * size : (i + 1) * size]
-            own[:] = region[j // tpb] * tpb + j % tpb
-            # Padded to a fixed count with a repeat of the block's own first token.
-            extra = slice(i * per_block, (i + 1) * per_block)
-            host["extra_src"][extra] = i * size
-            host["extra_dst"][extra] = own[0]
-            host["extra_src"][extra][: dyn_src.size] = dyn_src
-            host["extra_dst"][extra][: dyn_src.size] = (piece_page * tpb + piece_slot)[~static]
-        host["seq_len_kv"][:] = np.asarray(blk.cached, dtype=np.int32) + size
+            self._fill_row(blk, i, runs, region)
+            blk.cached[i] = sum(b - a for a, b in runs) * self.tokens_per_page + partial.size
+            own = self._fill_own_slots(blk, i, region, first=partial.size)
+            # Fixed and history tokens are copied now, for every layer; this chunk's
+            # earlier blocks in the start page are written by write_chunk.
+            k = np.arange(partial.size)
+            static = partial < past
+            num_pieces = self._queue_pieces(partial[static], region, k[static], num_pieces)
+            self._fill_start_page(blk, i, partial[~static] - past, region, k[~static], own[0])
+        blk.host["seq_len_kv"][:] = np.asarray(blk.cached, dtype=np.int32) + size
         return num_pieces
+
+    def _visible_spans(self, start: int) -> List[Tuple[int, int]]:
+        """Logical positions a block starting at ``start`` sees before its own tokens:
+        the fixed region and the window before it; one span when they touch."""
+        fixed = self._fixed_tokens
+        win_start = max(fixed, start - self.window_tokens)
+        spans = [(0, start)] if win_start <= fixed else [(0, fixed), (win_start, start)]
+        return [(lo, hi) for lo, hi in spans if hi > lo]
+
+    def _whole_page_runs(self, spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """Logical page ranges ``[a, b)`` the spans cover in full."""
+        tpb = self.tokens_per_page
+        return [(ceil_div(lo, tpb), hi // tpb) for lo, hi in spans]
+
+    def _partial_page_positions(
+        self, spans: List[Tuple[int, int]], runs: List[Tuple[int, int]]
+    ) -> np.ndarray:
+        """Visible positions on pages the spans cover only partly, ascending. At most
+        three such pages: where the fixed region ends, where the window starts and
+        where the block starts."""
+        tpb = self.tokens_per_page
+        edges = sorted({p for lo, hi in spans for p in (lo // tpb, (hi - 1) // tpb)})
+        pages = [p for p in edges if not any(a <= p < b for a, b in runs)]
+        pos = (np.asarray(pages, dtype=np.int64)[:, None] * tpb + np.arange(tpb)).ravel()
+        visible = np.zeros(pos.shape, dtype=bool)
+        for lo, hi in spans:
+            visible |= (pos >= lo) & (pos < hi)
+        return pos[visible]
+
+    def _region_slot(self, region: np.ndarray, k: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """View page and slot of the ``k``-th slots of a private region."""
+        return region[k // self.tokens_per_page], k % self.tokens_per_page
+
+    def _fill_row(
+        self, blk: _CausalBlockLayout, i: int, runs: List[Tuple[int, int]], region: np.ndarray
+    ) -> None:
+        """Block ``i``'s table row: its whole pages in logical order, then its region."""
+        whole = np.concatenate([self._host_table[a:b] for a, b in runs] or [np.zeros(0, np.int64)])
+        row = blk.host["rows"][i]
+        row[: whole.size] = whole
+        row[whole.size : whole.size + region.size] = region
+
+    def _fill_own_slots(
+        self, blk: _CausalBlockLayout, i: int, region: np.ndarray, first: int
+    ) -> np.ndarray:
+        """Slot ids of block ``i``'s own tokens: its region from slot ``first`` on."""
+        size = blk.block_size
+        page, slot = self._region_slot(region, first + np.arange(size))
+        own = blk.host["own_slots"][i * size : (i + 1) * size]
+        own[:] = page * self.tokens_per_page + slot
+        return own
+
+    def _queue_pieces(
+        self, positions: np.ndarray, region: np.ndarray, k: np.ndarray, num_pieces: int
+    ) -> int:
+        """Append copies of resident ``positions`` to region slots ``k`` (layer-0 pool
+        rows) to the pieces area; returns the new count."""
+        tpb, rpp = self.tokens_per_page, self._rows_per_page
+        page, slot = self._region_slot(region, k)
+        stop = num_pieces + positions.size
+        self._host_piece_src[num_pieces:stop] = (
+            self._host_table[positions // tpb] * rpp + positions % tpb
+        )
+        self._host_piece_dst[num_pieces:stop] = page * rpp + slot
+        return stop
+
+    def _fill_start_page(
+        self,
+        blk: _CausalBlockLayout,
+        i: int,
+        tokens: np.ndarray,
+        region: np.ndarray,
+        k: np.ndarray,
+        own_first: int,
+    ) -> None:
+        """Block ``i``'s entries for this chunk's ``tokens`` that share its start page,
+        written to region slots ``k`` by write_chunk. Padded to a fixed count with a
+        harmless repeat of the block's own first token."""
+        per_block = self.tokens_per_page - 1
+        if tokens.size > per_block:
+            raise RuntimeError("more chunk tokens in a start page than a page holds")
+        page, slot = self._region_slot(region, k)
+        entries = slice(i * per_block, (i + 1) * per_block)
+        src, dst = blk.host["extra_src"][entries], blk.host["extra_dst"][entries]
+        src[:] = i * blk.block_size
+        dst[:] = own_first
+        src[: tokens.size] = tokens
+        dst[: tokens.size] = page * self.tokens_per_page + slot
 
     def _copy_pieces(self, count: int) -> None:
         """Copy the first ``count`` pieces (layer-0 slot rows, uploaded) for every layer,
