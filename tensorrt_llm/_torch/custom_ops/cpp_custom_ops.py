@@ -16,6 +16,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 def _register_fake():
 
+    @torch.library.register_fake("trtllm::rotate_rows_")
+    def rotate_rows_(self: torch.Tensor, shift: int) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::scatter_kv_slots_")
     def scatter_kv_slots_(
         pool: torch.Tensor,

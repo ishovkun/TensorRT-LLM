@@ -19,6 +19,8 @@ import torch
 
 import tensorrt_llm  # noqa: F401  # registers the trtllm:: ops
 
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+
 
 @pytest.mark.parametrize(
     "dtype",
@@ -45,9 +47,8 @@ def test_matches_torch_roll(dtype, shape, shift):
     raw = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64, 16: torch.complex128}
     as_raw = x.view(raw[x.element_size()])
     expected = torch.roll(as_raw, shift, dims=-1).view(dtype)
-    out = torch.ops.trtllm.rotate_rows_(x, shift)
+    torch.ops.trtllm.rotate_rows_(x, shift)
     torch.cuda.synchronize()
-    assert out.data_ptr() == x.data_ptr(), "must rotate in place"
     torch.testing.assert_close(x.view(raw[x.element_size()]), expected.view(raw[x.element_size()]))
 
 
@@ -84,3 +85,23 @@ def test_capturable_in_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(x, torch.roll(start, 1, dims=1))
+
+
+def test_overlapping_rows_are_refused():
+    base = torch.arange(20, device="cuda", dtype=torch.int32)
+    overlapping = base.as_strided((3, 8), (4, 1))  # row i shares 4 elements with row i+1
+    with pytest.raises(RuntimeError, match="rows overlap"):
+        torch.ops.trtllm.rotate_rows_(overlapping, 1)
+
+
+def test_traces_under_torch_compile():
+    """The fake registration lets dynamo trace the op without a graph break."""
+    x = torch.arange(64, device="cuda", dtype=torch.int32)
+    expected = torch.roll(x, -5)
+
+    @torch.compile(fullgraph=True, backend="aot_eager")
+    def rotate(t):
+        torch.ops.trtllm.rotate_rows_(t, -5)
+        return t
+
+    torch.testing.assert_close(rotate(x), expected)
