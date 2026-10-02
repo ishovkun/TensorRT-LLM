@@ -149,6 +149,7 @@ add_library(
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
   rotateRowsOp.cpp
+  scatterKvSlotsOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp
   inplaceSliceCopyOp.cpp

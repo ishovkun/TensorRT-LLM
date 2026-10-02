@@ -150,8 +150,8 @@ def test_reopen_keeps_device_state_in_place(cache):
             cache.table,
             cache.page_table(size),
             cache.causal_block_lengths(size)[1],
-            cache._k_rows,
-            cache._layout(size).k_rows,
+            cache._chunk_slots,
+            cache._layout(size).own_slots,
         )
     ]
     cache.close()
@@ -164,8 +164,8 @@ def test_reopen_keeps_device_state_in_place(cache):
             cache.table,
             cache.page_table(size),
             cache.causal_block_lengths(size)[1],
-            cache._k_rows,
-            cache._layout(size).k_rows,
+            cache._chunk_slots,
+            cache._layout(size).own_slots,
         )
     ]
     assert before == after
