@@ -254,6 +254,70 @@ def test_causal_blocks_at_any_alignment(cache, backend):
     )
 
 
+def indicator_values(watch, first, count):
+    """V for tokens ``[first, first + count)`` of the sequence: 1 in dimension ``d`` of
+    K/V head ``h`` for the token ``watch[h][d]``, 0 everywhere else."""
+    ids = torch.arange(first, first + count, device=DEVICE)
+    return (ids[:, None, None] == watch[None]).to(DTYPE)
+
+
+@pytest.mark.parametrize("num_causal_blocks", [1, 4])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks):
+    """Exact visible-key sets, no tolerance games: with q = 0 every visible key gets
+    the same weight 1/N, so with V one-hot per watched token the output is
+    ``[token visible] / N``. An off-by-one window edge, a stale or evicted token
+    read, or a key read twice shows up as a 1, a 0 or a 2 where it should not."""
+    if backend == "trtllm" and cache.tokens_per_page != 32:
+        pytest.skip("trtllm-gen: 32-token pages only")
+    torch.manual_seed(7)
+    prompt, commits = 9, 3
+    hist = commits * CHUNK  # 120 committed: some evicted, some stale, the rest visible
+    total = prompt + hist + CHUNK
+    # Watch every token of the prompt, the last 79 history tokens (both window
+    # edges of every block, stale ones included) and the whole chunk: 128 ids,
+    # one per (K/V head, dimension).
+    ids = torch.cat(
+        [
+            torch.arange(prompt),
+            torch.arange(prompt + hist - 79, prompt + hist),
+            torch.arange(prompt + hist, total),
+        ]
+    ).to(DEVICE)
+    watch = ids.view(NUM_KV_HEADS, HEAD_DIM)
+
+    def keys(n):
+        return torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
+
+    cache.open()
+    cache.write_range(0, 0, keys(prompt), indicator_values(watch, 0, prompt))
+    cache.pin_prefix(prompt)
+    for c in range(commits):
+        first = prompt + c * CHUNK
+        cache.write_range(0, cache.past_tokens, keys(CHUNK), indicator_values(watch, first, CHUNK))
+        cache.commit()
+    assert cache.history_tokens > WINDOW, "test geometry should hold stale tokens here"
+
+    size = CHUNK // num_causal_blocks
+    q = torch.zeros(CHUNK, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    v = indicator_values(watch, prompt + hist, CHUNK)
+    out = run(make_backend(backend), cache, q, keys(CHUNK), v, causal_block_size=size)
+    torch.cuda.synchronize()
+
+    token = torch.arange(CHUNK, device=DEVICE)
+    start = token // size * size  # each query's block start within the chunk
+    end = start + size
+    # Global ids: prompt [0, prompt), history [prompt, prompt + hist), chunk after.
+    g = watch.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=0)[None]  # [1, H, D]
+    win_start = (prompt + hist + start - WINDOW)[:, None, None]
+    visible = (g < prompt) | ((g >= win_start) & (g < (prompt + hist + end)[:, None, None]))
+    num_visible = (prompt + torch.clamp(hist + start, max=WINDOW) + size)[:, None, None]
+    seen = out.float() * num_visible
+    assert torch.allclose(seen, visible.float(), atol=0.05), (
+        f"{(seen.round() != visible.float()).sum().item()} (query, key) pairs wrong"
+    )
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
     """``seq_len`` counts the real tokens: a padded chunk behaves like the unpadded one."""
