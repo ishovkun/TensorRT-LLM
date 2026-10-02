@@ -208,6 +208,7 @@ class TrtllmAttentionMetadata:
                     "K/V cache attention metadata first needed during CUDA graph capture; "
                     "run the forward eagerly once before capturing"
                 )
+            self._drop_metadata_of_closed_caches()
             metadata = BaseTrtllmAttentionMetadata(
                 max_num_requests=kv_cache.max_causal_blocks,
                 max_num_tokens=kv_cache.chunk_tokens,
@@ -250,6 +251,18 @@ class TrtllmAttentionMetadata:
             cached["prepared"] = True
             cached["kv_state"] = state
         return metadata
+
+    def _drop_metadata_of_closed_caches(self) -> None:
+        """Forget metadata built over caches that are no longer open. Each entry holds
+        its cache, so without this a model that builds a new cache per rollout would
+        keep every old one alive."""
+        stale = [
+            key
+            for key, entry in self._metadata_cache.items()
+            if key[0] == "kv_cache" and not entry["metadata"].kv_cache_manager.is_open
+        ]
+        for key in stale:
+            del self._metadata_cache[key]
 
 
 class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
@@ -467,6 +480,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_attention_config is not None:
             raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
+        if self.sparse_params is not None:
+            raise NotImplementedError("K/V cache attention does not combine with sparse attention.")
         if k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v.")
         if kv_cache.tokens_per_page != TRTLLM_GEN_TOKENS_PER_PAGE:

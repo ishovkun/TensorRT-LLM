@@ -254,6 +254,14 @@ class UlyssesAttention(AttentionBackend):
             # backend the post-A2A lengths instead.
             kwargs["seq_len"] = seq_len_full
             kwargs["seq_len_kv"] = kv_seq_len_full
+        elif not seq_len_full - self.world_size < kwargs.get("seq_len", 0) <= seq_len_full:
+            # With a cache, seq_len is the real token count and padding is less than
+            # one row per rank; a per-rank length here would silently drop real tokens.
+            raise ValueError(
+                f"seq_len {kwargs.get('seq_len')} with a K/V cache must count the real tokens "
+                f"of the whole sequence ({seq_len_full} rows after the exchange, padding "
+                f"below {self.world_size})"
+            )
         if gate_compress is not None:
             kwargs["gate_compress"] = gate_compress
         if gate_fine is not None:

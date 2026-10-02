@@ -184,8 +184,12 @@ def test_pinned_tokens_are_the_first_committed_and_never_evicted(cache):
     prompt longer than a chunk in one commit, then generated tokens up to the pin
     size inside a later commit, which splits it. They survive every rotation."""
     tpb, chunk = cache.tokens_per_page, cache.chunk_tokens
-    with pytest.raises(RuntimeError):
-        make_cache(tpb).table  # not open
+    unopened = make_cache(tpb)
+    try:
+        with pytest.raises(RuntimeError):
+            unopened.table
+    finally:
+        unopened.shutdown()
     with pytest.raises(ValueError):
         cache.open(pin_tokens=cache.fixed_capacity + 1)
     prompt, sink = cache.fixed_capacity - 8, 8
@@ -361,7 +365,8 @@ def test_block_rows_present_exactly_the_window(cache):
         for i in range(2):
             start, end = past + i * size, past + (i + 1) * size
             expected = expected_stamps(max(fixed, start - window), start, end)
-            assert sorted(row_keys(cache, layer, size, i).tolist()) == expected
+            for layer in range(NUM_LAYERS):
+                assert sorted(row_keys(cache, layer, size, i).tolist()) == expected
         # The shared pages hold the chunk too, for later blocks and chunks.
         for layer in range(NUM_LAYERS):
             k_back, _ = read_kv(cache, layer, positions)
@@ -508,6 +513,18 @@ def test_rejects_bad_geometry():
             window_tokens=64,
             chunk_tokens=40,
             causal_block_sizes=(40, 7),
+        )
+    with pytest.raises(ValueError, match="earlier blocks"):
+        CausalKVCacheManager(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=16,
+            dtype=torch.float16,
+            tokens_per_page=32,
+            fixed_capacity=8,
+            window_tokens=29,  # blocks of 10 in a chunk of 40 need 30
+            chunk_tokens=40,
+            causal_block_sizes=(40, 10),
         )
 
 

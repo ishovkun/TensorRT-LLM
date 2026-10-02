@@ -243,6 +243,7 @@ def _logic_causal_blocks(
             cache.commit()
             history_k.append(k)
             history_v.append(v)
+        assert cache.history_tokens > window, "test geometry should hold stale tokens here"
         hk, hv = torch.cat(history_k), torch.cat(history_v)
 
         size = chunk // num_causal_blocks
@@ -321,24 +322,33 @@ def _logic_head_count_guard(rank, world_size, backend):
         cache.shutdown()
 
 
-@pytest.mark.parametrize("backend", ["cudnn", "trtllm"])
-def test_rollout_under_ulysses(backend):
-    run_distributed(functools.partial(_logic_rollout, backend=backend))
+def _logic_per_rank_seq_len_refused(rank, world_size, backend):
+    """With a cache, seq_len counts the whole sequence's real tokens; a caller passing
+    its per-rank length would have real tokens treated as padding, so it raises."""
+    chunk = 40
+    cache = make_cache(chunk)
+    attn, _ = make_ulysses(rank, world_size, backend, chunk)
+    try:
+        cache.open()
+        q, k, v = rand_qkv(chunk)
+        with pytest.raises(ValueError, match="real tokens of the whole sequence"):
+            forward(attn, cache, q, k, v, rank, seq_len=chunk // world_size)
+    finally:
+        cache.shutdown()
+
+
+def _logic_all(rank, world_size, backend):
+    """Every scenario in one process group per backend: spawning costs more than the tests."""
+    _logic_rollout(rank, world_size, backend)
+    _logic_causal_blocks(rank, world_size, backend, chunk=40, num_causal_blocks=4)
+    _logic_padded_first_chunk(rank, world_size, backend)
+    _logic_head_count_guard(rank, world_size, backend)
+    _logic_per_rank_seq_len_refused(rank, world_size, backend)
 
 
 @pytest.mark.parametrize("backend", ["cudnn", "trtllm"])
-def test_causal_blocks_under_ulysses(backend):
-    """The clean pass: four causal blocks of 10, page-unaligned, cut after the all-to-all."""
-    run_distributed(
-        functools.partial(_logic_causal_blocks, backend=backend, chunk=40, num_causal_blocks=4)
-    )
-
-
-@pytest.mark.parametrize("backend", ["cudnn", "trtllm"])
-def test_padded_first_chunk_under_ulysses(backend):
-    run_distributed(functools.partial(_logic_padded_first_chunk, backend=backend))
-
-
-@pytest.mark.parametrize("backend", ["cudnn", "trtllm"])
-def test_head_count_guard_under_ulysses(backend):
-    run_distributed(functools.partial(_logic_head_count_guard, backend=backend))
+def test_kv_cache_attention_under_ulysses(backend):
+    """A rollout through rotations, the clean pass in four page-unaligned causal blocks
+    cut after the all-to-all, a padded single-frame first chunk, and two refusals: a
+    cache built for the full head count, and a per-rank seq_len."""
+    run_distributed(functools.partial(_logic_all, backend=backend))

@@ -242,12 +242,12 @@ def chunk_cycle(args, gen) -> None:
     """One chunk's worth of work across ``--layers`` layers.
 
     Four denoising forwards and one clean pass per layer under CUDA graphs, then
-    one commit, with the commit's device kernels (CUPTI) and host time measured
+    one commit, with the commit's GPU span (CUPTI) and host time measured
     separately.
     """
     window = args.window_frames * TOKENS_PER_FRAME
     layers = args.layers
-    mgr, _, _, _, _ = build_cache(
+    mgr, kp, vp, hk, hv = build_cache(
         args.prompt_len, window, args.history_chunks, args.tokens_per_page, gen, layers
     )
     q = torch.randn(CHUNK, NUM_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
@@ -295,11 +295,38 @@ def chunk_cycle(args, gen) -> None:
         f"history {mgr.history_tokens} [{max(0, mgr.history_tokens - window)} stale], "
         f"chunk {CHUNK}, clean pass in {CHUNK // TOKENS_PER_FRAME} blocks of {TOKENS_PER_FRAME}"
     )
+    # Correctness first: the clean pass of the last layer against the exact window
+    # (every layer holds the same values).
+    out = (
+        attns[-1]
+        .forward(
+            q4,
+            k4,
+            v4,
+            batch_size=1,
+            seq_len=CHUNK,
+            kv_cache=mgr,
+            causal_block_size=TOKENS_PER_FRAME,
+        )
+        .reshape(CHUNK, NUM_HEADS, HEAD_DIM)
+    )
+    ref = torch.cat(
+        [
+            exact_reference(q, kp, vp, hk, hv, k, v, lo, lo + TOKENS_PER_FRAME, window)
+            for lo in range(0, CHUNK, TOKENS_PER_FRAME)
+        ]
+    )
+    err = (out.float() - ref).abs().max().item()
+    print(f"check clean pass  max|err| vs fp32 exact window = {err:.4f}")
+    if err > 2e-2:
+        raise SystemExit(f"chunk cycle: clean pass deviates from the exact window by {err}")
+
     timer = CuptiTimer(args.iters, args.warmup, not args.no_l2_flush, not args.no_graph)
     denoise = timer.time(lambda: forward(None), "denoise")
     clean = timer.time(lambda: forward(TOKENS_PER_FRAME), "clean")
 
-    # Commit: device kernels by CUPTI (eager, no graph), host time by the wall clock.
+    # Commit: GPU span by CUPTI (eager, no graph): first kernel start to last kernel
+    # end, so it includes launch gaps between the kernels; host time by the wall clock.
     # Each commit at steady state drops pages, so the rotation and the private-page
     # copies for both blockings are exercised every time.
     def refresh_and_commit():
@@ -326,7 +353,7 @@ def chunk_cycle(args, gen) -> None:
     print(f"{'4 denoising forwards':34s} {4 * denoise['median_us'] / 1e3:9.2f} ms")
     print(f"{'1 clean pass':34s} {clean['median_us'] / 1e3:9.2f} ms")
     print(
-        f"{'commit, device kernels':34s} {commit_dev['median_us'] / 1e3:9.2f} ms  "
+        f"{'commit, GPU span':34s} {commit_dev['median_us'] / 1e3:9.2f} ms  "
         f"({commit_dev['kernels']:.0f} kernels)"
     )
     print(f"{'commit, host wall (incl. above)':34s} {host_ms:9.2f} ms")
@@ -339,10 +366,7 @@ def chunk_cycle(args, gen) -> None:
         f"clean {clean['median_us'] / layers:.1f} us"
     )
     mgr.shutdown()
-    try:
-        timer.cupti.finalize()
-    except Exception:
-        pass
+    timer.cupti.finalize()  # exactly once per process
 
 
 def main() -> None:
@@ -519,10 +543,7 @@ def main() -> None:
             f"{name:12s} {r['median_us']:10.1f} {r['min_us']:9.1f} {r['p90_us']:9.1f} {r['kernels']:8.0f}"
         )
     mgr.shutdown()
-    try:
-        timer.cupti.finalize()
-    except Exception:  # once-per-process teardown; nothing depends on it succeeding
-        pass
+    timer.cupti.finalize()  # exactly once per process
 
 
 if __name__ == "__main__":

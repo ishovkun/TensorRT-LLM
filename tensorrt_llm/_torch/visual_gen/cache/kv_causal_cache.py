@@ -161,6 +161,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 f"causal_block_sizes {tuple(causal_block_sizes)} must be positive and tile the "
                 f"{chunk_tokens}-token chunk"
             )
+        # A block whose window reaches back into the chunk would need the chunk's
+        # tokens in two partial pages of its private region; only its start page is
+        # supported, so every block must see all earlier blocks of its chunk.
+        if window_tokens < chunk_tokens - min(sizes):
+            raise ValueError(
+                f"window_tokens {window_tokens} must cover the earlier blocks of a chunk: at "
+                f"least {chunk_tokens - min(sizes)} for blocks of {min(sizes)}"
+            )
         self.causal_block_sizes = sizes
 
         tpb = tokens_per_page
@@ -922,6 +930,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
     ) -> torch.Tensor:
         rows = self.get_batch_cache_indices(request_ids, layer_idx, num_blocks)
         return torch.tensor([p for row in rows for p in row], dtype=torch.int32)
+
+    @property
+    def is_open(self) -> bool:
+        """Whether a rollout is open; device state of a closed cache is not live."""
+        return self._kv_cache is not None
 
     def _require_open(self) -> None:
         if self._kv_cache is None:

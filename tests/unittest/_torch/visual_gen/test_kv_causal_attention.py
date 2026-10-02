@@ -27,6 +27,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
@@ -507,3 +508,157 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
     q = torch.zeros(1, 8, NUM_HEADS * HEAD_DIM, device=DEVICE, dtype=DTYPE)
     with pytest.raises(NotImplementedError, match="does not support a K/V cache"):
         attn._attn_impl(q, q, q, kv_cache=cache)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_padding_with_causal_blocks_over_stale_history(cache, backend):
+    """Ulysses padding during the clean pass: four causal blocks over a rotated table
+    with stale tokens, plus padding rows that are neither written nor attended."""
+    if backend == "trtllm" and cache.tokens_per_page != 32:
+        pytest.skip("trtllm-gen: 32-token pages only")
+    torch.manual_seed(9)
+    pk, pv = open_with_prompt(cache, 9)
+    history_k, history_v = [], []
+    for _ in range(3):
+        _, k, v = rand_qkv(CHUNK)
+        cache.write_range(0, cache.past_tokens, k, v)
+        cache.commit()
+        history_k.append(k)
+        history_v.append(v)
+    assert cache.history_tokens > WINDOW, "test geometry should hold stale tokens here"
+    hk, hv = torch.cat(history_k), torch.cat(history_v)
+    pad, size = 6, CHUNK // 4
+    q, k, v = rand_qkv(CHUNK + pad)
+    out = (
+        make_backend(backend)
+        .forward(
+            q[None],
+            k[None],
+            v[None],
+            batch_size=1,
+            seq_len=CHUNK,
+            kv_cache=cache,
+            causal_block_size=size,
+        )
+        .reshape(CHUNK + pad, NUM_HEADS, HEAD_DIM)
+    )
+    torch.cuda.synchronize()
+    expected = torch.cat(
+        [exact_reference(q, pk, pv, hk, hv, k, v, i * size, (i + 1) * size) for i in range(4)]
+    )
+    torch.testing.assert_close(out[:CHUNK], expected, rtol=2e-2, atol=2e-2)
+    assert out[CHUNK:].abs().max().item() == 0.0, "padding rows must be zero"
+    positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+    k_back, v_back = read_kv(cache, 0, positions)
+    torch.testing.assert_close(k_back, k[:CHUNK])
+    torch.testing.assert_close(v_back, v[:CHUNK])
+
+
+@pytest.mark.parametrize("block", [32, 64])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_blocks_of_one_and_two_whole_pages(backend, block):
+    """Causal blocks exactly one page and exactly two pages long, so block starts
+    and ends fall on page boundaries, through several rotations."""
+    torch.manual_seed(10)
+    prompt, window, chunk = 8, 96, 64
+    cache = CausalKVCacheManager(
+        num_layers=1,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=DTYPE,
+        tokens_per_page=32,
+        fixed_capacity=prompt,
+        window_tokens=window,
+        chunk_tokens=chunk,
+        causal_block_sizes=(64, 32),
+    )
+    try:
+        pk, pv = open_with_prompt(cache, prompt)
+        attn = make_backend(backend)
+        history_k, history_v = [], []
+        empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        for step in range(6):
+            q, k, v = rand_qkv(chunk)
+            out = run(attn, cache, q, k, v, causal_block_size=block)
+            torch.cuda.synchronize()
+            hk = torch.cat(history_k) if history_k else empty
+            hv = torch.cat(history_v) if history_v else empty
+            keys, values = torch.cat([pk, hk, k]), torch.cat([pv, hv, v])
+            pos = torch.arange(keys.shape[0], device=DEVICE)
+            expected = []
+            for start in range(0, chunk, block):
+                end = start + block
+                visible = (pos < prompt) | (
+                    (pos >= prompt + hk.shape[0] + start - window)
+                    & (pos < prompt + hk.shape[0] + end)
+                )
+                expected.append(reference_attention(q[start:end], keys[visible], values[visible]))
+            torch.testing.assert_close(
+                out, torch.cat(expected), rtol=2e-2, atol=2e-2, msg=f"step {step}"
+            )
+            history_k.append(k)
+            history_v.append(v)
+            cache.commit()
+        assert cache.history_tokens >= window, "the window should be full by now"
+    finally:
+        cache.shutdown()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_cache_path_refusals(cache, backend):
+    """What the cache path does not support raises instead of computing something else."""
+    if backend == "trtllm" and cache.tokens_per_page != 32:
+        pytest.skip("trtllm-gen: 32-token pages only")
+    open_with_prompt(cache, 9)
+    attn = make_backend(backend)
+    q, k, v = rand_qkv(CHUNK)
+    common = dict(seq_len=CHUNK, kv_cache=cache)
+    with pytest.raises(ValueError):  # two videos
+        attn.forward(
+            torch.stack([q, q]), torch.stack([k, k]), torch.stack([v, v]), batch_size=2, **common
+        )
+    with pytest.raises(NotImplementedError):  # anything but full attention over the cache
+        attn.forward(
+            q[None],
+            k[None],
+            v[None],
+            batch_size=1,
+            attention_mask=PredefinedAttentionMask.CAUSAL,
+            **common,
+        )
+    with pytest.raises(ValueError, match="not declared"):
+        attn.forward(q[None], k[None], v[None], batch_size=1, causal_block_size=8, **common)
+    if backend == "trtllm":
+        attn.sparse_params = object()  # any sparse attention configuration
+        with pytest.raises(NotImplementedError, match="sparse"):
+            attn.forward(q[None], k[None], v[None], batch_size=1, **common)
+
+
+def test_trtllm_forgets_metadata_of_closed_caches():
+    """Metadata holds its cache; once a cache is shut down, building metadata for the
+    next one drops the old entries so a cache per rollout does not leak."""
+    attn = make_backend("trtllm")
+    caches = []
+    for rollout in range(3):
+        cache = CausalKVCacheManager(
+            num_layers=1,
+            num_kv_heads=NUM_KV_HEADS,
+            head_dim=HEAD_DIM,
+            dtype=DTYPE,
+            tokens_per_page=32,
+            fixed_capacity=PROMPT_CAPACITY,
+            window_tokens=WINDOW,
+            chunk_tokens=CHUNK,
+            causal_block_sizes=(CHUNK, CHUNK // 4),
+        )
+        open_with_prompt(cache, 9)
+        attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)
+        attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4)
+        held = {
+            id(e["metadata"].kv_cache_manager)
+            for key, e in attn.metadata._metadata_cache.items()
+            if key[0] == "kv_cache"
+        }
+        assert held == {id(cache)}, f"rollout {rollout}: metadata of closed caches kept"
+        cache.shutdown()
+        caches.append(cache)
