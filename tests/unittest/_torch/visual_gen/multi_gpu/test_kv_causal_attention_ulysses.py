@@ -193,10 +193,10 @@ def _logic_rollout(rank, world_size, backend):
     cache = make_cache(chunk)
     attn, group = make_ulysses(rank, world_size, backend, chunk)
     try:
-        cache.open()
+        cache.open(pin_tokens=PROMPT)
         _, pk, pv = rand_qkv(PROMPT)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
-        cache.pin_prefix(PROMPT)
+        cache.commit(PROMPT)
         history_k, history_v = [], []
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
         per = chunk // world_size
@@ -232,10 +232,10 @@ def _logic_causal_blocks(
     cache = make_cache(chunk, prompt, window)
     attn, group = make_ulysses(rank, world_size, backend, chunk, prompt, window)
     try:
-        cache.open()
+        cache.open(pin_tokens=prompt)
         _, pk, pv = rand_qkv(prompt)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
-        cache.pin_prefix(prompt)
+        cache.commit(prompt)
         history_k, history_v = [], []
         for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
             _, k, v = rand_qkv(chunk)
@@ -270,10 +270,10 @@ def _logic_padded_first_chunk(rank, world_size, backend):
     cache = make_cache(chunk)
     attn, group = make_ulysses(rank, world_size, backend, chunk)
     try:
-        cache.open()
+        cache.open(pin_tokens=PROMPT)
         _, pk, pv = rand_qkv(PROMPT)
         cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
-        cache.pin_prefix(PROMPT)
+        cache.commit(PROMPT)
         q, k, v = rand_qkv(block)
         pad = (-block) % world_size
         padded = [torch.cat([x, torch.randn_like(x[:pad])]) for x in (q, k, v)]

@@ -87,13 +87,14 @@ def write_kv_reference(cache, layer, positions, k, v):
 
 
 def open_with_fixed(cache, fixed_len):
-    """Open, write ``fixed_len`` random tokens at position 0 in every layer, pin them."""
-    cache.open()
+    """Open pinning ``fixed_len`` tokens, write that many random tokens at position 0
+    in every layer and commit them."""
+    cache.open(pin_tokens=fixed_len)
     k, v = rand_kv(fixed_len)
     for layer in range(NUM_LAYERS):
         cache.write_range(layer, 0, k, v)
     if fixed_len:
-        cache.pin_prefix(fixed_len)
+        cache.commit(fixed_len)
     return k, v
 
 
@@ -178,54 +179,49 @@ def test_reopen_keeps_device_state_in_place(cache):
     torch.testing.assert_close(v_back, v)
 
 
-def test_pin_makes_fresh_tokens_or_the_oldest_history_fixed(cache):
-    tpb = cache.tokens_per_page
-    cache.open()
+def test_pinned_tokens_are_the_first_committed_and_never_evicted(cache):
+    """``open(pin_tokens)`` pins the first tokens committed, whatever they are: a
+    prompt longer than a chunk in one commit, then generated tokens up to the pin
+    size inside a later commit, which splits it. They survive every rotation."""
+    tpb, chunk = cache.tokens_per_page, cache.chunk_tokens
     with pytest.raises(RuntimeError):
         make_cache(tpb).table  # not open
-    k, v = rand_kv(13)
-    for layer in range(NUM_LAYERS):
-        cache.write_range(layer, 0, k, v)
-    cache.pin_prefix(13)
-    assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (13, 0, 13)
-    assert cache._fixed_pages == 0  # 13 tokens do not fill a page; the page is shared
-    version = cache.table_version
-    cache.pin_prefix(13)  # same total: no-op
-    assert cache.table_version == version
-    with pytest.raises(NotImplementedError):
-        cache.pin_prefix(12)  # shrinking
     with pytest.raises(ValueError):
-        cache.pin_prefix(cache.fixed_capacity + 1)  # over capacity
+        cache.open(pin_tokens=cache.fixed_capacity + 1)
+    prompt, sink = cache.fixed_capacity - 8, 8
+    cache.open(pin_tokens=prompt + sink)
+    pk, pv = rand_kv(prompt)
+    for layer in range(NUM_LAYERS):
+        cache.write_range(layer, 0, pk, pv)
+    cache.commit(prompt)
+    assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (prompt, 0, prompt)
 
-    # A chunk becomes history; its oldest 8 tokens become fixed (sink frames).
-    chunk = cache.chunk_tokens
+    # The first chunk: its first `sink` tokens complete the pinned part.
     hk, hv = rand_kv(chunk)
     for layer in range(NUM_LAYERS):
         cache.write_range(layer, cache.past_tokens, hk, hv)
     cache.commit()
-    with pytest.raises(ValueError):
-        cache.pin_prefix(13 + chunk + 1)  # more than the resident history
-    version = cache.table_version
-    cache.pin_prefix(13 + 8)
-    assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (
-        21,
-        chunk - 8,
-        13 + chunk,
-    )
-    assert cache.table_version > version
-    for layer in range(NUM_LAYERS):
-        k_back, v_back = read_kv(cache, layer, torch.arange(21, device=DEVICE))
-        torch.testing.assert_close(k_back, torch.cat([k, hk[:8]]))
-        torch.testing.assert_close(v_back, torch.cat([v, hv[:8]]))
-    # Pinned tokens survive rotations like any fixed token.
-    for _ in range(6):
-        _, kk, vv = (None, *rand_kv(chunk))
+    assert (cache.fixed_tokens, cache.history_tokens) == (prompt + sink, chunk - sink)
+    pinned_k, pinned_v = torch.cat([pk, hk[:sink]]), torch.cat([pv, hv[:sink]])
+    for _ in range(3 * cache.capacity // chunk):  # cycle the pool several times
+        kk, vv = rand_kv(chunk)
         for layer in range(NUM_LAYERS):
             cache.write_range(layer, cache.past_tokens, kk, vv)
         cache.commit()
+        assert cache.fixed_tokens == prompt + sink
     for layer in range(NUM_LAYERS):
-        k_back, _ = read_kv(cache, layer, torch.arange(21, device=DEVICE))
-        torch.testing.assert_close(k_back, torch.cat([k, hk[:8]]))
+        k_back, v_back = read_kv(cache, layer, torch.arange(prompt + sink, device=DEVICE))
+        torch.testing.assert_close(k_back, pinned_k)
+        torch.testing.assert_close(v_back, pinned_v)
+
+
+def test_commit_beyond_a_chunk_only_into_the_pinned_part(cache):
+    chunk = cache.chunk_tokens
+    cache.open(pin_tokens=cache.fixed_capacity)
+    with pytest.raises(ValueError):
+        cache.commit(cache.fixed_capacity + chunk + 1)  # more than a chunk past the pin
+    cache.commit(cache.fixed_capacity + chunk)  # pinned part plus exactly one chunk
+    assert (cache.fixed_tokens, cache.history_tokens) == (cache.fixed_capacity, chunk)
 
 
 def test_write_range_matches_indexed_write(cache):
@@ -315,10 +311,10 @@ def test_block_rows_present_exactly_the_window(cache):
     nothing twice. Checked by stamping every token with its position."""
     chunk, window = cache.chunk_tokens, cache.window_tokens
     fixed = 13
-    cache.open()
+    cache.open(pin_tokens=fixed)
     for layer in range(NUM_LAYERS):
         cache.write_range(layer, 0, *stamped_kv(torch.arange(fixed, device=DEVICE)))
-    cache.pin_prefix(fixed)
+    cache.commit(fixed)
     num_blocks, size = 4, chunk // 4
 
     written: list = []  # stamp of every committed token, oldest first

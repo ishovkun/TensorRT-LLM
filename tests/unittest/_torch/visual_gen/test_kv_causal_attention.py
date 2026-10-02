@@ -139,12 +139,13 @@ def rand_qkv(n):
 
 
 def open_with_prompt(cache, prompt_len):
-    """Open, write a random prompt at position 0 and pin it; returns its K and V."""
-    cache.open()
+    """Open pinning ``prompt_len`` tokens, write a random prompt at position 0 and
+    commit it; returns its K and V."""
+    cache.open(pin_tokens=prompt_len)
     pk, pv = rand_qkv(prompt_len)[1:]
     cache.write_range(0, 0, pk, pv)
     if prompt_len:
-        cache.pin_prefix(prompt_len)
+        cache.commit(prompt_len)
     return pk, pv
 
 
@@ -289,9 +290,9 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks):
     def keys(n):
         return torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
 
-    cache.open()
+    cache.open(pin_tokens=prompt)
     cache.write_range(0, 0, keys(prompt), indicator_values(watch, 0, prompt))
-    cache.pin_prefix(prompt)
+    cache.commit(prompt)
     for c in range(commits):
         first = prompt + c * CHUNK
         cache.write_range(0, cache.past_tokens, keys(CHUNK), indicator_values(watch, first, CHUNK))

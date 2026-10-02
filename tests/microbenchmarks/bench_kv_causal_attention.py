@@ -200,13 +200,13 @@ def build_cache(
         chunk_tokens=CHUNK,
         causal_block_sizes=(CHUNK, TOKENS_PER_FRAME),
     )
-    mgr.open()
+    mgr.open(pin_tokens=prompt_len)
     kp = torch.randn(prompt_len, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
     vp = torch.randn_like(kp)
     for layer in range(num_layers):
         mgr.write_range(layer, 0, kp, vp)
     if prompt_len:
-        mgr.pin_prefix(prompt_len)
+        mgr.commit(prompt_len)
 
     hist_k, hist_v = [], []
     for _ in range(history_chunks):
