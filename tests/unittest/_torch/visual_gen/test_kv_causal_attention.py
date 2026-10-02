@@ -21,6 +21,8 @@ and the block itself. Stale tokens the whole-page eviction keeps resident must
 not be seen.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -28,6 +30,9 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -350,3 +355,29 @@ def test_graph_replay_survives_commit(cache, backend):
         k_back, v_back = read_kv(cache, 0, positions)
         torch.testing.assert_close(k_back, k, msg=f"replay {step}: K landed on stale pages")
         torch.testing.assert_close(v_back, v, msg=f"replay {step}: V landed on stale pages")
+
+
+def test_backend_without_cache_support_refuses_a_cache(cache):
+    """A cache routed to a backend that cannot use it raises instead of being ignored."""
+    config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=NUM_HEADS * HEAD_DIM,
+            num_attention_heads=NUM_HEADS,
+            attention_head_dim=HEAD_DIM,
+            eps=1e-6,
+        ),
+        attention=AttentionConfig(backend="VANILLA"),
+        skip_create_weights_in_init=True,
+    )
+    attn = Attention(
+        hidden_size=NUM_HEADS * HEAD_DIM,
+        num_attention_heads=NUM_HEADS,
+        head_dim=HEAD_DIM,
+        config=config,
+    )
+    assert not attn.attn.support_kv_cache()
+    assert make_backend("cudnn").support_kv_cache()
+    assert make_backend("trtllm").support_kv_cache()
+    q = torch.zeros(1, 8, NUM_HEADS * HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    with pytest.raises(NotImplementedError, match="does not support a K/V cache"):
+        attn._attn_impl(q, q, q, kv_cache=cache)

@@ -80,3 +80,10 @@ class AttentionBackend(ABC):
     def support_lse(cls) -> bool:
         """Whether the backend supports returning the softmax log-sum-exp (LSE) of the attention weights."""
         return False
+
+    @classmethod
+    def support_kv_cache(cls) -> bool:
+        """Whether ``forward`` accepts a ``CausalKVCacheManager`` as ``kv_cache``. A backend
+        without support would silently drop the keyword through ``**kwargs``, so callers
+        must check before passing one."""
+        return False

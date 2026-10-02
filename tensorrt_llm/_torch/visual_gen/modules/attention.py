@@ -586,6 +586,10 @@ class Attention(nn.Module):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
+        if kwargs.get("kv_cache") is not None and not self.attn.support_kv_cache():
+            raise NotImplementedError(
+                f"{type(self.attn).__name__} does not support a K/V cache; use CUDNN or TRTLLM."
+            )
         out = self.attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]

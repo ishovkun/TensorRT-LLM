@@ -522,3 +522,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     def support_fused_qkv(self) -> bool:
         """Standard path fuses QKV; SageAttention path does not."""
         return self.quant_attention_config is None
+
+    @classmethod
+    def support_kv_cache(cls) -> bool:
+        return True

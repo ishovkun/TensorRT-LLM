@@ -1024,6 +1024,10 @@ class CuDNNAttention(AttentionBackend):
     def support_fused_qkv(cls) -> bool:
         return False
 
+    @classmethod
+    def support_kv_cache(cls) -> bool:
+        return True
+
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
         return self._preferred_layout

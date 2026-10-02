@@ -341,6 +341,8 @@ class UlyssesAttention(AttentionBackend):
         makes default wait on the last push.
         Post-attention permute / SDPA / reverse A2A run in the caller's outer
         compile region for additional inductor fusion."""
+        if attn_kwargs.get("kv_cache") is not None:
+            raise NotImplementedError("The async Ulysses path does not support a K/V cache.")
         P = self.world_size
 
         # Issue the closures in issue_order. Order is correctness-neutral (_join_async
@@ -413,6 +415,9 @@ class UlyssesAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return True
+
+    def support_kv_cache(self) -> bool:
+        return self.inner_backend.support_kv_cache()
 
 
 class Attention2DAttention(AttentionBackend):
