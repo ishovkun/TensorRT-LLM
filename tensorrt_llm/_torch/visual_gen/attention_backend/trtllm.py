@@ -208,7 +208,7 @@ class TrtllmAttentionMetadata:
                     "K/V cache attention metadata first needed during CUDA graph capture; "
                     "run the forward eagerly once before capturing"
                 )
-            self._drop_metadata_of_closed_caches()
+            self._drop_metadata_of_shut_down_caches()
             metadata = BaseTrtllmAttentionMetadata(
                 max_num_requests=kv_cache.max_causal_blocks,
                 max_num_tokens=kv_cache.chunk_tokens,
@@ -252,14 +252,15 @@ class TrtllmAttentionMetadata:
             cached["kv_state"] = state
         return metadata
 
-    def _drop_metadata_of_closed_caches(self) -> None:
-        """Forget metadata built over caches that are no longer open. Each entry holds
-        its cache, so without this a model that builds a new cache per rollout would
-        keep every old one alive."""
+    def _drop_metadata_of_shut_down_caches(self) -> None:
+        """Forget metadata built over caches that were shut down. Each entry holds its
+        cache, so without this a model that builds a new cache per rollout would keep
+        every old one alive. A merely closed cache keeps its metadata: it may be
+        reopened, and graphs captured over it still read those buffers."""
         stale = [
             key
             for key, entry in self._metadata_cache.items()
-            if key[0] == "kv_cache" and not entry["metadata"].kv_cache_manager.is_open
+            if key[0] == "kv_cache" and entry["metadata"].kv_cache_manager.is_shut_down
         ]
         for key in stale:
             del self._metadata_cache[key]
@@ -420,7 +421,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Plain diffusion attention; returns ``[B*S, H*D]``."""
-        if "causal_block_size" in kwargs:
+        if kwargs.pop("causal_block_size", None) is not None:
             raise NotImplementedError(
                 "causal_block_size is only implemented over a K/V cache; pass kv_cache."
             )
@@ -499,6 +500,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise ValueError(
                 f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
             )
+        if q.shape[2:] != (self.num_heads, self.head_dim) or k.shape[3] != self.head_dim:
+            raise ValueError(
+                f"q is {tuple(q.shape)}, k is {tuple(k.shape)}; this backend was built for "
+                f"{self.num_heads} heads of {self.head_dim}"
+            )
         if not 0 < seq_len <= num_rows:
             raise ValueError(
                 f"seq_len {seq_len} outside (0, {num_rows}]: it counts the real tokens; "
@@ -538,6 +544,5 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         """Standard path fuses QKV; SageAttention path does not."""
         return self.quant_attention_config is None
 
-    @classmethod
-    def support_kv_cache(cls) -> bool:
+    def support_kv_cache(self) -> bool:
         return True

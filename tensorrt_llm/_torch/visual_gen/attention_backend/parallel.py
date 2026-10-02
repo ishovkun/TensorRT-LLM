@@ -161,6 +161,17 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
+        if kwargs.get("kv_cache") is not None:
+            # With a cache, seq_len counts the real tokens of the whole sequence and
+            # rows past it are padding; a caller passing its own shard length would
+            # silently drop real tokens.
+            rows = q.shape[1] * self.world_size
+            seq_len = kwargs.setdefault("seq_len", rows)
+            if self.world_size > 1 and not q.shape[1] < seq_len <= rows:
+                raise ValueError(
+                    f"seq_len {seq_len} with a K/V cache must count the real tokens of the whole "
+                    f"sequence: more than this rank's {q.shape[1]} rows, at most {rows}"
+                )
         # The fused path stacks q/k/v on one axis, which needs equal head counts;
         # grouped-query models take the per-tensor path, and so does the K/V cache
         # path, whose backends take q, k, v separately.
@@ -254,14 +265,6 @@ class UlyssesAttention(AttentionBackend):
             # backend the post-A2A lengths instead.
             kwargs["seq_len"] = seq_len_full
             kwargs["seq_len_kv"] = kv_seq_len_full
-        elif not seq_len_full - self.world_size < kwargs.get("seq_len", 0) <= seq_len_full:
-            # With a cache, seq_len is the real token count and padding is less than
-            # one row per rank; a per-rank length here would silently drop real tokens.
-            raise ValueError(
-                f"seq_len {kwargs.get('seq_len')} with a K/V cache must count the real tokens "
-                f"of the whole sequence ({seq_len_full} rows after the exchange, padding "
-                f"below {self.world_size})"
-            )
         if gate_compress is not None:
             kwargs["gate_compress"] = gate_compress
         if gate_fine is not None:

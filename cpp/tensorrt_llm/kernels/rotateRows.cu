@@ -17,6 +17,8 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/rotateRows.h"
 
+#include <algorithm>
+
 using namespace tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
@@ -33,15 +35,18 @@ __global__ void reverseRowsKernel(T* data, int64_t rows, int64_t rowStride, int6
 {
     int64_t const half = (end - begin) / 2;
     int64_t const i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    int64_t const row = blockIdx.y;
-    if (i >= half || row >= rows)
+    if (i >= half)
     {
         return;
     }
-    T* r = data + row * rowStride;
-    T const a = r[begin + i];
-    r[begin + i] = r[end - 1 - i];
-    r[end - 1 - i] = a;
+    // Rows beyond the grid's y limit are covered by striding.
+    for (int64_t row = blockIdx.y; row < rows; row += gridDim.y)
+    {
+        T* r = data + row * rowStride;
+        T const a = r[begin + i];
+        r[begin + i] = r[end - 1 - i];
+        r[end - 1 - i] = a;
+    }
 }
 
 template <typename T>
@@ -53,7 +58,9 @@ void reverseRows(T* data, int64_t rows, int64_t rowStride, int64_t begin, int64_
         return;
     }
     constexpr int kThreads = 256;
-    dim3 const grid(static_cast<unsigned>((half + kThreads - 1) / kThreads), static_cast<unsigned>(rows));
+    constexpr int64_t kMaxGridY = 65535;
+    dim3 const grid(
+        static_cast<unsigned>((half + kThreads - 1) / kThreads), static_cast<unsigned>(std::min(rows, kMaxGridY)));
     reverseRowsKernel<T><<<grid, kThreads, 0, stream>>>(data, rows, rowStride, begin, end);
     check_cuda_error(cudaGetLastError());
 }
@@ -77,7 +84,7 @@ void invokeRotateRows(
         return;
     }
     // A right rotation by s is a left rotation by cols - s; reduce any shift to a left one in [0, cols).
-    int64_t const left = ((-shift % cols) + cols) % cols;
+    int64_t const left = (cols - shift % cols) % cols; // shift % cols first: -INT64_MIN overflows
     if (left == 0)
     {
         return;

@@ -24,6 +24,7 @@ with it.
 
 import functools
 import os
+from types import SimpleNamespace
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
@@ -38,7 +39,13 @@ from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention
+from tensorrt_llm.visual_gen.args import AttentionConfig
 
 WORLD = 2
 NUM_HEADS = 8
@@ -337,6 +344,62 @@ def _logic_per_rank_seq_len_refused(rank, world_size, backend):
         cache.shutdown()
 
 
+def _logic_through_the_attention_module(rank, world_size, backend):
+    """The model's path: the shared Attention module builds the Ulysses wrapper and
+    must hand the caller's real token count through, padding included."""
+    torch.manual_seed(3)
+    chunk = 44  # declares blocks of 11, the padded single-frame chunk below
+    vgm = VisualGenMapping(world_size=world_size, rank=rank, ulysses_size=world_size)
+    config = DiffusionModelConfig(
+        pretrained_config=SimpleNamespace(
+            hidden_size=NUM_HEADS * HEAD_DIM,
+            num_attention_heads=NUM_HEADS,
+            attention_head_dim=HEAD_DIM,
+            eps=1e-6,
+        ),
+        attention=AttentionConfig(backend=backend.upper()),
+        skip_create_weights_in_init=True,
+    )
+    config.attention_metadata_state = (
+        create_attention_metadata_state() if backend == "trtllm" else None
+    )
+    config.visual_gen_mapping = vgm
+    attn = Attention(
+        hidden_size=NUM_HEADS * HEAD_DIM,
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        config=config,
+        layer_idx=0,
+    )
+    assert attn.attn.support_kv_cache()
+    cache = make_cache(chunk)
+    group = vgm.ulysses_group
+    try:
+        cache.open(pin_tokens=PROMPT)
+        _, pk, pv = rand_qkv(PROMPT)
+        cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
+        cache.commit(PROMPT)
+        empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        for real in (chunk, 11):  # a full chunk, then 11 tokens padded to 12
+            pad = (-real) % world_size
+            q, k, v = rand_qkv(real)
+            padded = [torch.cat([x, torch.randn_like(x[:pad])]) for x in (q, k, v)]
+            per = (real + pad) // world_size
+            flat = [token_slice(x, rank).flatten(2) for x in padded]  # [1, per, heads * dim]
+            out = attn._attn_impl(*flat, kv_cache=cache, seq_len=real).view(
+                per, NUM_HEADS, HEAD_DIM
+            )
+            torch.cuda.synchronize()
+            full = exact_reference(q, pk, pv, empty, empty, k, v, 0, real, WINDOW)
+            full = torch.cat([full, full.new_zeros((pad, NUM_HEADS, HEAD_DIM))])
+            torch.testing.assert_close(
+                out, full[rank * per : (rank + 1) * per], rtol=2e-2, atol=2e-2
+            )
+    finally:
+        cache.shutdown()
+
+
 def _logic_all(rank, world_size, backend):
     """Every scenario in one process group per backend: spawning costs more than the tests."""
     _logic_rollout(rank, world_size, backend)
@@ -344,6 +407,7 @@ def _logic_all(rank, world_size, backend):
     _logic_padded_first_chunk(rank, world_size, backend)
     _logic_head_count_guard(rank, world_size, backend)
     _logic_per_rank_seq_len_refused(rank, world_size, backend)
+    _logic_through_the_attention_module(rank, world_size, backend)
 
 
 @pytest.mark.parametrize("backend", ["cudnn", "trtllm"])

@@ -149,7 +149,7 @@ class CuptiTimer:
         launches.sort(key=lambda x: x[0])
         starts = [x[0] for x in launches]
 
-        us, counts = [], []
+        us, busy, counts = [], [], []
         for idx, (t0, t1) in enumerate(stamps):
             lo, hi = bisect.bisect_left(starts, t0), bisect.bisect_right(starts, t1)
             ks = [k for i in range(lo, hi) for k in by_corr.get(launches[i][2], [])]
@@ -157,6 +157,7 @@ class CuptiTimer:
                 raise RuntimeError(f"{tag}: no kernel activity recorded for iteration {idx}")
             t_start = min(k[0] for k in ks)
             us.append((max(k[1] for k in ks) - t_start) / 1e3)
+            busy.append(sum(k[1] - k[0] for k in ks) / 1e3)
             counts.append(sum(1 for k in ks if k[3] is not None))
             if self.dump and idx == 0:
                 for k in sorted(ks, key=lambda r: r[0]):
@@ -169,6 +170,7 @@ class CuptiTimer:
             "median_us": statistics.median(us),
             "min_us": us[0],
             "p90_us": us[int(0.9 * (len(us) - 1))],
+            "busy_us": statistics.median(busy),  # kernels' own durations, no gaps
             "kernels": statistics.median(counts),
         }
 
@@ -295,31 +297,25 @@ def chunk_cycle(args, gen) -> None:
         f"history {mgr.history_tokens} [{max(0, mgr.history_tokens - window)} stale], "
         f"chunk {CHUNK}, clean pass in {CHUNK // TOKENS_PER_FRAME} blocks of {TOKENS_PER_FRAME}"
     )
-    # Correctness first: the clean pass of the last layer against the exact window
-    # (every layer holds the same values).
-    out = (
-        attns[-1]
-        .forward(
-            q4,
-            k4,
-            v4,
-            batch_size=1,
-            seq_len=CHUNK,
-            kv_cache=mgr,
-            causal_block_size=TOKENS_PER_FRAME,
+    # Correctness first, on the last layer (every layer holds the same values): a
+    # denoising forward and the clean pass against the exact window.
+    for block in (CHUNK, TOKENS_PER_FRAME):
+        out = (
+            attns[-1]
+            .forward(q4, k4, v4, batch_size=1, seq_len=CHUNK, kv_cache=mgr, causal_block_size=block)
+            .reshape(CHUNK, NUM_HEADS, HEAD_DIM)
         )
-        .reshape(CHUNK, NUM_HEADS, HEAD_DIM)
-    )
-    ref = torch.cat(
-        [
-            exact_reference(q, kp, vp, hk, hv, k, v, lo, lo + TOKENS_PER_FRAME, window)
-            for lo in range(0, CHUNK, TOKENS_PER_FRAME)
-        ]
-    )
-    err = (out.float() - ref).abs().max().item()
-    print(f"check clean pass  max|err| vs fp32 exact window = {err:.4f}")
-    if err > 2e-2:
-        raise SystemExit(f"chunk cycle: clean pass deviates from the exact window by {err}")
+        ref = torch.cat(
+            [
+                exact_reference(q, kp, vp, hk, hv, k, v, lo, lo + block, window)
+                for lo in range(0, CHUNK, block)
+            ]
+        )
+        err = (out.float() - ref).abs().max().item()
+        name = "denoising" if block == CHUNK else "clean pass"
+        print(f"check {name:10s} max|err| vs fp32 exact window = {err:.4f}")
+        if err > 2e-2:
+            raise SystemExit(f"chunk cycle: {name} deviates from the exact window by {err}")
 
     timer = CuptiTimer(args.iters, args.warmup, not args.no_l2_flush, not args.no_graph)
     denoise = timer.time(lambda: forward(None), "denoise")
@@ -348,18 +344,19 @@ def chunk_cycle(args, gen) -> None:
     host_ms = statistics.median(host)
 
     forwards = 4 * denoise["median_us"] + clean["median_us"]
-    total = forwards + commit_dev["median_us"]
+    total = forwards + commit_dev["busy_us"]
     print(f"\n{'per chunk, all layers':34s} {'median':>10s}")
     print(f"{'4 denoising forwards':34s} {4 * denoise['median_us'] / 1e3:9.2f} ms")
     print(f"{'1 clean pass':34s} {clean['median_us'] / 1e3:9.2f} ms")
     print(
-        f"{'commit, GPU span':34s} {commit_dev['median_us'] / 1e3:9.2f} ms  "
+        f"{'commit, kernels (sum)':34s} {commit_dev['busy_us'] / 1e3:9.2f} ms  "
         f"({commit_dev['kernels']:.0f} kernels)"
     )
+    print(f"{'commit, first to last kernel':34s} {commit_dev['median_us'] / 1e3:9.2f} ms")
     print(f"{'commit, host wall (incl. above)':34s} {host_ms:9.2f} ms")
     print(
         f"{'total device per chunk':34s} {total / 1e3:9.2f} ms  "
-        f"(commit share {100 * commit_dev['median_us'] / total:.2f}%)"
+        f"(commit share {100 * commit_dev['busy_us'] / total:.2f}%)"
     )
     print(
         f"{'per layer per forward':34s} denoise {denoise['median_us'] / layers:.1f} us, "

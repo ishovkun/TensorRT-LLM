@@ -105,3 +105,19 @@ def test_traces_under_torch_compile():
         return t
 
     torch.testing.assert_close(rotate(x), expected)
+
+
+def test_more_rows_than_one_grid_dimension_holds():
+    """Rows beyond the 65535 the launch grid's y dimension allows are rotated too."""
+    x = torch.arange(70_000 * 4, device="cuda", dtype=torch.int32).view(70_000, 4)
+    expected = torch.roll(x, 1, dims=-1)
+    torch.ops.trtllm.rotate_rows_(x, 1)
+    torch.testing.assert_close(x, expected)
+
+
+def test_extreme_shift():
+    x = torch.arange(10, device="cuda", dtype=torch.int64)
+    shift = -(2**63)
+    expected = torch.roll(x, shift % 10)
+    torch.ops.trtllm.rotate_rows_(x, shift)
+    torch.testing.assert_close(x, expected)

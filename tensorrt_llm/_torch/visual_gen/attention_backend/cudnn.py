@@ -677,6 +677,8 @@ class CuDNNAttention(AttentionBackend):
             )
         num_causal_blocks = num_tokens // causal_block_size
         device = q.device
+        if q.dtype != kv_cache.kv_buffer(self.layer_idx).dtype:
+            raise TypeError(f"q is {q.dtype} but the cache holds {kv_cache.kv_buffer(0).dtype}")
         kv_cache.write_chunk(self.layer_idx, k[0], v[0], causal_block_size)
         seq_len_q, seq_len_kv = kv_cache.causal_block_lengths(causal_block_size)
         seq_len_q, seq_len_kv = seq_len_q[:num_causal_blocks], seq_len_kv[:num_causal_blocks]
@@ -976,7 +978,7 @@ class CuDNNAttention(AttentionBackend):
                 key_padding_mask,
                 kwargs.pop("seq_len", None),
             )
-        if "causal_block_size" in kwargs:
+        if kwargs.pop("causal_block_size", None) is not None:
             raise NotImplementedError(
                 "causal_block_size is only implemented over a K/V cache; pass kv_cache."
             )
@@ -1000,6 +1002,8 @@ class CuDNNAttention(AttentionBackend):
             output: ``[B, S_q, H, D_v]``
             lse: ``[B, S_q, H]`` float32
         """
+        if kwargs.get("kv_cache") is not None:
+            raise NotImplementedError("forward_with_lse does not support a K/V cache.")
         output, lse = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=True
         )
@@ -1024,8 +1028,7 @@ class CuDNNAttention(AttentionBackend):
     def support_fused_qkv(cls) -> bool:
         return False
 
-    @classmethod
-    def support_kv_cache(cls) -> bool:
+    def support_kv_cache(self) -> bool:
         return True
 
     @property

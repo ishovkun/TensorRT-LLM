@@ -52,13 +52,20 @@ def fused_kv(tokens, heads, head_dim, dtype, q_heads=3):
 def test_scatter_matches_reference(dtype, head_dim, strided, second):
     torch.manual_seed(0)
     pages, heads, tpb, tokens = 37, 4, 32, 90
-    pool = torch.randn(pages, 2, heads, tpb, head_dim, device=DEV).to(dtype)
+
+    def values(*shape):  # every byte pattern matters for a byte copy, int8 included
+        if dtype == torch.int8:
+            return torch.randint(-128, 128, shape, device=DEV, dtype=torch.int8)
+        return torch.randn(*shape, device=DEV).to(dtype)
+
+    pool = values(pages, 2, heads, tpb, head_dim)
     if strided:
         k, v = fused_kv(tokens, heads, head_dim, dtype)
+        if dtype == torch.int8:
+            k.copy_(values(*k.shape)), v.copy_(values(*v.shape))
         assert not k.is_contiguous()
     else:
-        k = torch.randn(tokens, heads, head_dim, device=DEV).to(dtype)
-        v = torch.randn(tokens, heads, head_dim, device=DEV).to(dtype)
+        k, v = values(tokens, heads, head_dim), values(tokens, heads, head_dim)
     all_slots = torch.randperm(pages * tpb, device=DEV)
     dst = all_slots[:tokens].contiguous()
     dst2 = all_slots[tokens : 2 * tokens].contiguous() if second else None
@@ -123,3 +130,20 @@ def test_bad_arguments():
         torch.ops.trtllm.scatter_kv_slots_(pool, k, k, torch.arange(9, device=DEV))
     with pytest.raises(RuntimeError, match="entries"):
         torch.ops.trtllm.scatter_kv_slots_(pool, k, k, dst, dst2=dst[:4])
+
+
+def test_traces_under_torch_compile():
+    """The fake registration lets dynamo trace the op without a graph break."""
+    torch.manual_seed(4)
+    pool = torch.zeros(6, 2, 2, 32, 64, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(10, 2, 64, device=DEV, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    dst = torch.randperm(6 * 32, device=DEV)[:10]
+    expected = reference(pool, k, v, dst)
+
+    @torch.compile(fullgraph=True, backend="aot_eager")
+    def scatter(pool, k, v, dst):
+        torch.ops.trtllm.scatter_kv_slots_(pool, k, v, dst)
+        return pool
+
+    assert torch.equal(scatter(pool, k, v, dst), expected)

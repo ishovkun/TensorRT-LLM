@@ -60,11 +60,20 @@ def rand_kv(n):
     return k, torch.randn_like(k)
 
 
-def stamped_kv(positions):
-    """K/V whose every element is the token's logical position: reading a slot back
-    tells which token sits there."""
-    stamp = positions.to(DTYPE)[:, None, None].expand(-1, NUM_KV_HEADS, HEAD_DIM).contiguous()
+LAYER_STAMP = 1024  # stamps of layer l are offset by l * LAYER_STAMP; exact in fp16 below 2048
+
+
+def stamped_kv(positions, layer=0):
+    """K/V whose every element is the token's logical position plus a per-layer offset:
+    reading a slot back tells which token, and which layer's write, sits there."""
+    stamp = (positions + layer * LAYER_STAMP).to(DTYPE)
+    stamp = stamp[:, None, None].expand(-1, NUM_KV_HEADS, HEAD_DIM).contiguous()
     return stamp, -stamp
+
+
+def layer_kv(n):
+    """Different random K/V for every layer: ``[(k, v)] * NUM_LAYERS``."""
+    return [rand_kv(n) for _ in range(NUM_LAYERS)]
 
 
 def read_kv(cache, layer, positions):
@@ -87,15 +96,15 @@ def write_kv_reference(cache, layer, positions, k, v):
 
 
 def open_with_fixed(cache, fixed_len):
-    """Open pinning ``fixed_len`` tokens, write that many random tokens at position 0
-    in every layer and commit them."""
+    """Open pinning ``fixed_len`` tokens, write that many random tokens at position 0,
+    different in every layer, and commit them. Returns ``[(k, v)]`` per layer."""
     cache.open(pin_tokens=fixed_len)
-    k, v = rand_kv(fixed_len)
-    for layer in range(NUM_LAYERS):
+    per_layer = layer_kv(fixed_len)
+    for layer, (k, v) in enumerate(per_layer):
         cache.write_range(layer, 0, k, v)
     if fixed_len:
         cache.commit(fixed_len)
-    return k, v
+    return per_layer
 
 
 def row_keys(cache, layer, block_size, i):
@@ -140,8 +149,8 @@ def test_reopen_keeps_device_state_in_place(cache):
     """close() then open() refreshes the kernel-facing tensors where they are, so a
     forward captured in a CUDA graph before close() replays on live memory."""
     cache.open()
-    k, v = rand_kv(cache.chunk_tokens)
-    for layer in range(NUM_LAYERS):
+    per_layer = layer_kv(cache.chunk_tokens)
+    for layer, (k, v) in enumerate(per_layer):
         cache.write_range(layer, 0, k, v)
     cache.commit()
     size = cache.causal_block_sizes[-1]
@@ -172,17 +181,18 @@ def test_reopen_keeps_device_state_in_place(cache):
     assert before == after
     assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (0, 0, 0)
     assert cache.table.unique().numel() == cache.num_pages, "fresh pages, no duplicates"
-    for layer in range(NUM_LAYERS):
+    for layer, (k, v) in enumerate(per_layer):
         cache.write_range(layer, 0, k, v)
-    k_back, v_back = read_kv(cache, 1, torch.arange(cache.chunk_tokens, device=DEVICE))
-    torch.testing.assert_close(k_back, k)
-    torch.testing.assert_close(v_back, v)
+    for layer, (k, v) in enumerate(per_layer):
+        k_back, v_back = read_kv(cache, layer, torch.arange(cache.chunk_tokens, device=DEVICE))
+        torch.testing.assert_close(k_back, k)
+        torch.testing.assert_close(v_back, v)
 
 
 def test_pinned_tokens_are_the_first_committed_and_never_evicted(cache):
     """``open(pin_tokens)`` pins the first tokens committed, whatever they are: a
-    prompt longer than a chunk in one commit, then generated tokens up to the pin
-    size inside a later commit, which splits it. They survive every rotation."""
+    prompt in one commit, then generated tokens up to the pin size inside a later
+    commit, which splits it. They survive every rotation, in every layer."""
     tpb, chunk = cache.tokens_per_page, cache.chunk_tokens
     unopened = make_cache(tpb)
     try:
@@ -194,29 +204,28 @@ def test_pinned_tokens_are_the_first_committed_and_never_evicted(cache):
         cache.open(pin_tokens=cache.fixed_capacity + 1)
     prompt, sink = cache.fixed_capacity - 8, 8
     cache.open(pin_tokens=prompt + sink)
-    pk, pv = rand_kv(prompt)
-    for layer in range(NUM_LAYERS):
+    prompts = layer_kv(prompt)
+    for layer, (pk, pv) in enumerate(prompts):
         cache.write_range(layer, 0, pk, pv)
     cache.commit(prompt)
     assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (prompt, 0, prompt)
 
     # The first chunk: its first `sink` tokens complete the pinned part.
-    hk, hv = rand_kv(chunk)
-    for layer in range(NUM_LAYERS):
+    firsts = layer_kv(chunk)
+    for layer, (hk, hv) in enumerate(firsts):
         cache.write_range(layer, cache.past_tokens, hk, hv)
     cache.commit()
     assert (cache.fixed_tokens, cache.history_tokens) == (prompt + sink, chunk - sink)
-    pinned_k, pinned_v = torch.cat([pk, hk[:sink]]), torch.cat([pv, hv[:sink]])
     for _ in range(3 * cache.capacity // chunk):  # cycle the pool several times
-        kk, vv = rand_kv(chunk)
-        for layer in range(NUM_LAYERS):
+        for layer, (kk, vv) in enumerate(layer_kv(chunk)):
             cache.write_range(layer, cache.past_tokens, kk, vv)
         cache.commit()
         assert cache.fixed_tokens == prompt + sink
     for layer in range(NUM_LAYERS):
+        (pk, pv), (hk, hv) = prompts[layer], firsts[layer]
         k_back, v_back = read_kv(cache, layer, torch.arange(prompt + sink, device=DEVICE))
-        torch.testing.assert_close(k_back, pinned_k)
-        torch.testing.assert_close(v_back, pinned_v)
+        torch.testing.assert_close(k_back, torch.cat([pk, hk[:sink]]))
+        torch.testing.assert_close(v_back, torch.cat([pv, hv[:sink]]))
 
 
 def test_commit_beyond_a_chunk_only_into_the_pinned_part(cache):
@@ -264,15 +273,17 @@ def test_write_range_matches_indexed_write(cache):
 def test_eviction_keeps_the_window_and_the_fixed_region(cache):
     """Content check across many chunks with a fixed region that shares a page with the history."""
     fixed = 13
-    pk, pv = open_with_fixed(cache, fixed)
+    prompts = open_with_fixed(cache, fixed)
     tpb, chunk, window = cache.tokens_per_page, cache.chunk_tokens, cache.window_tokens
     allocated = sorted(cache.block_table())
     written = []  # one stamp per committed generator token, oldest first
     saw_stale = saw_rotation = False
 
     for c in range(1, 12):
-        stamp = torch.full((chunk, NUM_KV_HEADS, HEAD_DIM), float(c), device=DEVICE, dtype=DTYPE)
         for layer in range(NUM_LAYERS):
+            stamp = torch.full(
+                (chunk, NUM_KV_HEADS, HEAD_DIM), float(c + 64 * layer), device=DEVICE, dtype=DTYPE
+            )
             cache.write_range(layer, cache.past_tokens, stamp, -stamp)
         before = cache.table_version
         cache.commit()
@@ -291,12 +302,13 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
             hist = torch.arange(fixed, fixed + cache.history_tokens, device=DEVICE)
             k_back, v_back = read_kv(cache, layer, hist)
             expect = torch.tensor(written[-cache.history_tokens :], device=DEVICE, dtype=DTYPE)
+            expect = expect + 64 * layer
             torch.testing.assert_close(k_back[:, 0, 0], expect)
             torch.testing.assert_close(v_back[:, 0, 0], -expect)
             # The fixed region survived every rotation of the page it shares with the history.
             k_p, v_p = read_kv(cache, layer, torch.arange(fixed, device=DEVICE))
-            torch.testing.assert_close(k_p, pk)
-            torch.testing.assert_close(v_p, pv)
+            torch.testing.assert_close(k_p, prompts[layer][0])
+            torch.testing.assert_close(v_p, prompts[layer][1])
 
         # Eviction recycles pages; it never allocates or frees any.
         table = cache.block_table()
@@ -309,81 +321,112 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
     assert saw_rotation, "test geometry should rotate the table"
 
 
-def test_block_rows_present_exactly_the_window(cache):
+def check_rows_present_exactly_the_window(cache, fixed, size, steps=8, expect_stale=True):
     """Every block's row holds the fixed region, exactly ``window_tokens`` of history
-    before the block, the earlier blocks and itself; nothing stale, nothing later,
-    nothing twice. Checked by stamping every token with its position."""
+    before the block (or fewer while the window fills), the earlier blocks it may see
+    and itself; nothing stale, nothing later, nothing twice. Checked by stamping
+    every token with its position and layer."""
     chunk, window = cache.chunk_tokens, cache.window_tokens
-    fixed = 13
+    num_blocks = chunk // size
     cache.open(pin_tokens=fixed)
     for layer in range(NUM_LAYERS):
-        cache.write_range(layer, 0, *stamped_kv(torch.arange(fixed, device=DEVICE)))
+        cache.write_range(layer, 0, *stamped_kv(torch.arange(fixed, device=DEVICE), layer))
     cache.commit(fixed)
-    num_blocks, size = 4, chunk // 4
 
     written: list = []  # stamp of every committed token, oldest first
 
-    def expected_stamps(win_start, start, end):
+    def expected_stamps(start, end, layer):
         # Fixed stamps are their positions; history stamps are the positions the
         # tokens had when written (eviction shifted them since); chunk stamps are
         # current positions. Resident history is the tail of what was committed.
         past = cache.past_tokens
+        win_start = max(fixed, start - window)
         resident = written[len(written) - cache.history_tokens :]
-        return sorted(list(range(fixed)) + resident[win_start - fixed :] + list(range(past, end)))
+        stamps = (
+            list(range(fixed))
+            + resident[win_start - fixed :]
+            + list(range(max(past, win_start), end))
+        )
+        return sorted(t + layer * LAYER_STAMP for t in stamps)
 
-    def check(step):
+    def check_rows(block, count, step):
+        cached = cache.cached_tokens(block)
+        _, kv_len = cache.causal_block_lengths(block)
+        for i in range(count):
+            start = cache.past_tokens + i * block
+            for layer in range(NUM_LAYERS):
+                expected = expected_stamps(start, start + block, layer)
+                if layer == 0:
+                    assert cached[i] == len(expected) - block, f"step {step} block {i}"
+                    assert int(kv_len[i]) == len(expected), f"step {step} block {i}"
+                got = sorted(row_keys(cache, layer, block, i).tolist())
+                assert got == expected, f"step {step} block {i} layer {layer}"
+
+    saw_stale = False
+    for step in range(steps):  # from empty history through saturation and several rotations
         past = cache.past_tokens
         positions = torch.arange(past, past + chunk, device=DEVICE)
-        k, v = stamped_kv(positions)
         for layer in range(NUM_LAYERS):
-            cache.write_chunk(layer, k, v, size)
-        rows = cache.page_table(size)
-        assert rows.shape[0] == num_blocks and rows.dtype == torch.int32
-        cached = cache.cached_tokens(size)
-        _, kv_len = cache.causal_block_lengths(size)
-        for i in range(num_blocks):
-            start, end = past + i * size, past + (i + 1) * size
-            win_start = max(fixed, start - window)
-            expected = expected_stamps(win_start, start, end)
-            assert cached[i] == len(expected) - size
-            assert int(kv_len[i]) == len(expected)
-            for layer in range(NUM_LAYERS):
-                got = row_keys(cache, layer, size, i).tolist()
-                assert sorted(got) == expected, f"step {step} block {i} layer {layer}"
+            cache.write_chunk(layer, *stamped_kv(positions, layer), size)
+        assert cache.page_table(size).shape[0] == num_blocks
+        check_rows(size, num_blocks, step)
         # A one-block forward reads the whole chunk with the same window.
         for layer in range(NUM_LAYERS):
-            cache.write_chunk(layer, k, v, chunk)
-        win_start = max(fixed, past - window)
-        expected = expected_stamps(win_start, past, past + chunk)
-        assert cache.cached_tokens(chunk) == [len(expected) - chunk]
-        for layer in range(NUM_LAYERS):
-            assert sorted(row_keys(cache, layer, chunk, 0).tolist()) == expected
+            cache.write_chunk(layer, *stamped_kv(positions, layer), chunk)
+        check_rows(chunk, 1, step)
         # A shorter forward of the same block size uses the leading blocks only.
-        half = 2 * size
-        for layer in range(NUM_LAYERS):
-            cache.write_chunk(layer, k[:half], v[:half], size)
-        for i in range(2):
-            start, end = past + i * size, past + (i + 1) * size
-            expected = expected_stamps(max(fixed, start - window), start, end)
+        if num_blocks > 1:
+            half = (num_blocks // 2) * size
             for layer in range(NUM_LAYERS):
-                assert sorted(row_keys(cache, layer, size, i).tolist()) == expected
+                k, v = stamped_kv(positions[:half], layer)
+                cache.write_chunk(layer, k, v, size)
+            check_rows(size, num_blocks // 2, step)
         # The shared pages hold the chunk too, for later blocks and chunks.
         for layer in range(NUM_LAYERS):
             k_back, _ = read_kv(cache, layer, positions)
-            torch.testing.assert_close(k_back, k)
-
-    saw_stale = False
-    for step in range(8):  # from empty history through saturation and several rotations
-        check(step)
+            torch.testing.assert_close(k_back, stamped_kv(positions, layer)[0])
         saw_stale |= cache.history_tokens > window
-        written.extend(range(cache.past_tokens, cache.past_tokens + chunk))
+        written.extend(range(past, past + chunk))
         cache.commit()
-    assert saw_stale, "test geometry should hold stale tokens at some step"
+    assert saw_stale or not expect_stale, "test geometry should hold stale tokens at some step"
 
+
+def test_block_rows_present_exactly_the_window(cache):
+    chunk = cache.chunk_tokens
+    check_rows_present_exactly_the_window(cache, fixed=13, size=chunk // 4)
     with pytest.raises(ValueError, match="not declared"):
         cache.causal_block_lengths(chunk // 2)
     with pytest.raises(ValueError, match="not declared"):
         cache.write_chunk(0, *rand_kv(chunk // 2))
+
+
+@pytest.mark.parametrize(
+    "tpb, chunk, size, window, stale",
+    [
+        (16, 24, 4, 20, True),  # window starts on the page holding past: chunk on two pages
+        (16, 32, 8, 12, True),  # window shorter than the chunk: starts inside earlier blocks
+        (32, 40, 40, 8, True),  # window shorter than a page
+        (32, 128, 64, 96, False),  # two blocks of two whole pages; eviction is page-aligned
+    ],
+)
+def test_block_rows_in_odd_geometries(tpb, chunk, size, window, stale):
+    cache = CausalKVCacheManager(
+        num_layers=NUM_LAYERS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        dtype=DTYPE,
+        tokens_per_page=tpb,
+        fixed_capacity=16,
+        window_tokens=window,
+        chunk_tokens=chunk,
+        causal_block_sizes=tuple(dict.fromkeys((chunk, size))),
+    )
+    try:
+        check_rows_present_exactly_the_window(
+            cache, fixed=13, size=size, steps=10, expect_stale=stale
+        )
+    finally:
+        cache.shutdown()
 
 
 def test_causal_block_lengths_follow_the_exact_window(cache):
@@ -513,18 +556,6 @@ def test_rejects_bad_geometry():
             window_tokens=64,
             chunk_tokens=40,
             causal_block_sizes=(40, 7),
-        )
-    with pytest.raises(ValueError, match="earlier blocks"):
-        CausalKVCacheManager(
-            num_layers=1,
-            num_kv_heads=1,
-            head_dim=16,
-            dtype=torch.float16,
-            tokens_per_page=32,
-            fixed_capacity=8,
-            window_tokens=29,  # blocks of 10 in a chunk of 40 need 30
-            chunk_tokens=40,
-            causal_block_sizes=(40, 10),
         )
 
 

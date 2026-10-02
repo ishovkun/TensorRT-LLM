@@ -263,42 +263,47 @@ def indicator_values(watch, first, count):
     return (ids[:, None, None] == watch[None]).to(DTYPE)
 
 
+@pytest.mark.parametrize("commits, sink", [(0, 0), (1, 0), (3, 0), (3, 12)])
 @pytest.mark.parametrize("num_causal_blocks", [1, 4])
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks):
+def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, commits, sink):
     """Exact visible-key sets, no tolerance games: with q = 0 every visible key gets
     the same weight 1/N, so with V one-hot per watched token the output is
     ``[token visible] / N``. An off-by-one window edge, a stale or evicted token
-    read, or a key read twice shows up as a 1, a 0 or a 2 where it should not."""
+    read, or a key read twice shows up as a 1, a 0 or a 2 where it should not.
+    Covers the window filling (0 and 1 commits) and full (3), and ``sink`` generated
+    tokens pinned with the prompt by the first commit."""
     if backend == "trtllm" and cache.tokens_per_page != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(7)
-    prompt, commits = 9, 3
-    hist = commits * CHUNK  # 120 committed: some evicted, some stale, the rest visible
+    prompt = 9
+    fixed = prompt + (sink if commits else 0)
+    hist = commits * CHUNK
     total = prompt + hist + CHUNK
-    # Watch every token of the prompt, the last 79 history tokens (both window
-    # edges of every block, stale ones included) and the whole chunk: 128 ids,
-    # one per (K/V head, dimension).
+    # Watch the prompt, up to the last 79 committed tokens (window edges of every
+    # block and stale tokens), the whole chunk, and ids that never exist: one per
+    # (K/V head, dimension).
     ids = torch.cat(
         [
             torch.arange(prompt),
-            torch.arange(prompt + hist - 79, prompt + hist),
+            torch.arange(prompt + max(0, hist - 79), prompt + hist),
             torch.arange(prompt + hist, total),
         ]
-    ).to(DEVICE)
-    watch = ids.view(NUM_KV_HEADS, HEAD_DIM)
+    )
+    ids = torch.cat([ids, torch.arange(total, total + NUM_KV_HEADS * HEAD_DIM - ids.numel())])
+    watch = ids.to(DEVICE).view(NUM_KV_HEADS, HEAD_DIM)
 
     def keys(n):
         return torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
 
-    cache.open(pin_tokens=prompt)
+    cache.open(pin_tokens=prompt + sink)
     cache.write_range(0, 0, keys(prompt), indicator_values(watch, 0, prompt))
     cache.commit(prompt)
     for c in range(commits):
         first = prompt + c * CHUNK
         cache.write_range(0, cache.past_tokens, keys(CHUNK), indicator_values(watch, first, CHUNK))
         cache.commit()
-    assert cache.history_tokens > WINDOW, "test geometry should hold stale tokens here"
+    assert cache.fixed_tokens == fixed
 
     size = CHUNK // num_causal_blocks
     q = torch.zeros(CHUNK, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
@@ -309,13 +314,16 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks):
     token = torch.arange(CHUNK, device=DEVICE)
     start = token // size * size  # each query's block start within the chunk
     end = start + size
-    # Global ids: prompt [0, prompt), history [prompt, prompt + hist), chunk after.
+    # Ids are sequence positions before any eviction: fixed [0, fixed), then history.
     g = watch.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=0)[None]  # [1, H, D]
-    win_start = (prompt + hist + start - WINDOW)[:, None, None]
-    visible = (g < prompt) | ((g >= win_start) & (g < (prompt + hist + end)[:, None, None]))
-    num_visible = (prompt + torch.clamp(hist + start, max=WINDOW) + size)[:, None, None]
+    block_start = (prompt + hist + start)[:, None, None]
+    win_start = torch.clamp(block_start - WINDOW, min=fixed)
+    visible = (g < fixed) | ((g >= win_start) & (g < (prompt + hist + end)[:, None, None]))
+    num_visible = fixed + (block_start - win_start) + size
     seen = out.float() * num_visible
-    assert torch.allclose(seen, visible.float(), atol=0.05), (
+    # One key too many or too few moves a watched value by 1/N of itself, N <= 113;
+    # bf16 rounding of 1/N is far below that.
+    assert torch.allclose(seen, visible.float(), atol=0.004), (
         f"{(seen.round() != visible.float()).sum().item()} (query, key) pairs wrong"
     )
 
@@ -557,10 +565,10 @@ def test_padding_with_causal_blocks_over_stale_history(cache, backend):
 @pytest.mark.parametrize("block", [32, 64])
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_blocks_of_one_and_two_whole_pages(backend, block):
-    """Causal blocks exactly one page and exactly two pages long, so block starts
-    and ends fall on page boundaries, through several rotations."""
+    """Causal blocks exactly one page and exactly two pages long, several per chunk, so
+    block starts and ends fall on page boundaries, through several rotations."""
     torch.manual_seed(10)
-    prompt, window, chunk = 8, 96, 64
+    prompt, window, chunk = 8, 96, 128
     cache = CausalKVCacheManager(
         num_layers=1,
         num_kv_heads=NUM_KV_HEADS,
@@ -570,7 +578,7 @@ def test_blocks_of_one_and_two_whole_pages(backend, block):
         fixed_capacity=prompt,
         window_tokens=window,
         chunk_tokens=chunk,
-        causal_block_sizes=(64, 32),
+        causal_block_sizes=(128, 64, 32),
     )
     try:
         pk, pv = open_with_prompt(cache, prompt)
@@ -634,13 +642,21 @@ def test_cache_path_refusals(cache, backend):
             attn.forward(q[None], k[None], v[None], batch_size=1, **common)
 
 
-def test_trtllm_forgets_metadata_of_closed_caches():
-    """Metadata holds its cache; once a cache is shut down, building metadata for the
-    next one drops the old entries so a cache per rollout does not leak."""
+def test_trtllm_forgets_metadata_of_shut_down_caches():
+    """Metadata holds its cache. Once a cache is shut down, building metadata for the
+    next one drops the old entries, so a cache per rollout does not leak. A merely
+    closed cache keeps its metadata: graphs captured over it still read it."""
     attn = make_backend("trtllm")
-    caches = []
-    for rollout in range(3):
-        cache = CausalKVCacheManager(
+
+    def held():
+        return {
+            id(e["metadata"].kv_cache_manager)
+            for key, e in attn.metadata._metadata_cache.items()
+            if key[0] == "kv_cache"
+        }
+
+    def new_cache():
+        return CausalKVCacheManager(
             num_layers=1,
             num_kv_heads=NUM_KV_HEADS,
             head_dim=HEAD_DIM,
@@ -651,14 +667,24 @@ def test_trtllm_forgets_metadata_of_closed_caches():
             chunk_tokens=CHUNK,
             causal_block_sizes=(CHUNK, CHUNK // 4),
         )
-        open_with_prompt(cache, 9)
-        attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)
-        attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4)
-        held = {
-            id(e["metadata"].kv_cache_manager)
-            for key, e in attn.metadata._metadata_cache.items()
-            if key[0] == "kv_cache"
-        }
-        assert held == {id(cache)}, f"rollout {rollout}: metadata of closed caches kept"
-        cache.shutdown()
-        caches.append(cache)
+
+    caches = [new_cache() for _ in range(3)]
+    try:
+        for rollout, cache in enumerate(caches):
+            open_with_prompt(cache, 9)
+            attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)
+            attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4)
+            assert held() == {id(cache)}, f"rollout {rollout}: metadata of shut-down caches kept"
+            cache.shutdown()
+        reopened, other = new_cache(), new_cache()
+        caches += [reopened, other]
+        open_with_prompt(reopened, 9)
+        attn.metadata.prepare_with_kv_cache(reopened, 1, CHUNK)
+        reopened.close()
+        open_with_prompt(other, 9)
+        attn.metadata.prepare_with_kv_cache(other, 1, CHUNK)
+        assert held() == {id(reopened), id(other)}, "a closed cache must keep its metadata"
+    finally:
+        for cache in caches:
+            if not cache.is_shut_down:
+                cache.shutdown()

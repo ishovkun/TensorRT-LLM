@@ -82,9 +82,9 @@ class _CausalBlockLayout:
     legitimate pages (at most three: where the fixed region ends, where the window
     starts, where the block starts) and the block's own tokens. ``cached[i]`` counts
     the keys before the block's own tokens. Slots holding fixed or history tokens
-    are copied at ``commit``; slots holding this forward's chunk tokens
-    (earlier blocks' tokens in the block's start page, and the block's own) are
-    written by every ``write_chunk``. All device tensors are persistent views into
+    are copied at ``commit``; slots holding this forward's chunk tokens (earlier
+    blocks' tokens on a partial page, and the block's own) are written by every
+    ``write_chunk``. All device tensors are persistent views into
     the cache's packed buffers, rewritten in place by ``commit``, never
     on the forward path; ``host`` holds numpy views of the same layout on the host
     side of that upload.
@@ -102,8 +102,9 @@ class _CausalBlockLayout:
     # Slot ids (``view_page * tokens_per_page + slot``) of the private slots holding
     # each chunk token as one of its block's own tokens.
     own_slots: torch.Tensor  # [num_blocks*block_size] int64
-    # Earlier blocks' tokens that sit in a block's start page: the chunk token and
-    # the private slot it goes to. A fixed tpb-1 entries per block, padded with a
+    # Earlier blocks' tokens on a block's partial pages (at most two: where its window
+    # starts and where it starts): the chunk token and the private slot it goes to.
+    # A fixed 2*(tpb-1) entries per block, padded with a
     # harmless repeat of the block's own first token, so the first ``n`` blocks'
     # entries are a prefix and a captured forward replays them.
     extra_src: torch.Tensor  # [num_blocks*(tpb-1)] int64 chunk token index
@@ -161,14 +162,6 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 f"causal_block_sizes {tuple(causal_block_sizes)} must be positive and tile the "
                 f"{chunk_tokens}-token chunk"
             )
-        # A block whose window reaches back into the chunk would need the chunk's
-        # tokens in two partial pages of its private region; only its start page is
-        # supported, so every block must see all earlier blocks of its chunk.
-        if window_tokens < chunk_tokens - min(sizes):
-            raise ValueError(
-                f"window_tokens {window_tokens} must cover the earlier blocks of a chunk: at "
-                f"least {chunk_tokens - min(sizes)} for blocks of {min(sizes)}"
-            )
         self.causal_block_sizes = sizes
 
         tpb = tokens_per_page
@@ -183,6 +176,9 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # Private pages: for every block size, each block needs room for up to three
         # partial pages' worth of slots plus its own tokens.
         self._region_pages_for = lambda block_size: ceil_div(3 * (tpb - 1) + block_size, tpb)
+        # This chunk's earlier tokens a block's private region holds: at most two
+        # partial pages of them, where its window starts and where it starts.
+        self._start_entries = 2 * (tpb - 1)
         self._num_private_pages = sum(
             (chunk_tokens // b) * self._region_pages_for(b) for b in sizes
         )
@@ -230,6 +226,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self.page_view_scale = scale // self.kv_factor
 
         self._kv_cache = None
+        self._buffers: List[torch.Tensor] = []
+        self._shut_down = False
         self._pin_tokens = 0
         self._fixed_tokens = 0
         self._history_tokens = 0
@@ -318,22 +316,26 @@ class CausalKVCacheManager(KVCacheManagerV2):
         # lets write_range copy a prompt in few pieces; nothing depends on it.
         pages.sort()
 
+        # Each layer's pool view, looked up once: the lookup goes through the
+        # manager's C++ binding, which torch.compile cannot trace.
+        buffers = [self.get_buffers(layer, kv_layout="HND") for layer in range(self._num_layers)]
+        buf = buffers[0]
+        # Layer ``l``'s page view is layer 0's shifted by ``l`` pages; commit-time
+        # copies address every layer through layer 0's view with that offset.
+        page_bytes = buf[0].numel() * buf.element_size()
+        for layer, layer_buf in enumerate(buffers):
+            if layer_buf is None or layer_buf.data_ptr() != buf.data_ptr() + layer * page_bytes:
+                self._release(kv_cache)
+                raise RuntimeError("K/V pool layout changed: layers are not page-interleaved")
+        self._buffers = buffers
         self._kv_cache = kv_cache
         self._pin_tokens = pin_tokens
         self._fixed_tokens = 0
         self._history_tokens = 0
         self._fixed_pages = 0
-        buf = self.kv_buffer(0)
         device = buf.device
         self._kv_heads_local = buf.shape[2]
         self._rows_per_page = 2 * self._kv_heads_local * self.tokens_per_page
-        # Layer ``l``'s page view is layer 0's shifted by ``l`` pages; commit-time
-        # copies address every layer through layer 0's view with that offset.
-        page_bytes = buf[0].numel() * buf.element_size()
-        for layer in range(1, self._num_layers):
-            if self.kv_buffer(layer).data_ptr() != buf.data_ptr() + layer * page_bytes:
-                self._release(kv_cache)
-                raise RuntimeError("K/V pool layout changed: layers are not page-interleaved")
         scaled = pages * self.page_view_scale
         if self._table is not None:
             # Reopened: the device tensors a captured forward points at stay where they
@@ -372,6 +374,12 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def shutdown(self) -> None:
         self.close()
         super().shutdown()
+        self._shut_down = True
+
+    @property
+    def is_shut_down(self) -> bool:
+        """Whether the pool is gone for good; a closed cache may still be reopened."""
+        return self._shut_down
 
     # ------------------------------------------------------------------ geometry
 
@@ -437,6 +445,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             self._fixed_tokens += pinned
             self._fixed_pages = self._fixed_tokens // self.tokens_per_page
         self._history_tokens += num_tokens - pinned
+        refill = None
         excess = self._history_tokens - self.window_tokens
         if excess > 0:
             drop_pages = excess // self.tokens_per_page
@@ -444,28 +453,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 # Recycle: the oldest pages become the newest free pages. Rotated in
                 # place, so the table's address, which captured graphs hold, never changes.
                 ring = self._table[self._fixed_pages :]
-                old_head = ring[0].clone()
                 torch.ops.trtllm.rotate_rows_(ring, -drop_pages)  # dropped pages go to the tail
                 host_ring = self._host_table[self._fixed_pages :]
+                old_head = int(host_ring[0])
                 host_ring[:] = np.roll(host_ring, -drop_pages)
-                self._refill_shared_page(old_head, ring[0])
+                refill = (old_head, int(host_ring[0]))
                 self._history_tokens -= drop_pages * self.tokens_per_page
                 self._table_version += 1
-        self._refresh_device_state()
-
-    def _refill_shared_page(self, old_page: torch.Tensor, new_page: torch.Tensor) -> None:
-        """Copy the fixed region's tail into the page that now starts the history.
-
-        ``old_page``/``new_page`` are 0-d int32 view indices on the device; indexing
-        with them keeps the commit free of host syncs.
-        """
-        tail = self._fixed_tokens % self.tokens_per_page
-        if tail == 0:
-            return
-        old_page, new_page = old_page.long().view(1), new_page.long().view(1)
-        for layer in range(self._num_layers):
-            buf = self.kv_buffer(layer)
-            buf[new_page, :, :, :tail] = buf[old_page, :, :, :tail]
+        self._refresh_device_state(refill)
 
     # ------------------------------------------------------------------ causal blocks
 
@@ -483,12 +478,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
             }
             i64 = {
                 "own_slots": (n * size,),
-                "extra_src": (n * (tpb - 1),),
-                "extra_dst": (n * (tpb - 1),),
+                "extra_src": (n * self._start_entries,),
+                "extra_dst": (n * self._start_entries,),
             }
             specs.append((size, n, region_pages, i32, i64))
         # Fixed and history slots copied per block: at most three partial pages.
-        piece_capacity = sum(n * 3 * (tpb - 1) for _, n, _, _, _ in specs)
+        # The shared page's refill, then per block at most three partial pages.
+        piece_capacity = tpb + sum(n * 3 * (tpb - 1) for _, n, _, _, _ in specs)
         numel_i32 = sum(int(np.prod(shape)) for *_, i32, _ in specs for shape in i32.values())
         numel_i64 = sum(int(np.prod(shape)) for *_, i64 in specs for shape in i64.values())
         numel_i64 += 2 * piece_capacity
@@ -582,7 +578,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     # ------------------------------------------------------------------ device state
 
-    def _refresh_device_state(self) -> None:
+    def _refresh_device_state(self, refill: Optional[Tuple[int, int]] = None) -> None:
         """Rewrite every kernel-facing device tensor for the current table, fixed region
         and ``past``. Runs on the host in ``open`` and ``commit``, never on the
         forward path."""
@@ -595,16 +591,36 @@ class CausalKVCacheManager(KVCacheManagerV2):
         torch.remainder(self._logical, tpb, out=self._chunk_slots)
         self._chunk_slots.add_(self._view_page, alpha=tpb)
         # Everything else is host arithmetic on the host table, uploaded at the end
-        # with one copy per packed buffer. Those copies wait for the GPU to reach them,
-        # i.e. for the forwards already queued; the next forward needs the new state
-        # anyway, so the wait costs nothing it would not cost otherwise.
-        num_pieces = 0
+        # with one plain copy per packed buffer. The first copy blocks the host until
+        # the GPU has finished the forwards already queued, so the GPU then idles for
+        # the host's remaining commit work and the next launch: a few microseconds
+        # per chunk. Pinned buffers with asynchronous copies would hide that, at the
+        # cost of double-buffering them across commits.
+        # A rotation moves the page the fixed region's tail shares with the history;
+        # its first slots are copied into the page that now starts the history first,
+        # since the private regions' copies below read them from there.
+        num_refill = self._queue_refill(refill)
+        num_pieces = num_refill
         for layout in self._layouts.values():
             num_pieces = self._refresh_layout(layout, num_pieces)
         self._packed_i32.copy_(torch.from_numpy(self._host_i32))
         self._packed_i64.copy_(torch.from_numpy(self._host_i64))
-        if num_pieces:
-            self._copy_pieces(num_pieces)
+        if num_refill:
+            self._copy_pieces(0, num_refill)
+        if num_pieces > num_refill:
+            self._copy_pieces(num_refill, num_pieces)
+
+    def _queue_refill(self, refill: Optional[Tuple[int, int]]) -> int:
+        """Queue the fixed region's tail slots from the shared page's old copy to its
+        new one (view pages ``refill``) at the start of the pieces area; returns the count."""
+        tail = self._fixed_tokens % self.tokens_per_page
+        if refill is None or tail == 0:
+            return 0
+        old_page, new_page = refill
+        slot = np.arange(tail)
+        self._host_piece_src[:tail] = old_page * self._rows_per_page + slot
+        self._host_piece_dst[:tail] = new_page * self._rows_per_page + slot
+        return tail
 
     def _refresh_layout(self, blk: _CausalBlockLayout, num_pieces: int) -> int:
         """Rebuild one block size's host twins for the current state. Appends the fixed
@@ -626,11 +642,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
             blk.cached[i] = sum(b - a for a, b in runs) * self.tokens_per_page + partial.size
             own = self._fill_own_slots(blk, i, region, first=partial.size)
             # Fixed and history tokens are copied now, for every layer; this chunk's
-            # earlier blocks in the start page are written by write_chunk.
+            # earlier blocks on partial pages are written by write_chunk.
             k = np.arange(partial.size)
             static = partial < past
             num_pieces = self._queue_pieces(partial[static], region, k[static], num_pieces)
-            self._fill_start_page(blk, i, partial[~static] - past, region, k[~static], own[0])
+            self._fill_chunk_pieces(blk, i, partial[~static] - past, region, k[~static], own[0])
         blk.host["seq_len_kv"][:] = np.asarray(blk.cached, dtype=np.int32) + size
         return num_pieces
 
@@ -645,7 +661,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def _whole_page_runs(self, spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         """Logical page ranges ``[a, b)`` the spans cover in full."""
         tpb = self.tokens_per_page
-        return [(ceil_div(lo, tpb), hi // tpb) for lo, hi in spans]
+        return [(ceil_div(lo, tpb), max(ceil_div(lo, tpb), hi // tpb)) for lo, hi in spans]
 
     def _partial_page_positions(
         self, spans: List[Tuple[int, int]], runs: List[Tuple[int, int]]
@@ -699,7 +715,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._host_piece_dst[num_pieces:stop] = page * rpp + slot
         return stop
 
-    def _fill_start_page(
+    def _fill_chunk_pieces(
         self,
         blk: _CausalBlockLayout,
         i: int,
@@ -708,12 +724,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
         k: np.ndarray,
         own_first: int,
     ) -> None:
-        """Block ``i``'s entries for this chunk's ``tokens`` that share its start page,
-        written to region slots ``k`` by write_chunk. Padded to a fixed count with a
-        harmless repeat of the block's own first token."""
-        per_block = self.tokens_per_page - 1
+        """Block ``i``'s entries for this chunk's ``tokens`` on its partial pages, written
+        to region slots ``k`` by write_chunk. Padded to a fixed count with a harmless
+        repeat of the block's own first token, also when that token is written by the
+        attention kernel itself (``own_tokens=False``): same value, same slot."""
+        per_block = self._start_entries
         if tokens.size > per_block:
-            raise RuntimeError("more chunk tokens in a start page than a page holds")
+            raise RuntimeError("more chunk tokens on partial pages than two pages hold")
         page, slot = self._region_slot(region, k)
         entries = slice(i * per_block, (i + 1) * per_block)
         src, dst = blk.host["extra_src"][entries], blk.host["extra_dst"][entries]
@@ -722,11 +739,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
         src[: tokens.size] = tokens
         dst[: tokens.size] = page * self.tokens_per_page + slot
 
-    def _copy_pieces(self, count: int) -> None:
-        """Copy the first ``count`` pieces (layer-0 slot rows, uploaded) for every layer,
+    def _copy_pieces(self, first: int, stop: int) -> None:
+        """Copy pieces ``[first, stop)`` (layer-0 slot rows, uploaded) for every layer,
         K and V, every head: one gather and one scatter over the whole pool."""
-        src = (self._piece_src[:count, None] + self._piece_offsets).view(-1)
-        dst = (self._piece_dst[:count, None] + self._piece_offsets).view(-1)
+        src = (self._piece_src[first:stop, None] + self._piece_offsets).view(-1)
+        dst = (self._piece_dst[first:stop, None] + self._piece_offsets).view(-1)
         pool = self.kv_buffer(0)
         pool_rows = pool.view(-1, pool.shape[-1])
         pool_rows.index_copy_(0, dst, pool_rows.index_select(0, src))
@@ -738,10 +755,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
         Base page ``p`` of this layer is ``buf[p * page_view_scale]``.
         """
-        buf = self.get_buffers(layer_idx, kv_layout="HND")
-        if buf is None:
-            raise RuntimeError(f"layer {layer_idx} has no K/V buffer")
-        return buf
+        self._require_open()
+        return self._buffers[layer_idx]
 
     def write_range(self, layer_idx: int, start: int, k: torch.Tensor, v: torch.Tensor) -> None:
         """Write ``k``/``v`` ``[T, num_kv_heads, head_dim]`` at logical ``[start, start + T)``.
@@ -818,10 +833,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
         token and head strides are free, so slices of a fused QKV projection go in
         without a copy. They go to the logical positions from ``past_tokens`` (where
         later blocks and, after commit, later chunks read them) and to the blocks'
-        private regions: the earlier blocks' tokens each block's start page holds,
+        private regions: the earlier blocks' tokens on each block's partial pages,
         and, with ``own_tokens``, each block's own tokens. One scatter kernel reads
-        K/V once for the logical and own-token slots, a second (clean pass only)
-        handles the start pages; both are driven by slot ids rebuilt on
+        K/V once for the logical and own-token slots, a second (several blocks only)
+        handles the partial pages; both are driven by slot ids rebuilt on
         ``commit``, so the write replays correctly inside a CUDA graph.
         A kernel that writes the new tokens into the region itself (trtllm-gen)
         passes ``own_tokens=False``.
@@ -851,7 +866,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             layout.own_slots[:num_tokens] if own_tokens else None,
         )
         if num_blocks > 1:
-            extra = num_blocks * (self.tokens_per_page - 1)
+            extra = num_blocks * self._start_entries
             torch.ops.trtllm.scatter_kv_slots_(
                 buf, k, v, layout.extra_dst[:extra], src=layout.extra_src[:extra]
             )

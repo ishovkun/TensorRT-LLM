@@ -57,9 +57,10 @@ struct ScatterKvSlotsParams
 };
 
 //! Scatter K/V rows into a paged pool. Each source row is read once whatever the number of
-//! destinations. ``elemSize`` is the element size in bytes; the copy is a byte copy, so any dtype.
-//! Copies in the widest of 16, 8, 4, 2 or 1 bytes that divides the row size, every base pointer
-//! and every stride.
+//! destinations. ``k`` and ``v`` must not overlap the pool. Two entries naming the same slot
+//! race; the result is one of the two writes. ``elemSize`` is the element size in bytes; the copy is a byte copy, so
+//! any dtype. Copies in the widest of 16, 8, 4, 2 or 1 bytes that divides the row size, every base pointer and every
+//! stride.
 void invokeScatterKvSlots(ScatterKvSlotsParams const& params, int elemSize, cudaStream_t stream);
 
 } // namespace kernels

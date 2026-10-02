@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -575,13 +590,11 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
 
-        kwargs.update(
-            {
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "seq_len_kv": seq_len_kv,
-            }
-        )
+        # With a K/V cache the caller may pass seq_len: the real token count of the
+        # whole sequence, which padding for the sequence exchange can exceed.
+        if kwargs.get("kv_cache") is None or kwargs.get("seq_len") is None:
+            kwargs["seq_len"] = seq_len
+        kwargs.update({"batch_size": batch_size, "seq_len_kv": seq_len_kv})
         for gate_key in ("gate_compress", "gate_fine"):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
