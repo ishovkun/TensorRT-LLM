@@ -300,6 +300,8 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
 
         # Eviction recycles pages; it never allocates or frees any.
         table = cache.block_table()
+        # The host copy of the table rotates in lockstep with the device one.
+        assert table == (cache.table // cache.page_view_scale).tolist()
         assert sorted(table) == allocated
         assert len(set(table)) == len(table)
 
