@@ -297,25 +297,30 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 self._release(kv_cache)
                 raise RuntimeError("K/V pool layout changed: layers are not page-interleaved")
         scaled = torch.from_numpy(pages * self.page_view_scale).to(device=device, dtype=torch.int32)
-        self._table = scaled[: self.num_pages].clone()
-        self._private = scaled[self.num_pages :].to(torch.int64)
-        rows = self.chunk_tokens * self._kv_heads_local
-        self._k_rows = torch.empty(rows, dtype=torch.int64, device=device)
-        self._v_rows = torch.empty(rows, dtype=torch.int64, device=device)
-        self._logical, self._logical_page, self._slot = (
-            torch.empty(self.chunk_tokens, dtype=torch.int64, device=device) for _ in range(3)
-        )
-        self._view_page = torch.empty(self.chunk_tokens, dtype=torch.int32, device=device)
-        self._head = torch.arange(self._kv_heads_local, dtype=torch.int64, device=device)
-        self._layouts = {}
-        self._block_offsets_size = None
-        first = 0
-        for size in self.causal_block_sizes:
-            n, region_pages = self.chunk_tokens // size, self._region_pages_for(size)
-            self._layouts[size] = self._new_layout(
-                size, self._private[first : first + n * region_pages]
+        if self._table is not None:
+            # Reopened: the device tensors a captured forward points at stay where they
+            # are and only their contents change (layout regions are views of _private).
+            self._table.copy_(scaled[: self.num_pages])
+            self._private.copy_(scaled[self.num_pages :])
+        else:
+            self._table = scaled[: self.num_pages].clone()
+            self._private = scaled[self.num_pages :].to(torch.int64)
+            rows = self.chunk_tokens * self._kv_heads_local
+            self._k_rows = torch.empty(rows, dtype=torch.int64, device=device)
+            self._v_rows = torch.empty(rows, dtype=torch.int64, device=device)
+            self._logical, self._logical_page, self._slot = (
+                torch.empty(self.chunk_tokens, dtype=torch.int64, device=device) for _ in range(3)
             )
-            first += n * region_pages
+            self._view_page = torch.empty(self.chunk_tokens, dtype=torch.int32, device=device)
+            self._head = torch.arange(self._kv_heads_local, dtype=torch.int64, device=device)
+            first = 0
+            for size in self.causal_block_sizes:
+                n, region_pages = self.chunk_tokens // size, self._region_pages_for(size)
+                self._layouts[size] = self._new_layout(
+                    size, self._private[first : first + n * region_pages]
+                )
+                first += n * region_pages
+        self._block_offsets_size = None
         self._table_version += 1
         self._refresh_device_state()
 
@@ -323,9 +328,8 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if self._kv_cache is None:
             return
         kv_cache, self._kv_cache = self._kv_cache, None
-        self._table = self._k_rows = self._v_rows = self._private = None
-        self._logical = self._logical_page = self._view_page = self._slot = self._head = None
-        self._layouts = {}
+        # Device state outlives the sequence so that forwards captured in a CUDA
+        # graph before close() stay valid after the next open().
         self._block_offsets_size = None
         self._release(kv_cache)
 

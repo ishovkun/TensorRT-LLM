@@ -135,6 +135,49 @@ def test_open_backs_every_page_once_and_publishes_the_table(cache):
     cache.close()
 
 
+def test_reopen_keeps_device_state_in_place(cache):
+    """close() then open() refreshes the kernel-facing tensors where they are, so a
+    forward captured in a CUDA graph before close() replays on live memory."""
+    cache.open()
+    k, v = rand_kv(cache.chunk_tokens)
+    for layer in range(NUM_LAYERS):
+        cache.write_range(layer, 0, k, v)
+    cache.commit()
+    size = cache.causal_block_sizes[-1]
+    before = [
+        t.data_ptr()
+        for t in (
+            cache.table,
+            cache.page_table(size),
+            cache.causal_block_lengths(size)[1],
+            cache._k_rows,
+            cache._layout(size).k_rows,
+        )
+    ]
+    cache.close()
+    with pytest.raises(RuntimeError):
+        cache.table
+    cache.open()
+    after = [
+        t.data_ptr()
+        for t in (
+            cache.table,
+            cache.page_table(size),
+            cache.causal_block_lengths(size)[1],
+            cache._k_rows,
+            cache._layout(size).k_rows,
+        )
+    ]
+    assert before == after
+    assert (cache.fixed_tokens, cache.history_tokens, cache.past_tokens) == (0, 0, 0)
+    assert cache.table.unique().numel() == cache.num_pages, "fresh pages, no duplicates"
+    for layer in range(NUM_LAYERS):
+        cache.write_range(layer, 0, k, v)
+    k_back, v_back = read_kv(cache, 1, torch.arange(cache.chunk_tokens, device=DEVICE))
+    torch.testing.assert_close(k_back, k)
+    torch.testing.assert_close(v_back, v)
+
+
 def test_pin_makes_fresh_tokens_or_the_oldest_history_fixed(cache):
     tpb = cache.tokens_per_page
     cache.open()
