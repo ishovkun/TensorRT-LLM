@@ -223,7 +223,7 @@ class _CuDNNPagedShape:
     d: int
     num_pages: int  # pages in the pool view (K/V container length)
     table_len: int  # entries per page-table row (the sequence's own pages)
-    tokens_per_block: int
+    tokens_per_page: int
     q_strides: Tuple[int, ...]
     page_stride: Tuple[int, ...]
 
@@ -550,7 +550,7 @@ class CuDNNAttention(AttentionBackend):
         table_heads, table_dim = 1, 1
         table_dims = [s.num_causal_blocks, table_heads, s.table_len, table_dim]
         q_dims = [s.num_causal_blocks, s.h_q, s.causal_block_size, s.d]
-        kv_container_dims = [s.num_pages, s.h_kv, s.tokens_per_block, s.d]
+        kv_container_dims = [s.num_pages, s.h_kv, s.tokens_per_page, s.d]
         # The output lands in an [S, H, D] buffer per block, described as [B, H, S, D].
         o_strides = [s.causal_block_size * s.h_q * s.d, s.d, s.h_q * s.d, 1]
 
@@ -589,7 +589,7 @@ class CuDNNAttention(AttentionBackend):
             seq_len_kv=lkv_t,
             paged_attention_k_table=pt_t,
             paged_attention_v_table=pt_t,
-            paged_attention_max_seq_len_kv=s.table_len * s.tokens_per_block,
+            paged_attention_max_seq_len_kv=s.table_len * s.tokens_per_page,
         )
         o_t.set_output(True).set_dim(q_dims).set_stride(o_strides).set_data_type(io)
         graph.build([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -684,7 +684,7 @@ class CuDNNAttention(AttentionBackend):
         q_seg = q.view(num_causal_blocks, causal_block_size, num_heads, head_dim)
         buf = kv_cache.kv_buffer(self.layer_idx)
         page_table = kv_cache.page_table(causal_block_size)[:num_causal_blocks]
-        num_pages, _, h_kv, tokens_per_block, _ = buf.shape
+        num_pages, _, h_kv, tokens_per_page, _ = buf.shape
         shape = _CuDNNPagedShape(
             h_q=num_heads,
             h_kv=h_kv,
@@ -693,7 +693,7 @@ class CuDNNAttention(AttentionBackend):
             d=head_dim,
             num_pages=num_pages,
             table_len=page_table.shape[1],
-            tokens_per_block=tokens_per_block,
+            tokens_per_page=tokens_per_page,
             q_strides=(q_seg.stride(0), q_seg.stride(2), q_seg.stride(1), q_seg.stride(3)),
             page_stride=tuple(buf[:, 0].stride()),
         )

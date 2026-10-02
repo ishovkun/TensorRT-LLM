@@ -29,16 +29,16 @@ DEVICE = torch.device("cuda")
 DTYPE = torch.float16  # integer stamps up to 2048 stay exact; bf16 loses them above 256
 
 
-def make_cache(tokens_per_block: int):
+def make_cache(tokens_per_page: int):
     """Geometry that scales with the page size so every test exercises partial
     pages, stale tokens and rotation: chunk is a page plus 8 tokens, window two pages."""
-    tpb = tokens_per_block
+    tpb = tokens_per_page
     return CausalKVCacheManager(
         num_layers=NUM_LAYERS,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=tpb,
+        tokens_per_page=tpb,
         fixed_capacity=tpb + 8,
         window_tokens=2 * tpb,
         chunk_tokens=tpb + 8,
@@ -71,8 +71,8 @@ def read_kv(cache, layer, positions):
     """Gather ``[T, num_kv_heads, head_dim]`` K and V at logical ``positions`` straight from the pool."""
     buf = cache.kv_buffer(layer)
     table = cache.table.long()
-    page = table[positions // cache.tokens_per_block]
-    slot = positions % cache.tokens_per_block
+    page = table[positions // cache.tokens_per_page]
+    slot = positions % cache.tokens_per_page
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
@@ -80,8 +80,8 @@ def write_kv_reference(cache, layer, positions, k, v):
     """Scatter one token at a time; the slow, obviously-correct write ``write_range`` must match."""
     buf = cache.kv_buffer(layer)
     table = cache.table.long()
-    page = table[positions // cache.tokens_per_block]
-    slot = positions % cache.tokens_per_block
+    page = table[positions // cache.tokens_per_page]
+    slot = positions % cache.tokens_per_page
     buf[page, 0, :, slot, :] = k
     buf[page, 1, :, slot, :] = v
 
@@ -104,13 +104,13 @@ def row_keys(cache, layer, block_size, i):
     _, kv_len = cache.causal_block_lengths(block_size)
     n = int(kv_len[i])
     pos = torch.arange(n, device=DEVICE)
-    page = rows[i].long()[pos // cache.tokens_per_block]
-    slot = pos % cache.tokens_per_block
+    page = rows[i].long()[pos // cache.tokens_per_page]
+    slot = pos % cache.tokens_per_page
     return buf[page, 0, 0, slot, 0].float()
 
 
 def test_geometry_holds_fixed_window_stale_and_chunk(cache):
-    tpb = cache.tokens_per_block
+    tpb = cache.tokens_per_page
     assert cache.page_view_scale == NUM_LAYERS, "layers share a slot; one layer's view is strided"
     tokens = cache.fixed_capacity + cache.window_tokens + cache.chunk_tokens
     assert cache.num_pages == -(-tokens // tpb) + 1
@@ -136,7 +136,7 @@ def test_open_backs_every_page_once_and_publishes_the_table(cache):
 
 
 def test_pin_makes_fresh_tokens_or_the_oldest_history_fixed(cache):
-    tpb = cache.tokens_per_block
+    tpb = cache.tokens_per_page
     cache.open()
     with pytest.raises(RuntimeError):
         make_cache(tpb).table  # not open
@@ -188,7 +188,7 @@ def test_pin_makes_fresh_tokens_or_the_oldest_history_fixed(cache):
 def test_write_range_matches_indexed_write(cache):
     """The run-based fast write lands bytes exactly where the per-token write does."""
     open_with_fixed(cache, 20)
-    tpb = cache.tokens_per_block
+    tpb = cache.tokens_per_page
     for start, n in ((0, 20), (20, 40), (7, 3), (tpb - 1, 2 * tpb + 5), (5, cache.capacity - 5)):
         k, v = rand_kv(n)
         positions = torch.arange(start, start + n, device=DEVICE)
@@ -222,7 +222,7 @@ def test_eviction_keeps_the_window_and_the_fixed_region(cache):
     """Content check across many chunks with a fixed region that shares a page with the history."""
     fixed = 13
     pk, pv = open_with_fixed(cache, fixed)
-    tpb, chunk, window = cache.tokens_per_block, cache.chunk_tokens, cache.window_tokens
+    tpb, chunk, window = cache.tokens_per_page, cache.chunk_tokens, cache.window_tokens
     allocated = sorted(cache.block_table())
     written = []  # one stamp per committed generator token, oldest first
     saw_stale = saw_rotation = False
@@ -385,7 +385,7 @@ def test_copy_batch_block_offsets_encodes_the_block_rows(cache):
         cache.copy_batch_block_offsets(
             dst, cache.request_ids(num_blocks), 1, num_blocks, num_blocks
         )
-    cache.set_block_offsets_block_size(size)
+    cache.set_causal_block_size(size)
     cache.copy_batch_block_offsets(dst, cache.request_ids(num_blocks), 1, num_blocks, num_blocks)
     torch.cuda.synchronize()
     rows = cache.page_table(size)
@@ -450,7 +450,7 @@ def test_rejects_bad_geometry():
             num_kv_heads=1,
             head_dim=16,
             dtype=torch.float32,
-            tokens_per_block=32,
+            tokens_per_page=32,
             fixed_capacity=8,
             window_tokens=8,
             chunk_tokens=8,
@@ -462,7 +462,7 @@ def test_rejects_bad_geometry():
             num_kv_heads=1,
             head_dim=16,
             dtype=torch.float16,
-            tokens_per_block=32,
+            tokens_per_page=32,
             fixed_capacity=8,
             window_tokens=64,
             chunk_tokens=40,
@@ -473,7 +473,7 @@ def test_rejects_bad_geometry():
 def test_commit_takes_the_tokens_actually_written(cache):
     """A rollout's first chunk is one frame: committing it must not promote the rest
     of the chunk's slots to history."""
-    tpb = cache.tokens_per_block
+    tpb = cache.tokens_per_page
     open_with_fixed(cache, 9)
     first = tpb + 3  # shorter than a chunk, not a page multiple
     k, v = rand_kv(first)

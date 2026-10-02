@@ -72,7 +72,7 @@ def cache(request):
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=request.param,
+        tokens_per_page=request.param,
         fixed_capacity=PROMPT_CAPACITY,
         window_tokens=WINDOW,
         chunk_tokens=CHUNK,
@@ -122,8 +122,8 @@ def read_kv(cache, layer, positions):
     """Gather ``[T, num_kv_heads, head_dim]`` K and V at logical ``positions`` straight from the pool."""
     buf = cache.kv_buffer(layer)
     table = cache.table.long()
-    page = table[positions // cache.tokens_per_block]
-    slot = positions % cache.tokens_per_block
+    page = table[positions // cache.tokens_per_page]
+    slot = positions % cache.tokens_per_page
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
@@ -154,7 +154,7 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
     torch.manual_seed(0)
     prompt_k, prompt_v = open_with_prompt(cache, prompt_len)
     attn = make_backend(backend)
-    if backend == "trtllm" and cache.tokens_per_block != 32:
+    if backend == "trtllm" and cache.tokens_per_page != 32:
         # trtllm-gen has paged context kernels for 32-token pages only; other sizes
         # would silently drop the prefix, so the backend must refuse them.
         q, k, v = rand_qkv(CHUNK)
@@ -226,7 +226,7 @@ def test_causal_blocks_at_any_alignment(cache, backend):
     """The clean pass: one launch, four causal blocks of 10 sharing pages mid-way,
     each with its own window start, over a rotated table with stale tokens."""
     torch.manual_seed(3)
-    if backend == "trtllm" and cache.tokens_per_block != 32:
+    if backend == "trtllm" and cache.tokens_per_page != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     pk, pv = open_with_prompt(cache, 9)
     history_k, history_v = [], []
@@ -252,7 +252,7 @@ def test_causal_blocks_at_any_alignment(cache, backend):
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
     """``seq_len`` counts the real tokens: a padded chunk behaves like the unpadded one."""
-    if backend == "trtllm" and cache.tokens_per_block != 32:
+    if backend == "trtllm" and cache.tokens_per_page != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(6)
     pk, pv = open_with_prompt(cache, 9)
@@ -285,7 +285,7 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_dirty_steps_overwrite_in_place(cache, backend):
     """Several forwards at the same ``past`` leave only the last K/V in the cache."""
-    if backend == "trtllm" and cache.tokens_per_block != 32:
+    if backend == "trtllm" and cache.tokens_per_page != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(1)
     open_with_prompt(cache, 9)
@@ -308,7 +308,7 @@ def test_graph_replay_survives_commit(cache, backend):
     """A forward captured in a CUDA graph stays correct after commit() moves the cache,
     including across a page rotation: writes land on the new pages and attention
     reads the new lengths. The step loop refreshes TRTLLM metadata before replay."""
-    if backend == "trtllm" and cache.tokens_per_block != 32:
+    if backend == "trtllm" and cache.tokens_per_page != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(5)
     pk, pv = open_with_prompt(cache, 9)

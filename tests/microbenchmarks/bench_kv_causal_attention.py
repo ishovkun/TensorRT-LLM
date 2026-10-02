@@ -180,7 +180,7 @@ def build_cache(
     prompt_len: int,
     window_tokens: int,
     history_chunks: int,
-    tokens_per_block: int,
+    tokens_per_page: int,
     gen,
     num_layers: int = 1,
 ):
@@ -194,7 +194,7 @@ def build_cache(
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=tokens_per_block,
+        tokens_per_page=tokens_per_page,
         fixed_capacity=max(prompt_len, 1),
         window_tokens=window_tokens,
         chunk_tokens=CHUNK,
@@ -248,7 +248,7 @@ def chunk_cycle(args, gen) -> None:
     window = args.window_frames * TOKENS_PER_FRAME
     layers = args.layers
     mgr, _, _, _, _ = build_cache(
-        args.prompt_len, window, args.history_chunks, args.tokens_per_block, gen, layers
+        args.prompt_len, window, args.history_chunks, args.tokens_per_page, gen, layers
     )
     q = torch.randn(CHUNK, NUM_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
     k = torch.randn(CHUNK, NUM_KV_HEADS, HEAD_DIM, device=DEV, dtype=DTYPE, generator=gen)
@@ -355,7 +355,7 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--prompt-len", type=int, default=512)
-    ap.add_argument("--tokens-per-block", type=int, default=32, help="cache page size")
+    ap.add_argument("--tokens-per-page", type=int, default=32, help="cache page size")
     ap.add_argument("--window-frames", type=int, default=96)
     ap.add_argument(
         "--history-chunks",
@@ -399,7 +399,7 @@ def main() -> None:
     gen = torch.Generator(device=DEV).manual_seed(args.seed)
     window = args.window_frames * TOKENS_PER_FRAME
     mgr, kp, vp, k_hist, v_hist = build_cache(
-        args.prompt_len, window, args.history_chunks, args.tokens_per_block, gen
+        args.prompt_len, window, args.history_chunks, args.tokens_per_page, gen
     )
     start = mgr.past_tokens
     seq_len = start + CHUNK
@@ -412,7 +412,7 @@ def main() -> None:
         f"{mgr.history_tokens} [{max(0, mgr.history_tokens - window)} stale] + chunk {CHUNK}) "
         f"in {num_causal_blocks} "
         f"causal block(s) of {causal_block_size}; heads={NUM_HEADS}/{NUM_KV_HEADS} d={HEAD_DIM} "
-        f"page={mgr.tokens_per_block} bf16"
+        f"page={mgr.tokens_per_page} bf16"
     )
 
     trtllm_attn = TrtllmAttention(

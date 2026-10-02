@@ -41,7 +41,7 @@ from .interface import AttentionBackend, AttentionTensorLayout
 # lookup and the attention op falls back to an unfused path that silently ignores
 # the cached prefix. Nothing in the tree exposes this number; it lives in the cubin
 # inventory only.
-TRTLLM_GEN_TOKENS_PER_BLOCK = 32
+TRTLLM_GEN_TOKENS_PER_PAGE = 32
 
 
 class TrtllmAttentionMetadata:
@@ -245,7 +245,7 @@ class TrtllmAttentionMetadata:
                     :num_causal_blocks
                 ],
             )
-            kv_cache.set_block_offsets_block_size(causal_block_size)
+            kv_cache.set_causal_block_size(causal_block_size)
             metadata.prepare()
             cached["prepared"] = True
             cached["kv_state"] = state
@@ -469,11 +469,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
         if k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v.")
-        if kv_cache.tokens_per_block != TRTLLM_GEN_TOKENS_PER_BLOCK:
+        if kv_cache.tokens_per_page != TRTLLM_GEN_TOKENS_PER_PAGE:
             raise NotImplementedError(
-                f"trtllm-gen ships paged context kernels for {TRTLLM_GEN_TOKENS_PER_BLOCK}-token "
-                f"pages only; the cache uses {kv_cache.tokens_per_block}. Build the cache with "
-                f"tokens_per_block={TRTLLM_GEN_TOKENS_PER_BLOCK} or use the CUDNN backend."
+                f"trtllm-gen ships paged context kernels for {TRTLLM_GEN_TOKENS_PER_PAGE}-token "
+                f"pages only; the cache uses {kv_cache.tokens_per_page}. Build the cache with "
+                f"tokens_per_page={TRTLLM_GEN_TOKENS_PER_PAGE} or use the CUDNN backend."
             )
         batch, num_rows, _, _ = q.shape
         if batch != 1 or batch_size != 1 or k.shape[1] != num_rows:

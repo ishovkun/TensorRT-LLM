@@ -126,7 +126,7 @@ def make_cache(chunk, prompt=PROMPT, window=WINDOW):
         num_kv_heads=NUM_KV_HEADS // WORLD,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=TPB,
+        tokens_per_page=TPB,
         fixed_capacity=prompt,
         window_tokens=window,
         chunk_tokens=chunk,
@@ -166,8 +166,8 @@ def make_ulysses(rank, world_size, backend, chunk, prompt=PROMPT, window=WINDOW)
 def read_kv(cache, positions):
     buf = cache.kv_buffer(0)
     table = cache.table.long()
-    page = table[positions // cache.tokens_per_block]
-    slot = positions % cache.tokens_per_block
+    page = table[positions // cache.tokens_per_page]
+    slot = positions % cache.tokens_per_page
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
@@ -305,7 +305,7 @@ def _logic_head_count_guard(rank, world_size, backend):
         num_kv_heads=NUM_KV_HEADS,  # full count: wrong under Ulysses
         head_dim=HEAD_DIM,
         dtype=DTYPE,
-        tokens_per_block=TPB,
+        tokens_per_page=TPB,
         fixed_capacity=PROMPT,
         window_tokens=WINDOW,
         chunk_tokens=chunk,

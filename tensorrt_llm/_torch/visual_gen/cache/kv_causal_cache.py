@@ -116,7 +116,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             Ulysses) is settled by the model before K/V reach the cache; the
             cache is a per-rank pool and knows nothing about the topology.
         head_dim, dtype: K/V geometry.
-        tokens_per_block: page size, a power of two (both paged kernels require
+        tokens_per_page: page size, a power of two (both paged kernels require
             it). Each backend may add its own constraint and raises if unmet.
         fixed_capacity: most tokens the fixed region may hold (prompt, sink frames).
         window_tokens: history each block may see before itself, in tokens
@@ -134,7 +134,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         num_kv_heads: int,
         head_dim: int,
         dtype: torch.dtype,
-        tokens_per_block: int,
+        tokens_per_page: int,
         fixed_capacity: int,
         window_tokens: int,
         chunk_tokens: int,
@@ -143,14 +143,14 @@ class CausalKVCacheManager(KVCacheManagerV2):
     ) -> None:
         if dtype not in _DTYPES:
             raise ValueError(f"CausalKVCacheManager supports bf16/fp16 K/V, got {dtype}")
-        if min(tokens_per_block, window_tokens, chunk_tokens) <= 0 or fixed_capacity < 0:
+        if min(tokens_per_page, window_tokens, chunk_tokens) <= 0 or fixed_capacity < 0:
             raise ValueError(
-                "tokens_per_block, window_tokens, chunk_tokens must be positive "
+                "tokens_per_page, window_tokens, chunk_tokens must be positive "
                 "and fixed_capacity non-negative"
             )
-        if tokens_per_block & (tokens_per_block - 1):
+        if tokens_per_page & (tokens_per_page - 1):
             # cuDNN's paged SDPA and trtllm-gen's KV block array both require it.
-            raise ValueError(f"tokens_per_block must be a power of two, got {tokens_per_block}")
+            raise ValueError(f"tokens_per_page must be a power of two, got {tokens_per_page}")
         sizes = tuple(dict.fromkeys(int(b) for b in causal_block_sizes))
         if not sizes or any(b <= 0 or chunk_tokens % b for b in sizes):
             raise ValueError(
@@ -159,8 +159,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             )
         self.causal_block_sizes = sizes
 
-        tpb = tokens_per_block
-        self.tokens_per_block = tpb
+        tpb = tokens_per_page
         self.fixed_capacity = fixed_capacity
         self.window_tokens = window_tokens
         self.chunk_tokens = chunk_tokens
@@ -264,7 +263,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             kv_cache.stop_committing()
             if not kv_cache.resize(self._pool_tokens):
                 raise RuntimeError(
-                    f"KVCacheManagerV2 could not back {self._pool_tokens // self.tokens_per_block} "
+                    f"KVCacheManagerV2 could not back {self._pool_tokens // self.tokens_per_page} "
                     "pages for the rollout"
                 )
         except Exception:
@@ -289,7 +288,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         buf = self.kv_buffer(0)
         device = buf.device
         self._kv_heads_local = buf.shape[2]
-        self._rows_per_page = 2 * self._kv_heads_local * self.tokens_per_block
+        self._rows_per_page = 2 * self._kv_heads_local * self.tokens_per_page
         # Layer ``l``'s page view is layer 0's shifted by ``l`` pages; commit-time
         # copies address every layer through layer 0's view with that offset.
         page_bytes = buf[0].numel() * buf.element_size()
@@ -342,6 +341,12 @@ class CausalKVCacheManager(KVCacheManagerV2):
         super().shutdown()
 
     # ------------------------------------------------------------------ geometry
+
+    @property
+    def tokens_per_page(self) -> int:
+        """Page size of the K/V pool. The parent class calls it ``tokens_per_block``;
+        in this cache and its backends "block" is only ever a causal block."""
+        return self.tokens_per_block
 
     @property
     def fixed_tokens(self) -> int:
@@ -413,7 +418,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if self._history_tokens:
             self._history_tokens -= grow
         self._fixed_tokens = num_tokens
-        self._fixed_pages = self._fixed_tokens // self.tokens_per_block
+        self._fixed_pages = self._fixed_tokens // self.tokens_per_page
         self._table_version += 1
         self._refresh_device_state()
 
@@ -430,7 +435,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self._history_tokens += num_tokens
         excess = self._history_tokens - self.window_tokens
         if excess > 0:
-            drop_pages = excess // self.tokens_per_block
+            drop_pages = excess // self.tokens_per_page
             if drop_pages:
                 # Recycle: the oldest pages become the newest free pages. Rotated in
                 # place, so the table's address, which captured graphs hold, never changes.
@@ -438,7 +443,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
                 old_head = ring[0].clone()
                 torch.ops.trtllm.rotate_rows_(ring, -drop_pages)  # dropped pages go to the tail
                 self._refill_shared_page(old_head, ring[0])
-                self._history_tokens -= drop_pages * self.tokens_per_block
+                self._history_tokens -= drop_pages * self.tokens_per_page
                 self._table_version += 1
         self._refresh_device_state()
 
@@ -448,7 +453,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         ``old_page``/``new_page`` are 0-d int32 view indices on the device; indexing
         with them keeps the commit free of host syncs.
         """
-        tail = self._fixed_tokens % self.tokens_per_block
+        tail = self._fixed_tokens % self.tokens_per_page
         if tail == 0:
             return
         old_page, new_page = old_page.long().view(1), new_page.long().view(1)
@@ -463,7 +468,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         region_pages = self._region_pages_for(size)
         device = self._table.device
         heads = self._kv_heads_local
-        extra = n * (self.tokens_per_block - 1) * heads
+        extra = n * (self.tokens_per_page - 1) * heads
         return _CausalBlockLayout(
             num_blocks=n,
             block_size=size,
@@ -519,7 +524,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         """
         return self._layout(causal_block_size).rows
 
-    def set_block_offsets_block_size(self, causal_block_size: int) -> None:
+    def set_causal_block_size(self, causal_block_size: int) -> None:
         """Declare the block size the next ``copy_batch_block_offsets`` describes."""
         self._layout(causal_block_size)
         self._block_offsets_size = causal_block_size
@@ -532,7 +537,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         forward path."""
         # Pool viewed as rows of head_dim: row of (page, kv, head, slot) is
         # ((page*2 + kv)*H + head)*tpb + slot, with page already a view index.
-        tpb, heads = self.tokens_per_block, self._kv_heads_local
+        tpb, heads = self.tokens_per_page, self._kv_heads_local
         torch.arange(self.past_tokens, self.past_tokens + self.chunk_tokens, out=self._logical)
         torch.floor_divide(self._logical, tpb, out=self._logical_page)
         torch.index_select(self._table, 0, self._logical_page, out=self._view_page)
@@ -546,7 +551,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
 
     def _refresh_layout(self, blk: _CausalBlockLayout) -> None:
         """Rebuild one block size's rows, lengths and private regions for the current state."""
-        tpb, heads, rpp = self.tokens_per_block, self._kv_heads_local, self._rows_per_page
+        tpb, heads, rpp = self.tokens_per_page, self._kv_heads_local, self._rows_per_page
         table = self._table.cpu().numpy().astype(np.int64)
         regions = blk.regions.cpu().numpy()
         fixed, past, window = self._fixed_tokens, self.past_tokens, self.window_tokens
@@ -624,7 +629,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     def _copy_pieces(self, src: np.ndarray, dst: np.ndarray) -> None:
         """Copy pool slots ``src`` to ``dst`` (layer-0 rows of one slot, all heads implied)
         for every layer, K and V: one gather and one scatter over the whole pool."""
-        tpb, heads, rpp = self.tokens_per_block, self._kv_heads_local, self._rows_per_page
+        tpb, heads, rpp = self.tokens_per_page, self._kv_heads_local, self._rows_per_page
         device = self._table.device
         # Expand slot rows to (layer, kv, head) rows: + layer*rpp + (kv*H + head)*tpb.
         layer = np.arange(self._num_layers, dtype=np.int64)[None, :, None] * rpp
@@ -640,7 +645,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
     # ------------------------------------------------------------------ direct pool access
 
     def kv_buffer(self, layer_idx: int) -> torch.Tensor:
-        """The layer's pool view ``[view_pages, 2, num_kv_heads, tokens_per_block, head_dim]``.
+        """The layer's pool view ``[view_pages, 2, num_kv_heads, tokens_per_page, head_dim]``.
 
         Base page ``p`` of this layer is ``buf[p * page_view_scale]``.
         """
@@ -665,7 +670,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         if not 0 <= start <= start + n <= self.capacity:
             raise ValueError(f"[{start}, {start + n}) outside the cache's {self.capacity} tokens")
         buf = self.kv_buffer(layer_idx)
-        tpb = self.tokens_per_block
+        tpb = self.tokens_per_page
         table = self.block_table()
         if k.dtype != buf.dtype:
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
@@ -703,7 +708,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self, buf: torch.Tensor, first_page: int, count: int, k: torch.Tensor, v: torch.Tensor
     ) -> None:
         """``count`` whole, physically consecutive pages starting at ``first_page``; one copy per tensor."""
-        tpb, vs = self.tokens_per_block, self.page_view_scale
+        tpb, vs = self.tokens_per_page, self.page_view_scale
         dst = slice(first_page * vs, (first_page + count) * vs, vs)
         buf[dst, 0].copy_(k.view(count, tpb, -1, k.shape[-1]).transpose(1, 2))
         buf[dst, 1].copy_(v.view(count, tpb, -1, v.shape[-1]).transpose(1, 2))
@@ -755,7 +760,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
             pool_rows.index_copy_(0, layout.k_rows[:rows], k2)
             pool_rows.index_copy_(0, layout.v_rows[:rows], v2)
         if num_blocks > 1:
-            extra = num_blocks * (self.tokens_per_block - 1) * heads
+            extra = num_blocks * (self.tokens_per_page - 1) * heads
             src = k2.index_select(0, layout.extra_src[:extra])
             pool_rows.index_copy_(0, layout.extra_k_dst[:extra], src)
             torch.index_select(v2, 0, layout.extra_src[:extra], out=src)
@@ -778,7 +783,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         of int32: K offsets then V offsets per sequence, each ``page * index_scale``
         (+ ``kv_offset`` for V) -- the same encoding the manager's device copy uses.
         Every request is a causal block of the size declared with
-        ``set_block_offsets_block_size``; row ``i`` is that block's key sequence.
+        ``set_causal_block_size``; row ``i`` is that block's key sequence.
         """
         ids = list(request_ids)
         if (
@@ -795,7 +800,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         size = self._block_offsets_size
         if size is None or num_seqs > self._layouts[size].num_blocks:
             raise ValueError(
-                f"block offsets for {num_seqs} sequences need set_block_offsets_block_size "
+                f"block offsets for {num_seqs} sequences need set_causal_block_size "
                 f"first with a size that cuts the chunk into at least that many blocks; "
                 f"declared: {size}"
             )
