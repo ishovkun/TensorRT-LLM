@@ -171,14 +171,16 @@ def read_kv(cache, positions):
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
-def forward(attn, cache, q, k, v, rank, causal_block_size=None):
+def forward(attn, cache, q, k, v, rank, causal_block_size=None, seq_len=None):
+    """``q``/``k``/``v`` hold all tokens, padded to a multiple of ``WORLD``; ``seq_len``
+    is the real count (default: all rows). Returns this rank's rows of the output."""
     per = q.shape[0] // WORLD
     out = attn.forward(
         token_slice(q, rank),
         token_slice(k, rank),
         token_slice(v, rank),
         batch_size=1,
-        seq_len=per,
+        seq_len=q.shape[0] if seq_len is None else seq_len,
         kv_cache=cache,
         causal_block_size=causal_block_size,
     )
@@ -259,6 +261,42 @@ def _logic_causal_blocks(
         cache.shutdown()
 
 
+def _logic_padded_first_chunk(rank, world_size, backend):
+    """A one-block first chunk whose length does not divide by the rank count: the
+    model pads it, passes the real ``seq_len``, and the padding is neither
+    attended nor written."""
+    torch.manual_seed(2)  # same tensors on every rank
+    chunk, block = 44, 11  # 11 real tokens on 2 ranks: padded to 12
+    cache = make_cache(chunk)
+    attn, group = make_ulysses(rank, world_size, backend, chunk)
+    try:
+        cache.open()
+        _, pk, pv = rand_qkv(PROMPT)
+        cache.write_range(0, 0, to_head_layout(pk, rank, group), to_head_layout(pv, rank, group))
+        cache.pin_prefix(PROMPT)
+        q, k, v = rand_qkv(block)
+        pad = (-block) % world_size
+        padded = [torch.cat([x, torch.randn_like(x[:pad])]) for x in (q, k, v)]
+        out = forward(attn, cache, *padded, rank, causal_block_size=block, seq_len=block)
+        torch.cuda.synchronize()
+
+        empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        full = exact_reference(q, pk, pv, empty, empty, k, v, 0, block, WINDOW)
+        full = torch.cat([full, full.new_zeros((pad, NUM_HEADS, HEAD_DIM))])
+        per = (block + pad) // world_size
+        expected = full[rank * per : (rank + 1) * per]
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+        positions = torch.arange(cache.past_tokens, cache.past_tokens + block, device="cuda")
+        k_back, v_back = read_kv(cache, positions)
+        torch.testing.assert_close(k_back, head_slice(k, rank))
+        torch.testing.assert_close(v_back, head_slice(v, rank))
+        cache.commit(block)
+        assert cache.history_tokens == block
+    finally:
+        cache.shutdown()
+
+
 def _logic_head_count_guard(rank, world_size, backend):
     """A cache built for the wrong head count is refused, not silently written."""
     chunk = 40
@@ -294,6 +332,11 @@ def test_causal_blocks_under_ulysses(backend):
     run_distributed(
         functools.partial(_logic_causal_blocks, backend=backend, chunk=40, num_causal_blocks=4)
     )
+
+
+@pytest.mark.parametrize("backend", ["cudnn", "trtllm"])
+def test_padded_first_chunk_under_ulysses(backend):
+    run_distributed(functools.partial(_logic_padded_first_chunk, backend=backend))
 
 
 @pytest.mark.parametrize("backend", ["cudnn", "trtllm"])

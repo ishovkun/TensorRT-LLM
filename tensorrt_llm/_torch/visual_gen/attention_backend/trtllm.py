@@ -356,12 +356,17 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             k: Key tensor [B, S_kv, H_kv, D] or None if fused
             v: Value tensor [B, S_kv, H_kv, D] or None if fused
             batch_size: Batch size
-            seq_len: Sequence length for Q
+            seq_len: Number of real query tokens. Without ``kv_cache`` it equals
+                ``S``. With ``kv_cache`` it may be smaller: rows of ``q``/``k``/``v``
+                past ``seq_len`` are padding added so the sequence splits evenly
+                across ranks; they are neither written to the cache nor attended,
+                and their output rows are zero.
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: the fused kernel writes them at ``past_tokens`` and
                 attends over everything cached before them plus themselves.
+                ``batch_size`` must be 1.
             timestep: Keyword; normalized diffusion timestep forwarded to
                 timestep-varying sparse attention (no effect otherwise).
             causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts
@@ -369,10 +374,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 block, causal across blocks. Use it when the cache must hold each
                 block's K/V as if the blocks had been generated one at a time, so later
                 blocks never leak into earlier ones. Absent: one causal block.
-            num_valid_tokens: Keyword understood by the ``kv_cache`` path only. The
-                number of leading tokens of ``S`` that are real; the rest is padding
-                added so the sequence splits evenly across ranks. Padding is neither
-                written nor attended, and its output rows are zero.
 
         Returns:
             Output tensor [B, S, H*D]
@@ -387,12 +388,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 kv_cache,
                 kwargs.pop("causal_block_size", None),
                 attention_mask,
-                kwargs.pop("num_valid_tokens", None),
             )
-        else:
-            output = self._forward_without_kv_cache(
-                q, k, v, batch_size, seq_len, attention_mask, seq_len_kv, **kwargs
-            )
+            return output.view(1, q.shape[1], -1)
+        output = self._forward_without_kv_cache(
+            q, k, v, batch_size, seq_len, attention_mask, seq_len_kv, **kwargs
+        )
         return output.view(batch_size, seq_len, -1)
 
     def _forward_without_kv_cache(
@@ -407,11 +407,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Plain diffusion attention; returns ``[B*S, H*D]``."""
-        for keyword in ("causal_block_size", "num_valid_tokens"):
-            if keyword in kwargs:
-                raise NotImplementedError(
-                    f"{keyword} is only implemented over a K/V cache; pass kv_cache."
-                )
+        if "causal_block_size" in kwargs:
+            raise NotImplementedError(
+                "causal_block_size is only implemented over a K/V cache; pass kv_cache."
+            )
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         timestep = kwargs.pop("timestep", None)
@@ -461,9 +460,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         kv_cache: CausalKVCacheManager,
         causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
-        num_valid_tokens: Optional[int],
     ) -> torch.Tensor:
-        """Attention over ``kv_cache`` with the new tokens; returns ``[S, H*D]``."""
+        """Attention over ``kv_cache`` with the ``seq_len`` real new tokens; returns
+        ``[S, H*D]`` with zero rows past ``seq_len``."""
         if attention_mask != PredefinedAttentionMask.FULL:
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_attention_config is not None:
@@ -476,8 +475,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 f"pages only; the cache uses {kv_cache.tokens_per_block}. Build the cache with "
                 f"tokens_per_block={TRTLLM_GEN_TOKENS_PER_BLOCK} or use the CUDNN backend."
             )
-        batch, num_tokens, _, _ = q.shape
-        if (batch, num_tokens) != (1, seq_len) or batch_size != 1 or k.shape[1] != num_tokens:
+        batch, num_rows, _, _ = q.shape
+        if batch != 1 or batch_size != 1 or k.shape[1] != num_rows:
             raise ValueError(
                 "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
             )
@@ -485,13 +484,14 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise ValueError(
                 f"k has {k.shape[2]} heads but the cache holds {kv_cache.num_kv_heads} per rank."
             )
-        total_tokens = num_tokens
-        if num_valid_tokens is not None:
-            if not 0 < num_valid_tokens <= num_tokens:
-                raise ValueError(f"num_valid_tokens {num_valid_tokens} outside (0, {num_tokens}]")
-            if num_valid_tokens < num_tokens:
-                num_tokens = num_valid_tokens
-                q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
+        if not 0 < seq_len <= num_rows:
+            raise ValueError(
+                f"seq_len {seq_len} outside (0, {num_rows}]: it counts the real tokens; "
+                "rows past it are padding."
+            )
+        num_tokens = seq_len
+        if num_tokens < num_rows:
+            q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
         causal_block_size = causal_block_size or num_tokens
         if num_tokens % causal_block_size:
             raise ValueError(
@@ -507,9 +507,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
         )
-        if num_tokens == total_tokens:
+        if num_tokens == num_rows:
             return output
-        full = output.new_empty(total_tokens, output.shape[-1])
+        full = output.new_empty(num_rows, output.shape[-1])
         full[:num_tokens].copy_(output.view(num_tokens, -1))
         full[num_tokens:].zero_()
         return full

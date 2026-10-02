@@ -251,7 +251,7 @@ def test_causal_blocks_at_any_alignment(cache, backend):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
-    """``num_valid_tokens``: a padded chunk behaves exactly like the unpadded one."""
+    """``seq_len`` counts the real tokens: a padded chunk behaves like the unpadded one."""
     if backend == "trtllm" and cache.tokens_per_block != 32:
         pytest.skip("trtllm-gen: 32-token pages only")
     torch.manual_seed(6)
@@ -264,9 +264,8 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
         k[None],
         v[None],
         batch_size=1,
-        seq_len=CHUNK + pad,
+        seq_len=CHUNK,
         kv_cache=cache,
-        num_valid_tokens=CHUNK,
     ).reshape(CHUNK + pad, NUM_HEADS, HEAD_DIM)
     torch.cuda.synchronize()
     expected = reference_attention(
@@ -278,16 +277,9 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
     k_back, v_back = read_kv(cache, 0, positions)
     torch.testing.assert_close(k_back, k[:CHUNK])
     torch.testing.assert_close(v_back, v[:CHUNK])
-    with pytest.raises(ValueError):
-        attn.forward(
-            q[None],
-            k[None],
-            v[None],
-            batch_size=1,
-            seq_len=CHUNK + pad,
-            kv_cache=cache,
-            num_valid_tokens=0,
-        )
+    for bad in (0, CHUNK + pad + 1):
+        with pytest.raises(ValueError):
+            attn.forward(q[None], k[None], v[None], batch_size=1, seq_len=bad, kv_cache=cache)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

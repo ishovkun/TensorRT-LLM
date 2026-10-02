@@ -70,8 +70,11 @@ class UlyssesAttention(AttentionBackend):
     Wraps any attention backend with sequence parallelism via all-to-all.
     Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
     Fully transparent to backend-specific kwargs: everything in ``**kwargs``
-    is forwarded to the inner backend unchanged (except ``seq_len`` which is
-    overridden with the post-all-to-all value).
+    is forwarded to the inner backend unchanged, except ``seq_len``: callers pass
+    the per-rank shard length and the wrapper replaces it with the gathered
+    length. With a ``kv_cache`` the caller's ``seq_len`` is the number of real
+    tokens, the same on every rank, and is passed through untouched; rows past
+    it are padding from the exchange.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
@@ -159,8 +162,13 @@ class UlyssesAttention(AttentionBackend):
             )
 
         # The fused path stacks q/k/v on one axis, which needs equal head counts;
-        # grouped-query models take the per-tensor path.
-        if self.inner_backend.support_fused_qkv() and q.shape[2] == k.shape[2]:
+        # grouped-query models take the per-tensor path, and so does the K/V cache
+        # path, whose backends take q, k, v separately.
+        if (
+            self.inner_backend.support_fused_qkv()
+            and q.shape[2] == k.shape[2]
+            and kwargs.get("kv_cache") is None
+        ):
             return self._forward_fused(q, k, v, **kwargs)
         return self._forward_unfused(q, k, v, **kwargs)
 
@@ -240,11 +248,12 @@ class UlyssesAttention(AttentionBackend):
             if gate_fine is not None:
                 gate_fine = gate_fine.transpose(1, 2)
 
-        # Caller passed pre-A2A (sharded) seq_lens; hand the inner
-        # backend the post-A2A lengths instead.
         kwargs["batch_size"] = batch_size
-        kwargs["seq_len"] = seq_len_full
-        kwargs["seq_len_kv"] = kv_seq_len_full
+        if kwargs.get("kv_cache") is None:
+            # Caller passed pre-A2A (sharded) seq_lens; hand the inner
+            # backend the post-A2A lengths instead.
+            kwargs["seq_len"] = seq_len_full
+            kwargs["seq_len_kv"] = kv_seq_len_full
         if gate_compress is not None:
             kwargs["gate_compress"] = gate_compress
         if gate_fine is not None:

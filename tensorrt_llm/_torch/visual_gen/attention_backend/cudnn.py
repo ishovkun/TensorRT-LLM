@@ -636,23 +636,23 @@ class CuDNNAttention(AttentionBackend):
         causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
         key_padding_mask: Optional[torch.Tensor],
-        num_valid_tokens: Optional[int],
+        seq_len: Optional[int],
     ) -> torch.Tensor:
         """Write ``k``/``v`` at ``past_tokens``, then attend over the cache.
 
-        ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video.
-        ``causal_block_size`` cuts the ``S`` new tokens into consecutive causal blocks that are
-        causal across each other (``None``: one causal block). Output is ``[1, S, H, D]``.
-        With ``num_valid_tokens`` only that prefix of the ``S`` tokens is real: it alone is
-        written and attended, and the output rows beyond it are zero.
+        ``q``, ``k``, ``v`` are ``[1, S, H, D]`` / ``[1, S, H_kv, D]``: one video. The
+        first ``seq_len`` rows are real (``None``: all of them); rows past that are
+        padding and are neither written nor attended. ``causal_block_size`` cuts the
+        real tokens into consecutive causal blocks that are causal across each other
+        (``None``: one causal block). Output is ``[1, S, H, D]`` with zero padding rows.
         """
         if self._resolve_mask(attention_mask, key_padding_mask):
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_dtype is not None:
             raise NotImplementedError("cuDNN paged K/V cache attention runs unquantized only.")
         self._validate_inputs(q, k, v)
-        batch, num_tokens, num_heads, head_dim = q.shape
-        if batch != 1 or k.shape[1] != num_tokens:
+        batch, num_rows, num_heads, head_dim = q.shape
+        if batch != 1 or k.shape[1] != num_rows:
             raise ValueError(
                 "K/V cache attention takes one video: q, k, v of [1, S, heads, head_dim]."
             )
@@ -662,13 +662,14 @@ class CuDNNAttention(AttentionBackend):
             )
         if q.stride(3) != 1:
             raise ValueError("q must be contiguous along head_dim.")
-        total_tokens = num_tokens
-        if num_valid_tokens is not None:
-            if not 0 < num_valid_tokens <= num_tokens:
-                raise ValueError(f"num_valid_tokens {num_valid_tokens} outside (0, {num_tokens}]")
-            if num_valid_tokens < num_tokens:
-                num_tokens = num_valid_tokens
-                q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
+        num_tokens = num_rows if seq_len is None else seq_len
+        if not 0 < num_tokens <= num_rows:
+            raise ValueError(
+                f"seq_len {seq_len} outside (0, {num_rows}]: it counts the real tokens; "
+                "rows past it are padding."
+            )
+        if num_tokens < num_rows:
+            q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
         causal_block_size = causal_block_size or num_tokens
         if num_tokens % causal_block_size:
             raise ValueError(
@@ -697,9 +698,9 @@ class CuDNNAttention(AttentionBackend):
             page_stride=tuple(buf[:, 0].stride()),
         )
         bundle = self._get_or_build_paged_graph(shape, self.scale, buf.dtype, device)
-        full = torch.empty(1, total_tokens, num_heads, head_dim, dtype=buf.dtype, device=device)
+        full = torch.empty(1, num_rows, num_heads, head_dim, dtype=buf.dtype, device=device)
         output = full[:, :num_tokens]
-        if num_tokens < total_tokens:
+        if num_tokens < num_rows:
             full[:, num_tokens:].zero_()
         tensor_map = {
             bundle.inputs["q"]: q_seg,
@@ -950,15 +951,16 @@ class CuDNNAttention(AttentionBackend):
             kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: they are written at ``past_tokens`` and attention runs
                 over everything cached before them plus themselves.
+            seq_len: Keyword understood by the ``kv_cache`` path only. Number of real
+                tokens; absent, all ``S_q`` rows are real. When smaller than ``S_q``,
+                the rows past it are padding added so the sequence splits evenly
+                across ranks; they are neither written to the cache nor attended, and
+                their output rows are zero.
             causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts
-                the new tokens into consecutive causal blocks: full attention within a
+                the real tokens into consecutive causal blocks: full attention within a
                 block, causal across blocks. Use it when the cache must hold each
                 block's K/V as if the blocks had been generated one at a time, so later
                 blocks never leak into earlier ones. Absent: one causal block.
-            num_valid_tokens: Keyword understood by the ``kv_cache`` path only. The
-                number of leading tokens of ``S_q`` that are real; the rest is
-                padding added so the sequence splits evenly across ranks. Padding is
-                neither written nor attended, and its output rows are zero.
 
         Returns:
             Output tensor ``[B, S_q, H, D_v]``.
@@ -972,13 +974,12 @@ class CuDNNAttention(AttentionBackend):
                 kwargs.pop("causal_block_size", None),
                 attention_mask,
                 key_padding_mask,
-                kwargs.pop("num_valid_tokens", None),
+                kwargs.pop("seq_len", None),
             )
-        for keyword in ("causal_block_size", "num_valid_tokens"):
-            if keyword in kwargs:
-                raise NotImplementedError(
-                    f"{keyword} is only implemented over a K/V cache; pass kv_cache."
-                )
+        if "causal_block_size" in kwargs:
+            raise NotImplementedError(
+                "causal_block_size is only implemented over a K/V cache; pass kv_cache."
+            )
         output, _ = self._run(
             q, k, v, is_causal=self._resolve_mask(attention_mask, key_padding_mask), with_lse=False
         )
