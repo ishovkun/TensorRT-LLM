@@ -166,7 +166,11 @@ class UlyssesAttention(AttentionBackend):
             # rows past it are padding; a caller passing its own shard length would
             # silently drop real tokens.
             rows = q.shape[1] * self.world_size
-            seq_len = kwargs.setdefault("seq_len", rows)
+            seq_len = kwargs.get("seq_len")
+            if seq_len is None:
+                raise ValueError(
+                    "with a K/V cache, pass seq_len: the real token count of the chunk"
+                )
             if self.world_size > 1 and not q.shape[1] < seq_len <= rows:
                 raise ValueError(
                     f"seq_len {seq_len} with a K/V cache must count the real tokens of the whole "

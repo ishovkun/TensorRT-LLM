@@ -590,10 +590,13 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
 
-        # With a K/V cache the caller may pass seq_len: the real token count of the
-        # whole sequence, which padding for the sequence exchange can exceed.
-        if kwargs.get("kv_cache") is None or kwargs.get("seq_len") is None:
+        # With a K/V cache the caller states seq_len, the real token count of the
+        # whole sequence: the rows here may include padding for the sequence
+        # exchange, and under Ulysses they are one rank's shard.
+        if kwargs.get("kv_cache") is None:
             kwargs["seq_len"] = seq_len
+        elif kwargs.get("seq_len") is None:
+            raise ValueError("with a K/V cache, pass seq_len: the real token count of the chunk")
         kwargs.update({"batch_size": batch_size, "seq_len_kv": seq_len_kv})
         for gate_key in ("gate_compress", "gate_fine"):
             if kwargs.get(gate_key) is not None:

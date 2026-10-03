@@ -515,6 +515,8 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
     assert make_backend("trtllm").support_kv_cache()
     q = torch.zeros(1, 8, NUM_HEADS * HEAD_DIM, device=DEVICE, dtype=DTYPE)
     with pytest.raises(NotImplementedError, match="does not support a K/V cache"):
+        attn._attn_impl(q, q, q, kv_cache=cache, seq_len=8)
+    with pytest.raises(ValueError, match="pass seq_len"):
         attn._attn_impl(q, q, q, kv_cache=cache)
 
 
