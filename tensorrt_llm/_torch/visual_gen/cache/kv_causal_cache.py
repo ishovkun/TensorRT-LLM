@@ -127,9 +127,12 @@ class CausalKVCacheManager(KVCacheManagerV2):
         window_tokens: history each block may see before itself, in tokens
             (``(window_frames - 1) * tokens_per_frame``).
         chunk_tokens: tokens written per forward (``chunk_frames * tokens_per_frame``).
-        causal_block_sizes: every causal block size a forward may use; each must tile
-            the chunk. The whole chunk as one block is a denoising step; one frame per
-            block is the clean pass. Each size gets its own private pages.
+        causal_block_sizes: every causal block size a forward may use, at most the
+            chunk. A forward of ``T`` tokens cut into blocks of size ``b`` needs ``b``
+            declared and ``T`` a multiple of ``b`` within the chunk: the whole chunk as
+            one block is a denoising step, one frame per block is the clean pass, a
+            shorter final chunk as one block is its own size. Each size gets its own
+            private pages, ``chunk // b`` blocks' worth.
     """
 
     def __init__(
@@ -157,10 +160,10 @@ class CausalKVCacheManager(KVCacheManagerV2):
             # cuDNN's paged SDPA and trtllm-gen's KV block array both require it.
             raise ValueError(f"tokens_per_page must be a power of two, got {tokens_per_page}")
         sizes = tuple(dict.fromkeys(int(b) for b in causal_block_sizes))
-        if not sizes or any(b <= 0 or chunk_tokens % b for b in sizes):
+        if not sizes or any(not 0 < b <= chunk_tokens for b in sizes):
             raise ValueError(
-                f"causal_block_sizes {tuple(causal_block_sizes)} must be positive and tile the "
-                f"{chunk_tokens}-token chunk"
+                f"causal_block_sizes {tuple(causal_block_sizes)} must be positive and at most "
+                f"the {chunk_tokens}-token chunk"
             )
         self.causal_block_sizes = sizes
 
@@ -765,40 +768,64 @@ class CausalKVCacheManager(KVCacheManagerV2):
         pages go one group of physically consecutive pages at a time. For the fixed
         region and for tests; the per-forward write is ``write_chunk``.
         """
-        self._require_open()
-        n = k.shape[0]
         if v.shape != k.shape:
             raise ValueError(f"k/v shape mismatch: {tuple(k.shape)} vs {tuple(v.shape)}")
+        buf = self.kv_buffer(layer_idx)
+        if k.dtype != buf.dtype:
+            raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
+        self._for_each_page_run(
+            start,
+            k.shape[0],
+            lambda page, slot, t0, t1: self._write_page_slots(buf, page, slot, k[t0:t1], v[t0:t1]),
+            lambda page, count, t0, t1: self._write_whole_pages(
+                buf, page, count, k[t0:t1], v[t0:t1]
+            ),
+        )
+
+    def zero_values(self, layer_idx: int, start: int, num_tokens: int) -> None:
+        """Zero the V vectors (all heads) of logical ``[start, start + num_tokens)`` in
+        one layer, leaving K as written. Eager, host-addressed, like ``write_range``."""
+        buf = self.kv_buffer(layer_idx)
+        vs = self.page_view_scale
+
+        def slots(page, slot, t0, t1):
+            buf[page * vs, 1, :, slot : slot + t1 - t0].zero_()
+
+        def whole(page, count, t0, t1):
+            buf[page * vs : (page + count) * vs : vs, 1].zero_()
+
+        self._for_each_page_run(start, num_tokens, slots, whole)
+
+    def _for_each_page_run(self, start: int, n: int, on_slots, on_whole_pages) -> None:
+        """Walk logical ``[start, start + n)`` as page runs: ``on_slots(page, slot, t0,
+        t1)`` for a partial page at either end, ``on_whole_pages(first_page, count,
+        t0, t1)`` for physically consecutive whole pages; ``t0:t1`` index the tokens."""
+        self._require_open()
         if n == 0:
             return
         if not 0 <= start <= start + n <= self.capacity:
             raise ValueError(f"[{start}, {start + n}) outside the cache's {self.capacity} tokens")
-        buf = self.kv_buffer(layer_idx)
         tpb = self.tokens_per_page
         table = self.block_table()
-        if k.dtype != buf.dtype:
-            raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
-
         end = start + n
         first_whole, end_whole = ceil_div(start, tpb), end // tpb  # whole pages [first, end)
         if first_whole > end_whole:  # the whole range lies inside one page
-            self._write_page_slots(buf, table[start // tpb], start % tpb, k, v)
+            on_slots(table[start // tpb], start % tpb, 0, n)
             return
         if start % tpb:
             head = first_whole * tpb - start
-            self._write_page_slots(buf, table[start // tpb], start % tpb, k[:head], v[:head])
+            on_slots(table[start // tpb], start % tpb, 0, head)
         page_idx = first_whole
         while page_idx < end_whole:
             run_end = page_idx + 1
             while run_end < end_whole and table[run_end] == table[run_end - 1] + 1:
                 run_end += 1
-            t0 = page_idx * tpb - start
-            t1 = run_end * tpb - start
-            self._write_whole_pages(buf, table[page_idx], run_end - page_idx, k[t0:t1], v[t0:t1])
+            on_whole_pages(
+                table[page_idx], run_end - page_idx, page_idx * tpb - start, run_end * tpb - start
+            )
             page_idx = run_end
         if end % tpb:
-            tail = end_whole * tpb - start
-            self._write_page_slots(buf, table[end_whole], 0, k[tail:], v[tail:])
+            on_slots(table[end_whole], 0, end_whole * tpb - start, n)
 
     def _write_page_slots(
         self, buf: torch.Tensor, page: int, slot: int, k: torch.Tensor, v: torch.Tensor
@@ -855,8 +882,11 @@ class CausalKVCacheManager(KVCacheManagerV2):
             raise TypeError(f"K/V dtype {k.dtype} does not match the cache's {buf.dtype}")
         size = causal_block_size or num_tokens
         layout = self._layout(size)
-        if num_tokens % size:
-            raise ValueError(f"{num_tokens} tokens do not split into causal blocks of {size}")
+        if num_tokens % size or num_tokens > layout.num_blocks * size:
+            raise ValueError(
+                f"{num_tokens} tokens do not split into at most {layout.num_blocks} causal "
+                f"blocks of {size}"
+            )
         num_blocks = num_tokens // size
         torch.ops.trtllm.scatter_kv_slots_(
             buf,

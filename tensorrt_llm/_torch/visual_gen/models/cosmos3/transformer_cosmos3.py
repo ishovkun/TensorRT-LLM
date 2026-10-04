@@ -17,7 +17,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Callable, ContextManager, Optional, Tuple, TypeVar
+from typing import Any, Callable, ContextManager, Optional, Tuple, TypeVar
 
 import torch
 import torch.nn as nn
@@ -31,6 +31,11 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sim_packing import (
+    SIM_CONFIG_KEY,
+    FramePacking,
+    sim_position_ids,
+)
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -641,7 +646,10 @@ class Cosmos3CrossAttention(Attention):
         module_name: Optional[str] = None,
     ):
         original_backend = model_config.attention.backend
-        if model_config.attention.backend == "TRTLLM":
+        # The bidirectional path cannot use TRTLLM here; the Sim path runs it over
+        # the K/V cache and keeps whatever backend the config asks for.
+        is_sim = getattr(model_config.pretrained_config, SIM_CONFIG_KEY, None) is not None
+        if model_config.attention.backend == "TRTLLM" and not is_sim:
             # TRTLLM backend is not supported for Cosmos3CrossAttention
             model_config.attention.backend = "VANILLA"
             # Warn once per (module class, requested, resolved) triple so the
@@ -700,6 +708,15 @@ class Cosmos3CrossAttention(Attention):
             [B, S_gen, hidden_size] cross-attention output
         """
         batch_size, seq_len_gen = hidden_states.shape[:2]
+        if (
+            type(self.attn).__name__ == "TrtllmAttention"
+            or getattr(getattr(self.attn, "inner_backend", None), "__class__", type(None)).__name__
+            == "TrtllmAttention"
+        ):
+            raise NotImplementedError(
+                "Cosmos3 bidirectional cross-attention does not run on the TRTLLM backend; "
+                "a Sim checkpoint keeps it for the causal path (forward_causal) only."
+            )
 
         q, k, v = self.get_qkv(hidden_states)
 
@@ -738,6 +755,40 @@ class Cosmos3CrossAttention(Attention):
                 timestep=timestep,
             )
 
+        return self.to_out[0](out)
+
+    def forward_causal(
+        self,
+        hidden_states: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        *,
+        kv_cache: Any,
+        seq_len: int,
+        causal_block_size: int,
+        timestep=None,
+    ) -> torch.Tensor:
+        """Attention over the K/V cache: the prompt and the history are read from it,
+        the chunk's own K/V are written to it. ``hidden_states`` is ``[1, S_rows, D]``,
+        this rank's shard with padding under sequence parallelism; ``seq_len`` is the
+        chunk's real token count."""
+        batch_size, rows = hidden_states.shape[:2]
+        q, k, v = self.get_qkv(hidden_states)
+        q = q.view(batch_size, rows, self.local_num_attention_heads, self.head_dim)
+        k = k.view(batch_size, rows, self.local_num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, rows, self.local_num_key_value_heads, self.head_dim)
+        q, k = self.apply_qk_norm(q, k)
+        q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
+        out = self._attn_impl(
+            q,
+            k,
+            v,
+            attention_mask=PredefinedAttentionMask.FULL,
+            timestep=timestep,
+            kv_cache=kv_cache,
+            seq_len=seq_len,
+            causal_block_size=causal_block_size,
+        )
         return self.to_out[0](out)
 
 
@@ -901,6 +952,36 @@ class Cosmos3GenDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
+    def forward_causal(
+        self,
+        hidden_states: torch.Tensor,
+        freqs: Tuple[torch.Tensor, torch.Tensor],
+        *,
+        kv_cache: Any,
+        seq_len: int,
+        causal_block_size: int,
+        timestep=None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        cos, sin = freqs
+        hidden_states = self.cross_attention.forward_causal(
+            hidden_states,
+            cos,
+            sin,
+            kv_cache=kv_cache,
+            seq_len=seq_len,
+            causal_block_size=causal_block_size,
+            timestep=timestep,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        B, S, D = hidden_states.shape
+        hidden_states = self.mlp(hidden_states.view(-1, D)).view(B, S, D)
+        return residual + hidden_states
 
 
 def _compute_default_rope_parameters(
@@ -1141,6 +1222,11 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         ulysses_size = vgm.ulysses_size if vgm else 1
         ring_size = vgm.ring_size if vgm else 1
         head_divisibility_factor = tp_size * ulysses_size
+        # K/V heads one rank's attention backend holds: tensor parallelism shards
+        # the projections, Ulysses splits what is left across its ranks.
+        self.cache_kv_heads = self.num_kv_heads // head_divisibility_factor
+        self._ulysses_rank = vgm.ulysses_rank if vgm else 0
+        self._sim_rope: Optional[tuple] = None  # (key, (cos, sin)) of the current chunk shape
 
         if (ulysses_size > 1 or tp_size > 1) and (
             self.num_attention_heads % head_divisibility_factor != 0
@@ -1475,7 +1561,183 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self.cached_kv = None
         self.cached_freqs_gen = None
         self.cached_freqs_gen_combined = None
+        self._sim_rope = None
         self.domain_ids_validated = False
+
+    # -------------------------------------------------------------------------
+    # Sim: the chunked causal rollout
+    # -------------------------------------------------------------------------
+
+    def write_prompt_kv(
+        self,
+        kv_cache: Any,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
+    ) -> int:
+        """Run the reasoner tower once and write every layer's text K/V at the start
+        of ``kv_cache``: this rank's heads, the prompt's real length, no padding.
+        The caller opens the cache with that many pinned tokens and commits them
+        afterwards. Returns the prompt length."""
+        if text_ids.shape[0] != 1:
+            raise ValueError("Cosmos3 Sim runs one video at a time.")
+        text_len = int(text_mask.sum().item())
+        if text_len > kv_cache.fixed_capacity:
+            raise ValueError(
+                f"prompt of {text_len} tokens exceeds the checkpoint's text cache of "
+                f"{kv_cache.fixed_capacity} tokens"
+            )
+        device, dtype = text_ids.device, self.vae2llm.weight.dtype
+        freqs_und, _ = self._compute_rope_freqs(text_mask, 1, 1, 1, None, device, dtype)
+        with offload_context("reasoner"):
+            layers_kv = self.language_model(text_ids, text_mask, freqs_und)
+        heads = self.cache_kv_heads
+        first = self._ulysses_rank * heads
+        for layer, (k, v) in enumerate(layers_kv):
+            kv_cache.write_range(
+                layer,
+                0,
+                k[0, :text_len, first : first + heads],
+                v[0, :text_len, first : first + heads],
+            )
+        return text_len
+
+    def forward_causal(
+        self,
+        hidden_states: torch.Tensor,
+        raw_timestep: torch.Tensor,
+        *,
+        kv_cache: Any,
+        first_frame: int,
+        text_len: int,
+        action_latents: torch.Tensor,
+        action_domain_ids: Optional[torch.Tensor] = None,
+        clean_pass: bool = False,
+        fps: float | None = None,
+        action_fps: float | None = None,
+        timestep: Optional[torch.Tensor] = None,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
+    ) -> Optional[TransformerOutput]:
+        """One forward of a chunk over the K/V cache.
+
+        ``hidden_states`` ``[1, C, n, H, W]`` are the chunk's ``n`` latent frames,
+        starting at absolute latent frame ``first_frame``; ``action_latents``
+        ``[1, n * A, action_dim]`` their action rows, frame-major. Each frame is
+        packed as its ``A`` action rows then its vision tokens.
+
+        A denoising forward (``clean_pass=False``) attends the whole chunk as one
+        causal block over the prompt and the history and returns the velocities.
+        The clean pass runs the finished chunk at ``raw_timestep = 0`` as one causal
+        block per frame, so each frame's stored K/V saw only frames up to itself,
+        and returns ``None``: only the K/V it leaves in the cache matter. The
+        caller commits the chunk afterwards.
+        """
+        if hidden_states.shape[0] != 1:
+            raise ValueError("Cosmos3 Sim runs one video at a time.")
+        if not self.action_gen:
+            raise ValueError("Cosmos3 Sim needs the transformer's action modules.")
+        T, H, W = hidden_states.shape[2:]
+        Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
+        if action_latents.shape[1] % T:
+            raise ValueError(
+                f"{action_latents.shape[1]} action rows do not split over {T} latent frames"
+            )
+        packing = FramePacking(T, action_latents.shape[1] // T, Hp * Wp)
+        if action_domain_ids is None:
+            action_domain_ids = torch.zeros(1, dtype=torch.long, device=hidden_states.device)
+        if not self.domain_ids_validated:
+            self.action_proj_in.validate_domain_ids(action_domain_ids.to(torch.long).reshape(-1))
+            self.domain_ids_validated = True
+        if action_latents.dtype != self.action_proj_in.dtype:
+            raise ValueError(
+                "Cosmos3 action latents must match the action projection dtype: "
+                f"latents={action_latents.dtype}, projection={self.action_proj_in.dtype}."
+            )
+
+        hidden_vis = self.vae2llm(self.patchify(hidden_states, T, H, W))
+        with torch.autocast("cuda", enabled=True, dtype=torch.float32):
+            time_embed = self.time_embedder(raw_timestep * self.timestep_scale)
+        time_embed = time_embed.to(hidden_vis.dtype).unsqueeze(1)
+        hidden_vis = hidden_vis + time_embed
+        hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
+        hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
+        hidden_action = hidden_action + time_embed
+        hidden = packing.interleave(hidden_vis, hidden_action)
+
+        cos, sin = self._sim_rope_tables(
+            packing, (Hp, Wp), first_frame, text_len, fps, action_fps, hidden.device, hidden.dtype
+        )
+        num_tokens = packing.num_tokens
+        hidden = self.sharder.shard(hidden, dim=1, pad_to_multiple=True)
+        cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
+        sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
+        block = packing.tokens_per_frame if clean_pass else num_tokens
+
+        with offload_context("generator"):
+            for layer in self.gen_layers:
+                hidden = layer.forward_causal(
+                    hidden,
+                    (cos, sin),
+                    kv_cache=kv_cache,
+                    seq_len=num_tokens,
+                    causal_block_size=block,
+                    timestep=timestep,
+                )
+
+        if clean_pass:
+            if first_frame == 0:
+                # Frame 0 carries a null action: later frames must not read values
+                # from its action slots. The cache keeps the keys, zeroes the values.
+                action_slots, _ = packing.frame_slices(0)
+                start = kv_cache.past_tokens + action_slots.start
+                for layer in range(len(self.gen_layers)):
+                    kv_cache.zero_values(layer, start, packing.action_tokens)
+            return None
+
+        hidden = self.sharder.gather(hidden, dim=1, unpad_to=num_tokens)
+        hidden = self.norm_moe_gen(hidden)
+        vision, action = packing.split(hidden)
+        video_vel = self.unpatchify(self.llm2vae(vision), T, H, W)
+        action_vel = self.unpack_action(self.action_proj_out(action, action_domain_ids))
+        return TransformerOutput(video=video_vel, image=video_vel, audio=None, action=action_vel)
+
+    def _sim_rope_tables(
+        self,
+        packing: FramePacking,
+        grid: Tuple[int, int],
+        first_frame: int,
+        text_len: int,
+        fps: float | None,
+        action_fps: float | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rotary cos/sin ``[1, S, 1, D]`` of a chunk, built once per chunk shape and
+        position: the four denoising forwards and the clean pass share them."""
+        fps = fps if fps is not None else self.base_fps
+        action_fps = action_fps if action_fps is not None else fps
+        key = (packing, grid, first_frame, text_len, fps, action_fps, device, dtype)
+        if self._sim_rope is not None and self._sim_rope[0] == key:
+            return self._sim_rope[1]
+        ids = sim_position_ids(
+            packing,
+            first_frame=first_frame,
+            grid_h=grid[0],
+            grid_w=grid[1],
+            text_len=text_len,
+            temporal_modality_margin=self.unified_3d_mrope_temporal_modality_margin,
+            fps=fps,
+            action_fps=action_fps,
+            base_fps=self.base_fps,
+            temporal_compression_factor=self.temporal_compression_factor,
+            enable_fps_modulation=self.enable_fps_modulation,
+        )
+        position_ids = ids.unsqueeze(1).to(device)  # [3, 1, S]
+        _dummy = torch.tensor([], dtype=dtype, device=device)
+        cos, sin = self.language_model.rotary_emb(_dummy, position_ids=position_ids)
+        tables = (cos.unsqueeze(2), sin.unsqueeze(2))
+        self._sim_rope = (key, tables)
+        return tables
 
     def forward(
         self,

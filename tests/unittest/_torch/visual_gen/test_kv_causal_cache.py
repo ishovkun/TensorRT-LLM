@@ -545,7 +545,7 @@ def test_rejects_bad_geometry():
             chunk_tokens=8,
             causal_block_sizes=(8,),
         )
-    with pytest.raises(ValueError, match="tile"):
+    with pytest.raises(ValueError, match="at most"):
         CausalKVCacheManager(
             num_layers=1,
             num_kv_heads=1,
@@ -555,7 +555,7 @@ def test_rejects_bad_geometry():
             fixed_capacity=8,
             window_tokens=64,
             chunk_tokens=40,
-            causal_block_sizes=(40, 7),
+            causal_block_sizes=(40, 41),
         )
 
 

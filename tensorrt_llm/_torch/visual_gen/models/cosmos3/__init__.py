@@ -14,5 +14,6 @@
 # limitations under the License.
 
 from .pipeline_cosmos3 import Cosmos3OmniMoTPipeline
+from .pipeline_sim import Cosmos3NanoSimBimanualPipeline
 
-__all__ = ["Cosmos3OmniMoTPipeline"]
+__all__ = ["Cosmos3NanoSimBimanualPipeline", "Cosmos3OmniMoTPipeline"]

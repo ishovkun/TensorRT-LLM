@@ -524,7 +524,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # the chunk here.
         kv_cache.write_chunk(self.layer_idx, k[0], v[0], causal_block_size, own_tokens=False)
         metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
-        qkv = self._concat_qkv(q, k, v, 1, num_tokens, num_tokens)
+        qkv = torch.cat(
+            [q.reshape(num_tokens, -1), k.reshape(num_tokens, -1), v.reshape(num_tokens, -1)],
+            dim=-1,
+        )
         output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
         )
