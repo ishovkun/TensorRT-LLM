@@ -1655,13 +1655,15 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             )
 
         hidden_vis = self.vae2llm(self.patchify(hidden_states, T, H, W))
-        with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder(raw_timestep * self.timestep_scale)
-        time_embed = time_embed.to(hidden_vis.dtype).unsqueeze(1)
-        hidden_vis = hidden_vis + time_embed
+        if not clean_pass:
+            # Only noised tokens carry the timestep embedding. Action rows are
+            # conditioning on this path and the clean pass holds finished frames,
+            # so neither gets it.
+            with torch.autocast("cuda", enabled=True, dtype=torch.float32):
+                time_embed = self.time_embedder(raw_timestep * self.timestep_scale)
+            hidden_vis = hidden_vis + time_embed.to(hidden_vis.dtype).unsqueeze(1)
         hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
         hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
-        hidden_action = hidden_action + time_embed
         hidden = packing.interleave(hidden_vis, hidden_action)
 
         cos, sin = self._sim_rope_tables(
@@ -1685,13 +1687,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 )
 
         if clean_pass:
-            if first_frame == 0:
-                # Frame 0 carries a null action: later frames must not read values
-                # from its action slots. The cache keeps the keys, zeroes the values.
-                action_slots, _ = packing.frame_slices(0)
-                start = kv_cache.past_tokens + action_slots.start
-                for layer in range(len(self.gen_layers)):
-                    kv_cache.zero_values(layer, start, packing.action_tokens)
             return None
 
         hidden = self.sharder.gather(hidden, dim=1, unpad_to=num_tokens)

@@ -227,6 +227,8 @@ def test_first_chunk_matches_the_bidirectional_forward():
                 fps=24.0,
                 action_latents=actions,
                 action_domain_ids=domain,
+                # conditioning rows, as the pipeline passes them: no timestep embedding
+                action_noisy_mask=torch.zeros(1, actions.shape[1], 1, device=DEVICE),
                 action_start_frame_offset=-(A - 1),  # rows of frames 0.., as the Sim packing
             )
             model.reset_cache()
@@ -327,36 +329,6 @@ def test_rollout_is_independent_of_the_chunking(model):
     for i, label in enumerate(("video", "action")):
         off_floor = fraction_off(floor[i], one[i])
         assert_same_model_output(split[i], one[i], label=label, off_floor=off_floor)
-
-
-def test_frame_zero_action_values_are_zeroed_after_its_clean_pass(model):
-    cache = make_cache(model)
-    try:
-        open_with_prompt(model, cache)
-        latents, actions = frames(1, seed=5, channels=model.latent_channel_size)
-        with torch.inference_mode():
-            model.forward_causal(
-                latents,
-                torch.zeros(1, device=DEVICE),
-                kv_cache=cache,
-                first_frame=0,
-                text_len=TEXT_LEN,
-                action_latents=actions,
-                clean_pass=True,
-                fps=24.0,
-            )
-        torch.cuda.synchronize()
-        for layer in range(len(model.gen_layers)):
-            buf = cache.kv_buffer(layer)
-            table = cache.table.long()
-            pos = torch.arange(TEXT_LEN, TEXT_LEN + A, device=DEVICE)
-            page, slot = table[pos // cache.tokens_per_page], pos % cache.tokens_per_page
-            assert buf[page, 1, :, slot].abs().max().item() == 0.0, f"layer {layer}: V not zeroed"
-            assert buf[page, 0, :, slot].abs().max().item() > 0.0, f"layer {layer}: K lost"
-        cache.commit(A + (H // 2) * (W // 2))
-        assert cache.history_tokens == A + (H // 2) * (W // 2)
-    finally:
-        cache.shutdown()
 
 
 def test_rollout_past_the_window_stays_bounded(model):
