@@ -22,13 +22,14 @@ class_name`` fallback, where it would load and produce wrong video.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Sequence
 
 import torch
 
 from ...cache import CausalKVCacheManager
 from ...pipeline_registry import register_pipeline
+from .action import normalize_action_mode
 from .pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from .sim_packing import SIM_CONFIG_KEY
 
@@ -37,6 +38,15 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+@dataclass(frozen=True)
+class SimEmbodiment:
+    """One embodiment the checkpoint was trained on: its domain id and the width
+    of the action rows it expects (``None`` where the block does not say)."""
+
+    domain_id: Optional[int]
+    action_dim: Optional[int]
 
 
 @dataclass(frozen=True)
@@ -63,6 +73,10 @@ class Cosmos3SimSettings:
     action_tokens_per_frame: int = 4
     """Action rows packed before each frame's vision tokens."""
     video_temporal_causal: bool = True
+    embodiments: dict[str, SimEmbodiment] = field(default_factory=dict)
+    """Embodiments declared under ``conditioning.embodiments``, by lower-case name."""
+    default_embodiment: Optional[str] = None
+    """``conditioning.default_embodiment``: used when a request names no domain."""
 
     @property
     def history_frames(self) -> int:
@@ -87,6 +101,20 @@ class Cosmos3SimSettings:
         chunk_frames = int(_get(block, "chunk_size", cls.chunk_frames))
         partition = _get(block, "chunk_partition") or (1, chunk_frames)
         conditioning = _get(block, "conditioning") or {}
+        # Schema 3 names the width per embodiment (`raw_action_dim`); schema 5 has
+        # `input_action_dim` per embodiment and one `input_contract.action_dim`.
+        contract_dim = _get(_get(conditioning, "input_contract") or {}, "action_dim")
+        embodiments = {}
+        for name, spec in (_get(conditioning, "embodiments") or {}).items():
+            width = _get(spec, "input_action_dim")
+            if width is None:
+                width = _get(spec, "raw_action_dim", contract_dim)
+            domain_id = _get(spec, "domain_id")
+            embodiments[str(name).lower()] = SimEmbodiment(
+                domain_id=None if domain_id is None else int(domain_id),
+                action_dim=None if width is None else int(width),
+            )
+        default_embodiment = _get(conditioning, "default_embodiment")
         settings = cls(
             sigmas=tuple(float(s) for s in t_list),
             chunk_frames=chunk_frames,
@@ -100,9 +128,51 @@ class Cosmos3SimSettings:
             video_temporal_causal=bool(
                 _get(block, "video_temporal_causal", cls.video_temporal_causal)
             ),
+            embodiments=embodiments,
+            default_embodiment=None
+            if default_embodiment is None
+            else str(default_embodiment).lower(),
         )
         settings.validate()
         return settings
+
+    def action_contract(
+        self,
+        domain_name: Optional[str],
+        domain_id: Optional[int],
+        raw_action_dim: Optional[int],
+    ) -> tuple[Optional[str], Optional[int], Optional[int]]:
+        """Complete a request's ``(domain_name, domain_id, raw_action_dim)`` from the
+        checkpoint's embodiment table: a missing domain falls back to the declared
+        default, a missing id or width is filled in, and a given one that disagrees
+        with the checkpoint is an error. Embodiments the checkpoint does not list
+        pass through untouched."""
+        if (domain_name is None or not str(domain_name).strip()) and domain_id is None:
+            domain_name = self.default_embodiment
+        if domain_name is not None and str(domain_name).strip():
+            name = str(domain_name).strip().lower()
+        else:
+            name = next(
+                (n for n, e in self.embodiments.items() if e.domain_id == int(domain_id)), None
+            )
+        spec = self.embodiments.get(name) if name is not None else None
+        if spec is None:
+            return domain_name, domain_id, raw_action_dim
+        if spec.domain_id is not None:
+            if domain_id is not None and int(domain_id) != spec.domain_id:
+                raise ValueError(
+                    f"Cosmos3 Sim domain_id={domain_id} contradicts the checkpoint, which "
+                    f"maps {name!r} to domain_id={spec.domain_id}."
+                )
+            domain_id = spec.domain_id
+        if spec.action_dim is not None:
+            if raw_action_dim is not None and int(raw_action_dim) != spec.action_dim:
+                raise ValueError(
+                    f"Cosmos3 Sim raw_action_dim={raw_action_dim} contradicts the checkpoint, "
+                    f"which expects {spec.action_dim} values per action row for {name!r}."
+                )
+            raw_action_dim = spec.action_dim
+        return name, domain_id, raw_action_dim
 
     def validate(self) -> None:
         if min(self.chunk_frames, self.window_frames, self.text_cache_max_len) <= 0:
@@ -158,6 +228,29 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             pipeline_config.primary_pretrained_config
         )
         self._sim_caches: dict[int, CausalKVCacheManager] = {}
+
+    def _resolve_request(
+        self,
+        *,
+        action_mode: Optional[str],
+        domain_name: Optional[str],
+        domain_id: Optional[int],
+        raw_action_dim: Optional[int],
+        **kwargs: Any,
+    ):
+        """The checkpoint, not the generic embodiment table, says which domain id and
+        action width an embodiment has on this model."""
+        if normalize_action_mode(action_mode) is not None:
+            domain_name, domain_id, raw_action_dim = self.sim.action_contract(
+                domain_name, domain_id, raw_action_dim
+            )
+        return super()._resolve_request(
+            action_mode=action_mode,
+            domain_name=domain_name,
+            domain_id=domain_id,
+            raw_action_dim=raw_action_dim,
+            **kwargs,
+        )
 
     # ------------------------------------------------------------------ the rollout
 
@@ -307,4 +400,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         return rows
 
 
-__all__ = ["Cosmos3NanoSimBimanualPipeline", "Cosmos3SimSettings", "SIM_CONFIG_KEY"]
+__all__ = [
+    "Cosmos3NanoSimBimanualPipeline",
+    "Cosmos3SimSettings",
+    "SIM_CONFIG_KEY",
+    "SimEmbodiment",
+]
