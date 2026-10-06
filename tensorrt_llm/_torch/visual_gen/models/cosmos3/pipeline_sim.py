@@ -262,9 +262,15 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         self.sim = Cosmos3SimSettings.from_pretrained_config(
             pipeline_config.primary_pretrained_config
         )
-        # Finished frames a chunk may read. Declared by the checkpoint, or settled
-        # once by warmup from the memory left at the largest served shape.
-        self._history_frames: Optional[int] = self.sim.history_frames
+        # Finished frames a chunk may read: settled once by warmup from the memory
+        # left at the largest served shape, capped at the longest clip. A window the
+        # checkpoint block declares is informational; the references run full history.
+        self._history_frames: Optional[int] = None
+        if self.sim.window_frames is not None:
+            logger.info(
+                f"Cosmos3 Sim checkpoint declares window_frames={self.sim.window_frames}; "
+                "running full history within the memory budget instead."
+            )
         # One cache is resident at a time, keyed by its frame geometry.
         self._sim_cache_obj: Optional[CausalKVCacheManager] = None
         self._sim_cache_key: Optional[int] = None
@@ -316,9 +322,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         return [self.sim.max_pixel_frames]
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
-        """Warm up at the given shape. With no declared window, the run uses a
-        two-chunk cache, its peak is measured, and the window is sized from what
-        is left, the way the LLM executor sizes its K/V pool."""
+        """Warm up at the given shape over a two-chunk cache, measure the peak, and
+        size the window from what is left, the way the LLM executor sizes its K/V
+        pool. A second warmup shape reuses the window already settled."""
         if self._history_frames is not None:
             super()._run_warmup(height, width, num_frames, steps)
             return
