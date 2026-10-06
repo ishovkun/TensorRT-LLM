@@ -974,6 +974,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
     def forward_causal(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
         *,
         kv_cache: Any,
@@ -981,10 +982,13 @@ class Cosmos3GenDecoderLayer(nn.Module):
         causal_block_size: int,
         timestep=None,
     ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        """``hidden_states`` is the layer's input already normalised by
+        ``input_layernorm``; ``residual`` is the residual stream, updated in place.
+        Returns the MLP output, not yet added: the caller fuses that add with the
+        next norm. One kernel does residual += attention and the post-attention
+        norm (fp32 math, weight in fp32, one rounding)."""
         cos, sin = freqs
-        hidden_states = self.cross_attention.forward_causal(
+        attn = self.cross_attention.forward_causal(
             hidden_states,
             cos,
             sin,
@@ -993,13 +997,14 @@ class Cosmos3GenDecoderLayer(nn.Module):
             causal_block_size=causal_block_size,
             timestep=timestep,
         )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        B, S, D = hidden_states.shape
-        hidden_states = self.mlp(hidden_states.view(-1, D)).view(B, S, D)
-        return residual + hidden_states
+        B, S, D = attn.shape
+        torch.ops.trtllm.flashinfer_fused_add_rmsnorm(
+            attn.view(-1, D),
+            residual.view(-1, D),
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon,
+        )
+        return self.mlp(attn.view(-1, D)).view(B, S, D)
 
 
 def _compute_default_rope_parameters(
@@ -1739,22 +1744,43 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
         block = packing.tokens_per_frame if clean_pass else num_tokens
 
+        # The residual stream lives in ``residual``; ``x`` is the normalised input of
+        # the next sub-block. Each layer's output add and the following norm are one
+        # kernel, including the final norm.
+        residual = hidden.contiguous()
+        D = residual.shape[-1]
+        x = torch.ops.trtllm.flashinfer_rmsnorm(
+            residual.view(-1, D),
+            self.gen_layers[0].input_layernorm.weight,
+            self.gen_layers[0].input_layernorm.variance_epsilon,
+        ).view_as(residual)
         with offload_context("generator"):
-            for layer in self.gen_layers:
-                hidden = layer.forward_causal(
-                    hidden,
+            for i, layer in enumerate(self.gen_layers):
+                x = layer.forward_causal(
+                    x,
+                    residual,
                     (cos, sin),
                     kv_cache=kv_cache,
                     seq_len=num_tokens,
                     causal_block_size=block,
                     timestep=timestep,
                 )
-
-        if clean_pass:
-            return None
+                if clean_pass and i + 1 == len(self.gen_layers):
+                    return None
+                next_norm = (
+                    self.gen_layers[i + 1].input_layernorm
+                    if i + 1 < len(self.gen_layers)
+                    else self.norm_moe_gen
+                )
+                torch.ops.trtllm.flashinfer_fused_add_rmsnorm(
+                    x.view(-1, D),
+                    residual.view(-1, D),
+                    next_norm.weight,
+                    next_norm.variance_epsilon,
+                )
+        hidden = x
 
         hidden = self.sharder.gather(hidden, dim=1, unpad_to=num_tokens)
-        hidden = self.norm_moe_gen(hidden)
         vision, action = packing.split(hidden)
         video_vel = self.unpatchify(self.llm2vae(vision), T, H, W)
         action_vel = self.unpack_action(self.action_proj_out(action, action_domain_ids))
