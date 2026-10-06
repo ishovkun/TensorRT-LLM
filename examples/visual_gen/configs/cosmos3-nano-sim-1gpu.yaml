@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# 1-GPU Cosmos3 Nano Sim deployment (chunked causal rollout over a K/V cache).
+# Model: nvidia/Cosmos3-Nano-Sim-Bimanual
+# Shared by offline examples (--visual_gen_args) and trtllm-serve.
+#
+# The causal rollout reads finished frames from a paged K/V cache, which needs
+# an attention backend that can attend over it: TRTLLM (trtllm-gen) or CUDNN.
+# Chunk size, denoising schedule, history window and action layout come from
+# the checkpoint. Warmup runs the largest shape the checkpoint serves and sizes
+# the cache from the memory left; kv_cache_config.free_gpu_memory_fraction is
+# the share of that memory the cache may take.
+attention_config:
+  backend: TRTLLM
+parallel_config:
+  cfg_size: 1
+  ulysses_size: 1
+kv_cache_config:
+  free_gpu_memory_fraction: 0.9

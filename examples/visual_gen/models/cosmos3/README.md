@@ -19,6 +19,7 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
 - [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
+- [`nvidia/Cosmos3-Nano-Sim-Bimanual`](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Bimanual) — autoregressive simulator for bimanual manipulation: a first frame plus a recorded action trajectory produce the video the actions cause, chunk by chunk, each chunk attending to the finished frames through a paged K/V cache. Everything the rollout needs is read from the checkpoint: chunk size, the fixed few-step SDE schedule (guidance baked in), history window, and the per-embodiment action layout (`agibotworld` and friends; the row width and domain id come from the checkpoint, conflicting request values are rejected). 480p, up to 901 frames at 30 fps; requests beyond that are refused. Needs the `TRTLLM` or `CUDNN` attention backend: use `configs/cosmos3-nano-sim-1gpu.yaml`. Guardrails apply as for every Cosmos3 checkpoint.
 - [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
 
 ## Guardrails
@@ -50,6 +51,7 @@ See `examples/visual_gen/configs/`:
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
 - `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
 - `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
+- `cosmos3-nano-sim-1gpu.yaml` — 1 GPU, `Cosmos3-Nano-Sim-Bimanual`: K/V-cache-capable attention backend and the cache memory share.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
 
@@ -210,6 +212,21 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --domain_name av \
     --action_json action_trajectory.json \
     --output_path forward_dynamics.safetensors
+
+# Cosmos3 Nano Sim — forward dynamics over the causal K/V cache (first frame +
+# recorded actions -> the video they cause). actions.json is [T-1, D] with D the
+# checkpoint's row width for the domain (29 for the early-access agibotworld
+# layout, 59 for the unified one); the trajectory is applied at --frame_rate.
+python cosmos3.py --model nvidia/Cosmos3-Nano-Sim-Bimanual \
+    --prompt "Smooth out a messy brown shorts with both arms and spread it flat." \
+    --visual_gen_args ../configs/cosmos3-nano-sim-1gpu.yaml \
+    --image_path first_frame_832x480.png \
+    --action_mode forward_dynamics \
+    --domain_name agibotworld \
+    --action_json actions.json \
+    --action_chunk_size 900 \
+    --frame_rate 30 \
+    --output_path sim_rollout.safetensors
 
 # Action — inverse dynamics (video -> predicted action)
 python cosmos3.py --model nvidia/Cosmos3-Nano \

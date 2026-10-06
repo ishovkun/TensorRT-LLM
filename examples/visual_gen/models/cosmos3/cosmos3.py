@@ -437,6 +437,12 @@ def main():
         help=("Resolution bucket for action image sizing. Defaults to the domain preset or 480."),
     )
     parser.add_argument(
+        "--frame_rate",
+        type=float,
+        default=None,
+        help="Output frame rate. Defaults to the mode or domain preset.",
+    )
+    parser.add_argument(
         "--action_fps",
         type=float,
         default=None,
@@ -529,6 +535,8 @@ def main():
         params.extra_params["action_resolution"] = args.action_resolution
     if args.action_fps is not None:
         params.extra_params["action_fps"] = args.action_fps
+    if args.frame_rate is not None:
+        params.frame_rate = args.frame_rate
     if args.view_point is not None:
         params.extra_params["view_point"] = args.view_point
     if args.action_json is not None:
