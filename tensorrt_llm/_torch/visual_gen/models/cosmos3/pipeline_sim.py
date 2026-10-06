@@ -30,6 +30,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from ...cache import CausalKVCacheManager
+from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from ...pipeline_registry import register_pipeline
 from .action import normalize_action_mode
 from .defaults import VIDEO_RES_SIZE_INFO
@@ -387,9 +388,60 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     def _shutdown_sim_cache(self) -> None:
         if self._sim_cache_obj is not None:
+            # Graphs captured over this cache read its pages and tables by address.
+            for runner in self._cuda_graph_runners.values():
+                runner.clear()
             self._sim_cache_obj.shutdown()
             self._sim_cache_obj = None
             self._sim_cache_key = None
+
+    # ------------------------------------------------------------------ CUDA graphs
+
+    def _setup_cuda_graphs(self) -> None:
+        """Run the chunk forward under CUDA graphs. The bidirectional forward is not
+        wrapped: the rollout never calls it. Keys: the tensor shapes, the packing,
+        the pass and the cache; the cache's page tables and lengths are read at
+        replay from the metadata the loop refreshes after every commit."""
+        if not self.pipeline_config.cuda_graph.enable:
+            return
+        if self.offloader.stages():
+            raise NotImplementedError(
+                "CUDA graphs are not supported with visual generation offloading yet. "
+                "Disable either cuda_graph_config.enable or cpu_offload_config.enable."
+            )
+        runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+        runner.register_extra_key_fn("clean_pass", lambda *a, **k: bool(k.get("clean_pass")))
+        runner.register_extra_key_fn("packing", lambda *a, **k: k.get("packing"))
+        runner.register_extra_key_fn("kv_cache", lambda *a, **k: id(k.get("kv_cache")))
+        tf = self.transformer
+        tf._forward_causal_core = runner.wrap(tf._forward_causal_core)
+        self._cuda_graph_runners["transformer.forward_causal"] = runner
+        logger.info("CUDA graph runner: wrapping transformer.forward_causal")
+
+    def _cache_metadata(self):
+        """The trtllm-gen metadata object every layer shares, or ``None`` on a backend
+        that reads the cache's state directly."""
+        attn = self.transformer.gen_layers[0].cross_attention.attn
+        while attn is not None:
+            metadata = getattr(attn, "metadata", None)
+            if metadata is not None and hasattr(metadata, "prepare_with_kv_cache"):
+                return metadata
+            attn = getattr(attn, "inner", None)
+        return None
+
+    def _refresh_cache_metadata(
+        self, cache: CausalKVCacheManager, frames: int, tokens_per_frame: int
+    ) -> None:
+        """Before a chunk's replays: re-prepare the attention metadata for its two
+        blockings (one block for the denoising steps, one block per frame for the
+        clean pass), since a replay does not re-read the cache's lengths."""
+        if not self._cuda_graph_runners:
+            return
+        metadata = self._cache_metadata()
+        if metadata is None:
+            return
+        metadata.prepare_with_kv_cache(cache, 1, frames * tokens_per_frame)
+        metadata.prepare_with_kv_cache(cache, frames, tokens_per_frame)
 
     # ------------------------------------------------------------------ the rollout
 
@@ -482,6 +534,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             step_kwargs = self.sampling.scheduler_step_kwargs(generator)
             zero_t = torch.zeros(1, device=self.device)
             for f0, f1 in sim.chunk_ranges(num_latent_frames):
+                self._refresh_cache_metadata(cache, f1 - f0, tokens_per_frame)
                 x = latents[:, :, f0:f1]
                 chunk_actions = actions[:, f0 * A : f1 * A]
                 mask = velocity_mask[:, :, f0:f1] if velocity_mask is not None else None

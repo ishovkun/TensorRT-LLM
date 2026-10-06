@@ -1654,6 +1654,54 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 f"latents={action_latents.dtype}, projection={self.action_proj_in.dtype}."
             )
 
+        cos, sin = self._sim_rope_tables(
+            packing,
+            (Hp, Wp),
+            first_frame,
+            text_len,
+            fps,
+            action_fps,
+            hidden_states.device,
+            self.vae2llm.weight.dtype,
+        )
+        out = self._forward_causal_core(
+            hidden_states,
+            raw_timestep,
+            cos,
+            sin,
+            action_latents,
+            action_domain_ids,
+            timestep,
+            kv_cache=kv_cache,
+            packing=packing,
+            clean_pass=clean_pass,
+            offload_context=offload_context,
+        )
+        if out is None:
+            return None
+        video_vel, action_vel = out
+        return TransformerOutput(video=video_vel, image=video_vel, audio=None, action=action_vel)
+
+    def _forward_causal_core(
+        self,
+        hidden_states: torch.Tensor,
+        raw_timestep: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        action_latents: torch.Tensor,
+        action_domain_ids: torch.Tensor,
+        timestep: Optional[torch.Tensor],
+        *,
+        kv_cache: Any,
+        packing: FramePacking,
+        clean_pass: bool,
+        offload_context: Callable[[str], ContextManager] = _noop_offload_context,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """The device work of ``forward_causal``: everything after validation and the
+        rotary tables. Tensors in, ``(video_velocity, action_velocity)`` out (``None``
+        for the clean pass), no host reads, so the pipeline can run it under a CUDA
+        graph keyed on the tensor shapes, the packing, the pass and the cache."""
+        T, H, W = hidden_states.shape[2:]
         hidden_vis = self.vae2llm(self.patchify(hidden_states, T, H, W))
         if not clean_pass:
             # Only noised tokens carry the timestep embedding. Action rows are
@@ -1666,9 +1714,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
         hidden = packing.interleave(hidden_vis, hidden_action)
 
-        cos, sin = self._sim_rope_tables(
-            packing, (Hp, Wp), first_frame, text_len, fps, action_fps, hidden.device, hidden.dtype
-        )
         num_tokens = packing.num_tokens
         hidden = self.sharder.shard(hidden, dim=1, pad_to_multiple=True)
         cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
@@ -1694,7 +1739,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         vision, action = packing.split(hidden)
         video_vel = self.unpatchify(self.llm2vae(vision), T, H, W)
         action_vel = self.unpack_action(self.action_proj_out(action, action_domain_ids))
-        return TransformerOutput(video=video_vel, image=video_vel, audio=None, action=action_vel)
+        return video_vel, action_vel
 
     def _sim_rope_tables(
         self,

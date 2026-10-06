@@ -30,3 +30,6 @@ parallel_config:
   ulysses_size: 1
 kv_cache_config:
   free_gpu_memory_fraction: 0.9
+# The chunk forward replays as CUDA graphs (one per chunk shape and pass).
+cuda_graph_config:
+  enable: true

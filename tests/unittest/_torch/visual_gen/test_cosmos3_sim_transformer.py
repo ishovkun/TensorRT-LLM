@@ -372,12 +372,13 @@ def test_rollout_past_the_window_stays_bounded(model):
 # ----------------------------------------------------------------------- the chunk loop
 
 
-def make_sim_pipeline(model):
+def make_sim_pipeline(model, cuda_graphs: bool = False):
     """The Sim pipeline's rollout over the tiny transformer, without loading a
     checkpoint: only the attributes the rollout touches are set."""
     pipe = Cosmos3NanoSimBimanualPipeline.__new__(Cosmos3NanoSimBimanualPipeline)
     torch.nn.Module.__init__(pipe)  # BasePipeline is a Module; skip its loading constructor
     pipe.transformer = model
+    pipe._cuda_graph_runners = {}
     pipe.sim = Cosmos3SimSettings.from_pretrained_config({SIM_CONFIG_KEY: SIM_BLOCK})
     pipe._history_frames = pipe.sim.history_frames
     pipe._sim_cache_obj = None
@@ -394,10 +395,14 @@ def make_sim_pipeline(model):
         }
     )
     pipe.sampling = Cosmos3SamplingPolicy.from_scheduler(pipe.scheduler)
-    pipe.offloader = SimpleNamespace(context_if_requested=lambda name: nullcontext())
+    pipe.offloader = SimpleNamespace(
+        context_if_requested=lambda name: nullcontext(), stages=lambda: []
+    )
     pipe._device = DEVICE
     pipe.pipeline_config = SimpleNamespace(
-        torch_dtype=DTYPE, kv_cache=SimpleNamespace(free_gpu_memory_fraction=0.9)
+        torch_dtype=DTYPE,
+        kv_cache=SimpleNamespace(free_gpu_memory_fraction=0.9),
+        cuda_graph=SimpleNamespace(enable=cuda_graphs),
     )
     pipe.vae_scale_factor_temporal = 4
     pipe.vae_scale_factor_spatial = 16
@@ -406,8 +411,11 @@ def make_sim_pipeline(model):
     return pipe
 
 
-def rollout(model, num_latent_frames, seed, conditioned_first_frame=False):
-    pipe = make_sim_pipeline(model)
+def rollout(
+    model, num_latent_frames, seed, conditioned_first_frame=False, cuda_graphs: bool = False
+):
+    pipe = make_sim_pipeline(model, cuda_graphs=cuda_graphs)
+    pipe._setup_cuda_graphs()
     generator = torch.Generator(device=DEVICE).manual_seed(seed)
     latents = torch.randn(
         1,
@@ -480,3 +488,15 @@ def test_conditioned_first_frame_is_kept_and_cached(model):
     assert torch.isfinite(out).all()
     tokens_per_frame = A + (H // 2) * (W // 2)
     assert cache.history_tokens == 1 * tokens_per_frame
+
+
+def test_chunk_loop_under_cuda_graphs_matches_eager(model):
+    """The same seeded rollout with the chunk forward captured and replayed: the
+    graphs see the cache's lengths through the refreshed metadata, so every chunk
+    reads the history it should. Thirteen latent frames: four chunk shapes in
+    play, commits and page rotations between replays."""
+    eager, _, _ = rollout(model, 13, seed=21)
+    graphed, _, cache = rollout(model, 13, seed=21, cuda_graphs=True)
+    torch.cuda.synchronize()
+    assert_same_model_output(graphed, eager, label="rollout under CUDA graphs")
+    assert cache.is_open is False
