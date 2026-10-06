@@ -1377,9 +1377,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     # VAE decode
     # =========================================================================
 
-    def _decode_latents_raw(self, latents):
+    def _scale_latents_for_decode(self, latents):
+        """Latents as the VAE decoder expects them: the checkpoint's per-channel
+        statistics undone, or its scaling factor."""
         latents = latents.to(self.vae.dtype)
-
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
             if not hasattr(self, "_latents_mean"):
                 self._latents_mean = (
@@ -1392,11 +1393,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     .view(1, -1, 1, 1, 1)
                     .to(self.device, self.vae.dtype)
                 )
-            latents = (latents * self._latents_std) + self._latents_mean
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latents = latents / scaling_factor
+            return (latents * self._latents_std) + self._latents_mean
+        scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        return latents / scaling_factor
 
+    def _decode_latents_raw(self, latents):
+        latents = self._scale_latents_for_decode(latents)
         with self.offloader.context_if_requested(PipelineComponent.VAE.value):
             return self.vae.decode(latents, return_dict=False)[0]
 

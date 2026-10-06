@@ -1824,6 +1824,40 @@ class WanVAE(nn.Module):
             return (out,)
         return DecoderOutput(sample=out)
 
+    def decode_stream_start(self) -> None:
+        """Begin decoding a video a few latent frames at a time: the causal
+        convolutions' temporal context carries over between ``decode_stream_step``
+        calls, so the frames come out as they would from one ``decode`` of the whole
+        clip. The first step must hold exactly one latent frame, as ``decode`` does
+        for its cache-initialising pass."""
+        self.clear_cache()
+        self._stream_first_chunk = True
+
+    def decode_stream_step(self, z: torch.Tensor) -> torch.Tensor:
+        """Decode the next consecutive latent frames ``z`` ``[B, C, t, h, w]`` and
+        return their pixel frames ``[B, C', T', H, W]`` in ``[-1, 1]``."""
+        if self._stream_first_chunk and z.shape[2] != 1:
+            raise ValueError(
+                f"the first decode_stream_step takes one latent frame, got {z.shape[2]}"
+            )
+        z = _channels_last_3d_if_needed(z)
+        x = self.post_quant_conv(z)
+        self._conv_idx = [0]
+        out = self.decoder(
+            x,
+            feat_cache=self._feat_map,
+            feat_idx=self._conv_idx,
+            first_chunk=self._stream_first_chunk,
+        )
+        self._stream_first_chunk = False
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+        out = _channels_last_3d_if_needed(out)
+        return torch.clamp(out, min=-1.0, max=1.0)
+
+    def decode_stream_end(self) -> None:
+        self.clear_cache()
+
     def decode(
         self,
         z: torch.Tensor,

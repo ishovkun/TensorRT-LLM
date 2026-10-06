@@ -412,6 +412,11 @@ def make_sim_pipeline(model, cuda_graphs: bool = False):
     torch.nn.Module.__init__(pipe)  # BasePipeline is a Module; skip its loading constructor
     pipe.transformer = model
     pipe._cuda_graph_runners = {}
+    pipe._decode_stream = None
+    pipe._streamed_video = None
+    pipe.vae = None  # no decoder in these tests: the rollout decodes nothing
+    pipe._parallel_vae_enabled = False
+    pipe._rank = 0
     pipe.sim = Cosmos3SimSettings.from_pretrained_config({SIM_CONFIG_KEY: SIM_BLOCK})
     pipe._history_frames = pipe.sim.window_frames - 1  # the tests pin a small window
     pipe._sim_cache_obj = None

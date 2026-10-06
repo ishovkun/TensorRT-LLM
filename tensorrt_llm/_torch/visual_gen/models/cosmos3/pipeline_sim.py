@@ -32,6 +32,7 @@ from tensorrt_llm.logger import logger
 from ...cache import CausalKVCacheManager
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from ...pipeline_registry import register_pipeline
+from ...utils import postprocess_video_tensor
 from .action import normalize_action_mode
 from .defaults import VIDEO_RES_SIZE_INFO
 from .pipeline_cosmos3 import Cosmos3OmniMoTPipeline
@@ -259,6 +260,42 @@ class Cosmos3SimSettings:
         return ranges
 
 
+class _OverlappedDecode:
+    """Pixel frames of a rollout, decoded chunk by chunk on a side stream as the
+    chunks finish. Each submitted latent slice is read on the side stream after the
+    main stream wrote it; ``finish`` joins the streams and returns the uint8 video
+    ``[1, T, H, W, 3]`` the pipeline would otherwise decode after the rollout."""
+
+    def __init__(self, pipe, latents: torch.Tensor, stream: torch.cuda.Stream) -> None:
+        self.pipe = pipe
+        self.stream = stream
+        self.chunks: list[torch.Tensor] = []
+        self.held: list[torch.Tensor] = []
+        with torch.cuda.stream(stream):
+            pipe.vae.decode_stream_start()
+        del latents
+
+    def submit(self, chunk: torch.Tensor) -> None:
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream())
+        with torch.cuda.stream(self.stream):
+            ready.wait()
+            self.held.append(chunk)  # the main stream never writes these frames again
+            z = self.pipe._scale_latents_for_decode(chunk)
+            frames = self.pipe.vae.decode_stream_step(z)
+            self.chunks.append(postprocess_video_tensor(frames))
+
+    def finish(self) -> torch.Tensor:
+        with torch.cuda.stream(self.stream):
+            self.pipe.vae.decode_stream_end()
+        torch.cuda.current_stream().wait_stream(self.stream)
+        video = torch.cat(self.chunks, dim=1)
+        video.record_stream(torch.cuda.current_stream())
+        self.chunks.clear()
+        self.held.clear()
+        return video
+
+
 @register_pipeline(
     "Cosmos3NanoSimBimanualPipeline",
     hf_ids=["nvidia/Cosmos3-Nano-Sim-Bimanual"],
@@ -286,6 +323,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         # One cache is resident at a time, keyed by its frame geometry.
         self._sim_cache_obj: Optional[CausalKVCacheManager] = None
         self._sim_cache_key: Optional[int] = None
+        # Finished chunks are decoded on this stream while later chunks denoise.
+        self._decode_stream: Optional[torch.cuda.Stream] = None
+        self._streamed_video: Optional[torch.Tensor] = None
 
     def _resolve_request(
         self,
@@ -558,6 +598,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         tf.reset_cache()
         timer.mark_denoise_start()
         text_len = int(cond_mask.sum().item())
+        decoder = self._start_overlapped_decode(latents)
         cache.open(pin_tokens=text_len + sim.sink_frames * tokens_per_frame)
         try:
             tf.write_prompt_kv(cache, cond_ids, cond_mask, offload_context=offload)
@@ -595,6 +636,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                         if mask is not None and prepared.condition_latents is not None:
                             x = mask * x + (1.0 - mask) * prepared.condition_latents[:, :, f0:f1]
                 latents[:, :, f0:f1] = x
+                if decoder is not None:
+                    decoder.submit(latents[:, :, f0:f1])
                 if f1 < num_latent_frames:
                     tf.forward_causal(
                         x,
@@ -613,8 +656,36 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                     cache.commit((f1 - f0) * tokens_per_frame)
         finally:
             cache.close()
+        if decoder is not None:
+            self._streamed_video = decoder.finish()
         self._release_scheduler_solver_state()
         return latents, None, prepared.action_latents, False
+
+    # ------------------------------------------------------------------ overlapped VAE decode
+
+    def _start_overlapped_decode(self, latents: torch.Tensor) -> Optional["_OverlappedDecode"]:
+        """Decode finished chunks on a second stream while the rollout continues,
+        when this rank decodes alone and the VAE is the native streaming decoder;
+        otherwise the usual decode after the rollout applies."""
+        self._streamed_video = None
+        vae = self.vae
+        if (
+            self._parallel_vae_enabled
+            or self.rank != 0
+            or not hasattr(vae, "decode_stream_step")
+            or self.offloader.stages()
+        ):
+            return None
+        if self._decode_stream is None:
+            self._decode_stream = torch.cuda.Stream()
+        return _OverlappedDecode(self, latents, self._decode_stream)
+
+    def _decode_latents(self, latents):
+        video = self._streamed_video
+        if video is None:
+            return super()._decode_latents(latents)
+        self._streamed_video = None
+        return video
 
     def _sim_action_rows(
         self, request, prepared, num_latent_frames: int, A: int, latents: torch.Tensor
