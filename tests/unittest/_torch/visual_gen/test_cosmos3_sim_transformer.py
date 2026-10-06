@@ -331,6 +331,36 @@ def test_rollout_is_independent_of_the_chunking(model):
         assert_same_model_output(split[i], one[i], label=label, off_floor=off_floor)
 
 
+def test_frame_zero_action_values_are_zeroed_after_its_clean_pass(model):
+    """The null-action rows of frame 0 keep their keys and lose their values in the
+    cache, as the reference stores them."""
+    cache = make_cache(model)
+    try:
+        open_with_prompt(model, cache)
+        latents, actions = frames(1, seed=5, channels=model.latent_channel_size)
+        with torch.inference_mode():
+            model.forward_causal(
+                latents,
+                torch.zeros(1, device=DEVICE),
+                kv_cache=cache,
+                first_frame=0,
+                text_len=TEXT_LEN,
+                action_latents=actions,
+                clean_pass=True,
+                fps=24.0,
+            )
+        torch.cuda.synchronize()
+        for layer in range(len(model.gen_layers)):
+            buf = cache.kv_buffer(layer)
+            table = cache.table.long()
+            pos = torch.arange(TEXT_LEN, TEXT_LEN + A, device=DEVICE)
+            page, slot = table[pos // cache.tokens_per_page], pos % cache.tokens_per_page
+            assert buf[page, 1, :, slot].abs().max().item() == 0.0, f"layer {layer}: V not zeroed"
+            assert buf[page, 0, :, slot].abs().max().item() > 0.0, f"layer {layer}: K lost"
+    finally:
+        cache.shutdown()
+
+
 def test_rollout_past_the_window_stays_bounded(model):
     cache = make_cache(model)
     tokens_per_frame = A + (H // 2) * (W // 2)

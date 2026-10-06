@@ -1699,6 +1699,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             kv_cache=kv_cache,
             packing=packing,
             clean_pass=clean_pass,
+            first_frame=first_frame,
             offload_context=offload_context,
         )
         if out is None:
@@ -1719,6 +1720,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         kv_cache: Any,
         packing: FramePacking,
         clean_pass: bool,
+        first_frame: int,
         offload_context: Callable[[str], ContextManager] = _noop_offload_context,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """The device work of ``forward_causal``: everything after validation and the
@@ -1768,6 +1770,14 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     timestep=timestep,
                 )
                 if clean_pass and i + 1 == len(self.gen_layers):
+                    if first_frame == 0:
+                        # Frame 0 carries the null action: its four rows keep their
+                        # keys, so later frames attend as in training, and lose their
+                        # values, so they contribute nothing (the reference zeroes V).
+                        action_slots, _ = packing.frame_slices(0)
+                        start = kv_cache.past_tokens + action_slots.start
+                        for layer_idx in range(len(self.gen_layers)):
+                            kv_cache.zero_values(layer_idx, start, packing.action_tokens)
                     return None
                 next_norm = (
                     self.gen_layers[i + 1].input_layernorm

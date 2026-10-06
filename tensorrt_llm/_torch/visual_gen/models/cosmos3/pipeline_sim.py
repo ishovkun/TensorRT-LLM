@@ -447,6 +447,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             )
         runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
         runner.register_extra_key_fn("clean_pass", lambda *a, **k: bool(k.get("clean_pass")))
+        runner.register_extra_key_fn("first_chunk", lambda *a, **k: k.get("first_frame") == 0)
         runner.register_extra_key_fn("packing", lambda *a, **k: k.get("packing"))
         runner.register_extra_key_fn("kv_cache", lambda *a, **k: id(k.get("kv_cache")))
         tf = self.transformer
