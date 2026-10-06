@@ -483,8 +483,18 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise NotImplementedError("K/V cache attention does not combine with SageAttention.")
         if self.sparse_params is not None:
             raise NotImplementedError("K/V cache attention does not combine with sparse attention.")
-        if k is None or v is None:
-            raise ValueError("K/V cache attention needs separate q, k, v.")
+        packed = None
+        if k is None and v is None:
+            # q is the fused projection [1, S, H + 2*H_kv, D]: the kernel takes it as
+            # it is and the cache takes strided K/V slices of it, so nothing is
+            # re-concatenated.
+            packed = q
+            kv_heads = kv_cache.num_kv_heads
+            q = packed[:, :, : self.num_heads]
+            k = packed[:, :, self.num_heads : self.num_heads + kv_heads]
+            v = packed[:, :, self.num_heads + kv_heads :]
+        elif k is None or v is None:
+            raise ValueError("K/V cache attention needs separate q, k, v, or one packed qkv.")
         if kv_cache.tokens_per_page != TRTLLM_GEN_TOKENS_PER_PAGE:
             raise NotImplementedError(
                 f"trtllm-gen ships paged context kernels for {TRTLLM_GEN_TOKENS_PER_PAGE}-token "
@@ -513,6 +523,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         num_tokens = seq_len
         if num_tokens < num_rows:
             q, k, v = q[:, :num_tokens], k[:, :num_tokens], v[:, :num_tokens]
+            if packed is not None:
+                packed = packed[:, :num_tokens]
         causal_block_size = causal_block_size or num_tokens
         if num_tokens % causal_block_size:
             raise ValueError(
@@ -524,10 +536,13 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         # the chunk here.
         kv_cache.write_chunk(self.layer_idx, k[0], v[0], causal_block_size, own_tokens=False)
         metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
-        qkv = torch.cat(
-            [q.reshape(num_tokens, -1), k.reshape(num_tokens, -1), v.reshape(num_tokens, -1)],
-            dim=-1,
-        )
+        if packed is not None:
+            qkv = packed.reshape(num_tokens, -1)
+        else:
+            qkv = torch.cat(
+                [q.reshape(num_tokens, -1), k.reshape(num_tokens, -1), v.reshape(num_tokens, -1)],
+                dim=-1,
+            )
         output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
         )

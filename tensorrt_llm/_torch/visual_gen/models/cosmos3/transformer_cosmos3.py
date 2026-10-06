@@ -681,6 +681,9 @@ class Cosmos3CrossAttention(Attention):
         eps = model_config.pretrained_config.rms_norm_eps
         self.norm_q = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
         self.norm_k = NemotronRMSNorm(hidden_size=head_dim, eps=eps, dtype=torch.bfloat16)
+        # For the fused norm+RoPE kernel: these norms' eps, and rotate-half RoPE.
+        self.eps = eps
+        self.interleave = False
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-head RMSNorm on 4D tensors [B, S, H, D]."""
@@ -773,22 +776,37 @@ class Cosmos3CrossAttention(Attention):
         this rank's shard with padding under sequence parallelism; ``seq_len`` is the
         chunk's real token count."""
         batch_size, rows = hidden_states.shape[:2]
-        q, k, v = self.get_qkv(hidden_states)
-        q = q.view(batch_size, rows, self.local_num_attention_heads, self.head_dim)
-        k = k.view(batch_size, rows, self.local_num_key_value_heads, self.head_dim)
-        v = v.view(batch_size, rows, self.local_num_key_value_heads, self.head_dim)
-        q, k = self.apply_qk_norm(q, k)
-        q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
-        out = self._attn_impl(
-            q,
-            k,
-            v,
-            attention_mask=PredefinedAttentionMask.FULL,
-            timestep=timestep,
-            kv_cache=kv_cache,
-            seq_len=seq_len,
-            causal_block_size=causal_block_size,
-        )
+        qkv = self.qkv_proj(hidden_states)  # [1, rows, (H + 2 H_kv) * D]
+        # One kernel: per-head RMSNorm of Q and K and rotate-half RoPE, in place.
+        self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
+        if type(self.attn).__name__ == "TrtllmAttention":
+            # trtllm-gen reads the packed projection as it is.
+            heads = self.local_num_attention_heads + 2 * self.local_num_key_value_heads
+            out = self.attn.forward(
+                q=qkv.view(batch_size, rows, heads, self.head_dim),
+                k=None,
+                v=None,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                seq_len_kv=rows,
+                attention_mask=PredefinedAttentionMask.FULL,
+                timestep=timestep,
+                kv_cache=kv_cache,
+                causal_block_size=causal_block_size,
+            )
+            out = out.reshape(batch_size, rows, -1)
+        else:
+            q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
+            out = self._attn_impl(
+                q,
+                k,
+                v,
+                attention_mask=PredefinedAttentionMask.FULL,
+                timestep=timestep,
+                kv_cache=kv_cache,
+                seq_len=seq_len,
+                causal_block_size=causal_block_size,
+            )
         return self.to_out[0](out)
 
 
@@ -1654,6 +1672,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 f"latents={action_latents.dtype}, projection={self.action_proj_in.dtype}."
             )
 
+        # fp32 tables: what the fused per-head norm+RoPE kernel reads.
         cos, sin = self._sim_rope_tables(
             packing,
             (Hp, Wp),
@@ -1662,7 +1681,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             fps,
             action_fps,
             hidden_states.device,
-            self.vae2llm.weight.dtype,
+            torch.float32,
         )
         out = self._forward_causal_core(
             hidden_states,

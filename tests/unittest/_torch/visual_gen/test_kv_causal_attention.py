@@ -690,3 +690,51 @@ def test_trtllm_forgets_metadata_of_shut_down_caches():
         for cache in caches:
             if not cache.is_shut_down:
                 cache.shutdown()
+
+
+def test_packed_qkv_matches_separate_tensors_on_the_cache_path():
+    """trtllm-gen takes the fused projection [1, S, H + 2 H_kv, D] directly; the
+    cache gets strided K/V slices of it. Same output, same cached K/V as the
+    separate-tensor call."""
+    torch.manual_seed(13)
+    attn = make_backend("trtllm")
+    outs, kvs = [], []
+    q, k, v = rand_qkv(CHUNK)
+    packed = torch.cat([q, k, v], dim=1).unsqueeze(0).contiguous()  # [1, S, H + 2 H_kv, D]
+    for call in ("separate", "packed"):
+        cache = CausalKVCacheManager(
+            num_layers=1,
+            num_kv_heads=NUM_KV_HEADS,
+            head_dim=HEAD_DIM,
+            dtype=DTYPE,
+            tokens_per_page=32,
+            fixed_capacity=PROMPT_CAPACITY,
+            window_tokens=WINDOW,
+            chunk_tokens=CHUNK,
+            causal_block_sizes=(CHUNK, CHUNK // 4),
+        )
+        try:
+            torch.manual_seed(14)  # the same prompt K/V for both calls
+            open_with_prompt(cache, 9)
+            if call == "separate":
+                out = run(attn, cache, q, k, v, causal_block_size=CHUNK // 4)
+            else:
+                out = attn.forward(
+                    q=packed,
+                    k=None,
+                    v=None,
+                    batch_size=1,
+                    seq_len=CHUNK,
+                    seq_len_kv=CHUNK,
+                    kv_cache=cache,
+                    causal_block_size=CHUNK // 4,
+                )
+            torch.cuda.synchronize()
+            positions = torch.arange(cache.past_tokens, cache.past_tokens + CHUNK, device=DEVICE)
+            outs.append(out.reshape(CHUNK, -1).clone())
+            kvs.append(tuple(x.clone() for x in read_kv(cache, 0, positions)))
+        finally:
+            cache.shutdown()
+    torch.testing.assert_close(outs[1], outs[0], rtol=0, atol=0)
+    torch.testing.assert_close(kvs[1][0], kvs[0][0], rtol=0, atol=0)
+    torch.testing.assert_close(kvs[1][1], kvs[0][1], rtol=0, atol=0)
