@@ -577,3 +577,29 @@ def test_commit_takes_the_tokens_actually_written(cache):
         cache.commit(0)
     with pytest.raises(ValueError):
         cache.commit(cache.chunk_tokens + 1)
+
+
+def test_pool_bytes_formula_matches_the_allocation():
+    """``pool_bytes_for`` is what the constructor allocates, so a window can be
+    sized against a budget before anything is built."""
+    geometry = dict(
+        num_layers=3,
+        num_kv_heads=2,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        tokens_per_page=32,
+        fixed_capacity=40,
+        chunk_tokens=120,
+        causal_block_sizes=(120, 60),
+    )
+    previous = 0
+    for window_tokens in (60, 600, 6000):
+        expected = CausalKVCacheManager.pool_bytes_for(window_tokens=window_tokens, **geometry)
+        cache = CausalKVCacheManager(window_tokens=window_tokens, **geometry)
+        try:
+            assert cache.pool_bytes == expected
+            assert expected == cache._pool_tokens * 3 * 2 * 2 * 64 * 2
+            assert expected > previous
+            previous = expected
+        finally:
+            cache.shutdown()

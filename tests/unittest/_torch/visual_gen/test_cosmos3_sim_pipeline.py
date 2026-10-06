@@ -154,3 +154,34 @@ def test_action_contract_completes_and_guards_a_request():
     # an embodiment the checkpoint does not list is left alone
     assert s.action_contract("droid_lerobot", None, 8) == ("droid_lerobot", None, 8)
     assert s.action_contract(None, 7, None) == (None, 7, None)
+
+
+def test_settings_window_and_envelope():
+    """A checkpoint may leave the window to the pipeline (``null``); the serving
+    envelope defaults to the model card (480p bucket, 901 frames) unless declared."""
+    s = Cosmos3SimSettings.from_pretrained_config(
+        {SIM_CONFIG_KEY: dict(CHECKPOINT_BLOCK, window_frames=None, sink_frames=0)}
+    )
+    assert s.window_frames is None and s.history_frames is None
+    assert (s.max_pixels, s.max_pixel_frames) == (640 * 640, 901)
+    assert s.max_latent_frames(4) == 226
+    assert s.largest_frame() == (640, 640)
+    declared = Cosmos3SimSettings.from_pretrained_config(
+        {SIM_CONFIG_KEY: dict(CHECKPOINT_BLOCK, max_pixels=832 * 480, max_num_frames=121)}
+    )
+    assert declared.largest_frame() == (480, 832) and declared.max_latent_frames(4) == 31
+    with pytest.raises(ValueError, match="no 480p bucket"):
+        Cosmos3SimSettings.from_pretrained_config(
+            {SIM_CONFIG_KEY: dict(CHECKPOINT_BLOCK, max_pixels=100)}
+        ).largest_frame()
+
+
+def test_envelope_check_refuses_larger_requests():
+    pipe = Cosmos3NanoSimBimanualPipeline.__new__(Cosmos3NanoSimBimanualPipeline)
+    pipe.sim = Cosmos3SimSettings.from_pretrained_config({SIM_CONFIG_KEY: CHECKPOINT_BLOCK})
+    pipe.check_envelope(480, 832, 901)
+    pipe.check_envelope(640, 640, 33)
+    with pytest.raises(ValueError, match="at most 409600 pixels"):
+        pipe.check_envelope(720, 1280, 33)
+    with pytest.raises(ValueError, match="901 frames"):
+        pipe.check_envelope(480, 832, 905)

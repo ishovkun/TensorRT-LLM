@@ -37,6 +37,7 @@ from tensorrt_llm.visual_gen.args import (
     CompilationConfig,
     CpuOffloadConfig,
     CudaGraphConfig,
+    KVCacheConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
     TeaCacheConfig,
@@ -200,6 +201,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
+    kv_cache: KVCacheConfig = PydanticField(default_factory=KVCacheConfig)
     cpu_offload_config: CpuOffloadConfig = PydanticField(default_factory=CpuOffloadConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     attention_metadata_state: Optional[Dict[str, Any]] = None
@@ -578,6 +580,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         compilation_cfg = args.compilation_config if args else CompilationConfig()
         torch_compile_cfg = args.torch_compile_config if args else TorchCompileConfig()
         cuda_graph_cfg = args.cuda_graph_config if args else CudaGraphConfig()
+        kv_cache_cfg = args.kv_cache_config if args else KVCacheConfig()
         offload_cfg = args.cpu_offload_config if args else CpuOffloadConfig()
         attention_cfg = args.attention_config if args else AttentionConfig()
         parallel_cfg = args.parallel_config if args else ParallelConfig()
@@ -775,6 +778,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             compilation=compilation_cfg,
             torch_compile=torch_compile_cfg,
             cuda_graph=cuda_graph_cfg,
+            kv_cache=kv_cache_cfg,
             cpu_offload_config=offload_cfg,
             attention=attention_cfg,
             attention_metadata_state=attention_metadata_state,

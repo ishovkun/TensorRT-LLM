@@ -27,9 +27,12 @@ from typing import Any, Optional, Sequence
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 from ...cache import CausalKVCacheManager
 from ...pipeline_registry import register_pipeline
 from .action import normalize_action_mode
+from .defaults import VIDEO_RES_SIZE_INFO
 from .pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from .sim_packing import SIM_CONFIG_KEY
 
@@ -38,6 +41,10 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    return None if value is None else int(value)
 
 
 @dataclass(frozen=True)
@@ -64,8 +71,10 @@ class Cosmos3SimSettings:
     """Latent frames generated together after the first chunk."""
     chunk_partition: tuple[int, ...] = (1, 4)
     """Frames per chunk from the start: the first chunk is one frame, then fours."""
-    window_frames: int = 96
-    """Frames the history holds, counting the chunk's own first frame."""
+    window_frames: Optional[int] = 96
+    """Frames the history holds, counting the chunk's own first frame. ``None``:
+    the checkpoint declares unbounded history and the pipeline sizes the window
+    from the memory left after warmup."""
     sink_frames: int = 0
     """Leading frames pinned for the whole rollout; 0 on this checkpoint."""
     text_cache_max_len: int = 512
@@ -73,15 +82,33 @@ class Cosmos3SimSettings:
     action_tokens_per_frame: int = 4
     """Action rows packed before each frame's vision tokens."""
     video_temporal_causal: bool = True
+    max_pixels: int = 640 * 640
+    """Largest frame the checkpoint serves, in pixels: the 480p bucket."""
+    max_pixel_frames: int = 901
+    """Longest clip the checkpoint serves, in pixel frames."""
     embodiments: dict[str, SimEmbodiment] = field(default_factory=dict)
     """Embodiments declared under ``conditioning.embodiments``, by lower-case name."""
     default_embodiment: Optional[str] = None
     """``conditioning.default_embodiment``: used when a request names no domain."""
 
     @property
-    def history_frames(self) -> int:
-        """Finished frames a chunk may read: the window less its own first frame."""
-        return self.window_frames - 1
+    def history_frames(self) -> Optional[int]:
+        """Finished frames a chunk may read: the window less its own first frame;
+        ``None`` when the checkpoint leaves the window to the pipeline."""
+        return None if self.window_frames is None else self.window_frames - 1
+
+    def max_latent_frames(self, temporal_compression_factor: int) -> int:
+        return (self.max_pixel_frames - 1) // temporal_compression_factor + 1
+
+    def largest_frame(self) -> tuple[int, int]:
+        """``(height, width)`` of the biggest 480p bucket shape within ``max_pixels``:
+        the shape warmup runs, so the measured peak covers every served frame."""
+        shapes = [
+            (h, w) for (w, h) in VIDEO_RES_SIZE_INFO["480"].values() if h * w <= self.max_pixels
+        ]
+        if not shapes:
+            raise ValueError(f"no 480p bucket shape fits max_pixels={self.max_pixels}")
+        return max(shapes, key=lambda hw: hw[0] * hw[1])
 
     @classmethod
     def from_pretrained_config(cls, pretrained_config: Any) -> "Cosmos3SimSettings":
@@ -119,7 +146,9 @@ class Cosmos3SimSettings:
             sigmas=tuple(float(s) for s in t_list),
             chunk_frames=chunk_frames,
             chunk_partition=tuple(int(n) for n in partition),
-            window_frames=int(_get(block, "window_frames", cls.window_frames)),
+            window_frames=_optional_int(_get(block, "window_frames", cls.window_frames)),
+            max_pixels=int(_get(block, "max_pixels", cls.max_pixels)),
+            max_pixel_frames=int(_get(block, "max_num_frames", cls.max_pixel_frames)),
             sink_frames=int(_get(block, "sink_frames", cls.sink_frames)),
             text_cache_max_len=int(_get(block, "text_cache_max_len", cls.text_cache_max_len)),
             action_tokens_per_frame=int(
@@ -175,8 +204,11 @@ class Cosmos3SimSettings:
         return name, domain_id, raw_action_dim
 
     def validate(self) -> None:
-        if min(self.chunk_frames, self.window_frames, self.text_cache_max_len) <= 0:
+        window = self.window_frames if self.window_frames is not None else 1
+        if min(self.chunk_frames, window, self.text_cache_max_len, self.max_pixels) <= 0:
             raise ValueError(f"Cosmos3 Sim settings must be positive: {self}")
+        if self.max_pixel_frames <= 0:
+            raise ValueError(f"max_num_frames must be positive: {self.max_pixel_frames}")
         if not self.chunk_partition or any(n <= 0 for n in self.chunk_partition):
             raise ValueError(
                 f"chunk_partition must be positive frame counts: {self.chunk_partition}"
@@ -185,7 +217,9 @@ class Cosmos3SimSettings:
             raise ValueError(
                 f"chunk_partition {self.chunk_partition} must end with chunk_size {self.chunk_frames}"
             )
-        if not 0 <= self.sink_frames < self.window_frames:
+        if self.sink_frames < 0 or (
+            self.window_frames is not None and self.sink_frames >= self.window_frames
+        ):
             raise ValueError(f"sink_frames {self.sink_frames} must be below window_frames")
         if not self.video_temporal_causal:
             raise ValueError(
@@ -227,7 +261,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         self.sim = Cosmos3SimSettings.from_pretrained_config(
             pipeline_config.primary_pretrained_config
         )
-        self._sim_caches: dict[int, CausalKVCacheManager] = {}
+        # Finished frames a chunk may read. Declared by the checkpoint, or settled
+        # once by warmup from the memory left at the largest served shape.
+        self._history_frames: Optional[int] = self.sim.history_frames
+        # One cache is resident at a time, keyed by its frame geometry.
+        self._sim_cache_obj: Optional[CausalKVCacheManager] = None
+        self._sim_cache_key: Optional[int] = None
 
     def _resolve_request(
         self,
@@ -244,37 +283,156 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             domain_name, domain_id, raw_action_dim = self.sim.action_contract(
                 domain_name, domain_id, raw_action_dim
             )
-        return super()._resolve_request(
+        resolved = super()._resolve_request(
             action_mode=action_mode,
             domain_name=domain_name,
             domain_id=domain_id,
             raw_action_dim=raw_action_dim,
             **kwargs,
         )
+        self.check_envelope(resolved.height, resolved.width, resolved.num_frames)
+        return resolved
+
+    def check_envelope(self, height: int, width: int, num_frames: int) -> None:
+        """Refuse what the checkpoint does not serve. The cache was sized at the
+        largest served shape, so a bigger request would not have been measured."""
+        sim = self.sim
+        if height * width > sim.max_pixels or num_frames > sim.max_pixel_frames:
+            raise ValueError(
+                f"Cosmos3 Sim serves at most {sim.max_pixels} pixels per frame "
+                f"({'x'.join(map(str, reversed(sim.largest_frame())))}) and "
+                f"{sim.max_pixel_frames} frames; got {width}x{height}, {num_frames} frames."
+            )
+
+    # ------------------------------------------------------------------ warmup and sizing
+
+    @property
+    def default_warmup_resolutions(self):
+        return [self.sim.largest_frame()]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [self.sim.max_pixel_frames]
+
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        """Warm up at the given shape. With no declared window, the run uses a
+        two-chunk cache, its peak is measured, and the window is sized from what
+        is left, the way the LLM executor sizes its K/V pool."""
+        if self._history_frames is not None:
+            super()._run_warmup(height, width, num_frames, steps)
+            return
+        fraction = self.pipeline_config.kv_cache.free_gpu_memory_fraction
+        self._history_frames = 2 * self.sim.chunk_frames
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        try:
+            super()._run_warmup(height, width, num_frames, steps)
+            torch.cuda.synchronize()
+            stats = torch.cuda.memory_stats()
+            free, total = torch.cuda.mem_get_info()
+            outside_torch = max(0, (total - free) - stats["allocated_bytes.all.current"])
+            peak = stats["allocated_bytes.all.peak"] + outside_torch
+            temp_cache = self._sim_cache_obj.pool_bytes if self._sim_cache_obj is not None else 0
+        finally:
+            self._shutdown_sim_cache()
+        available = int((total - peak + temp_cache) * fraction)
+        tokens_per_frame = self._tokens_per_frame(height, width)
+        cap = self.sim.max_latent_frames(self.vae_scale_factor_temporal) - 1
+        frames = self.history_frames_for_budget(available, tokens_per_frame, cap)
+        gib = 1 << 30
+        if frames < self.sim.chunk_frames:
+            raise RuntimeError(
+                f"Cosmos3 Sim cannot hold one chunk of history: warmup peak {peak / gib:.2f} GiB "
+                f"of {total / gib:.2f} GiB leaves {available / gib:.2f} GiB for the K/V cache at "
+                f"free_gpu_memory_fraction={fraction}; {frames} frames of {tokens_per_frame} tokens fit, "
+                f"{self.sim.chunk_frames} are needed."
+            )
+        self._history_frames = frames
+        logger.info(
+            f"Cosmos3 Sim K/V window: {frames} latent frames (cap {cap}). Warmup peak "
+            f"{peak / gib:.2f} GiB of {total / gib:.2f} GiB, {available / gib:.2f} GiB for the cache "
+            f"at fraction {fraction}, {tokens_per_frame} tokens per frame at {width}x{height}."
+        )
+
+    def history_frames_for_budget(self, budget_bytes: int, tokens_per_frame: int, cap: int) -> int:
+        """Most frames of history whose cache fits ``budget_bytes``, at most ``cap``."""
+        lo, hi = 0, max(cap, 0)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self._cache_bytes(mid, tokens_per_frame) <= budget_bytes:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _cache_bytes(self, history_frames: int, tokens_per_frame: int) -> int:
+        tf, sim = self.transformer, self.sim
+        return CausalKVCacheManager.pool_bytes_for(
+            num_layers=len(tf.gen_layers),
+            num_kv_heads=tf.cache_kv_heads,
+            head_dim=tf.gen_layers[0].cross_attention.head_dim,
+            dtype=self.dtype,
+            tokens_per_page=32,
+            fixed_capacity=sim.text_cache_max_len + sim.sink_frames * tokens_per_frame,
+            window_tokens=max(history_frames, 1) * tokens_per_frame,
+            chunk_tokens=sim.chunk_frames * tokens_per_frame,
+            causal_block_sizes=tuple(k * tokens_per_frame for k in range(sim.chunk_frames, 0, -1)),
+        )
+
+    def _tokens_per_frame(self, height: int, width: int) -> int:
+        s = self.vae_scale_factor_spatial
+        Hp, Wp, _, _ = self.transformer._pad_to_patch_size(height // s, width // s)
+        return self.sim.action_tokens_per_frame + Hp * Wp
+
+    def _shutdown_sim_cache(self) -> None:
+        if self._sim_cache_obj is not None:
+            self._sim_cache_obj.shutdown()
+            self._sim_cache_obj = None
+            self._sim_cache_key = None
 
     # ------------------------------------------------------------------ the rollout
 
     def _sim_cache(self, tokens_per_frame: int) -> CausalKVCacheManager:
-        """One cache per frame geometry, kept across requests: ``close()``/``open()``
-        keep its device tensors, so graphs captured over it stay valid."""
-        cache = self._sim_caches.get(tokens_per_frame)
-        if cache is None:
-            sim, tf = self.sim, self.transformer
-            cache = CausalKVCacheManager(
-                num_layers=len(tf.gen_layers),
-                num_kv_heads=tf.cache_kv_heads,
-                head_dim=tf.gen_layers[0].cross_attention.head_dim,
-                dtype=self.dtype,
-                tokens_per_page=32,
-                fixed_capacity=sim.text_cache_max_len + sim.sink_frames * tokens_per_frame,
-                window_tokens=sim.history_frames * tokens_per_frame,
-                chunk_tokens=sim.chunk_frames * tokens_per_frame,
-                causal_block_sizes=tuple(
-                    k * tokens_per_frame for k in range(sim.chunk_frames, 0, -1)
-                ),
+        """The resident cache for this frame geometry, kept across requests:
+        ``close()``/``open()`` keep its device tensors, so graphs captured over it
+        stay valid. A request with another geometry replaces it; two pools would
+        split the memory the window was sized for."""
+        if self._sim_cache_obj is not None and self._sim_cache_key == tokens_per_frame:
+            return self._sim_cache_obj
+        self._shutdown_sim_cache()
+        if self._history_frames is None:
+            # Warmup was skipped, so nothing measured the peak: size the window from
+            # what is free right now, as the LLM executor does without estimation.
+            free, _ = torch.cuda.mem_get_info()
+            fraction = self.pipeline_config.kv_cache.free_gpu_memory_fraction
+            cap = self.sim.max_latent_frames(self.vae_scale_factor_temporal) - 1
+            self._history_frames = self.history_frames_for_budget(
+                int(free * fraction), tokens_per_frame, cap
             )
-            self._sim_caches[tokens_per_frame] = cache
-        return cache
+            logger.warning(
+                f"Cosmos3 Sim K/V window sized without warmup: {self._history_frames} latent "
+                f"frames from {free / (1 << 30):.2f} GiB free at fraction {fraction}."
+            )
+        if self._history_frames < self.sim.chunk_frames:
+            raise RuntimeError(
+                f"Cosmos3 Sim K/V window of {self._history_frames} frames is below one chunk "
+                f"({self.sim.chunk_frames} frames)."
+            )
+        sim, tf = self.sim, self.transformer
+        self._sim_cache_obj = CausalKVCacheManager(
+            num_layers=len(tf.gen_layers),
+            num_kv_heads=tf.cache_kv_heads,
+            head_dim=tf.gen_layers[0].cross_attention.head_dim,
+            dtype=self.dtype,
+            tokens_per_page=32,
+            fixed_capacity=sim.text_cache_max_len + sim.sink_frames * tokens_per_frame,
+            window_tokens=self._history_frames * tokens_per_frame,
+            chunk_tokens=sim.chunk_frames * tokens_per_frame,
+            causal_block_sizes=tuple(k * tokens_per_frame for k in range(sim.chunk_frames, 0, -1)),
+        )
+        self._sim_cache_key = tokens_per_frame
+        return self._sim_cache_obj
 
     def _denoise_request(
         self,

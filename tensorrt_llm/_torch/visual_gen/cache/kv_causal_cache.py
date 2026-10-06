@@ -135,6 +135,71 @@ class CausalKVCacheManager(KVCacheManagerV2):
             private pages, ``chunk // b`` blocks' worth.
     """
 
+    @staticmethod
+    def pool_tokens_for(
+        *,
+        tokens_per_page: int,
+        fixed_capacity: int,
+        window_tokens: int,
+        chunk_tokens: int,
+        causal_block_sizes: Sequence[int],
+    ) -> int:
+        """Tokens the page pool holds for this geometry: resident pages (fixed,
+        window, chunk, one spare) plus the private pages of every block size.
+        The constructor allocates exactly this; callers size a window against a
+        memory budget with it before building anything."""
+        tpb = tokens_per_page
+        sizes = tuple(dict.fromkeys(int(b) for b in causal_block_sizes))
+        num_pages = ceil_div(fixed_capacity + window_tokens + chunk_tokens, tpb) + 1
+        private = sum((chunk_tokens // b) * ceil_div(3 * (tpb - 1) + b, tpb) for b in sizes)
+        return (num_pages + private) * tpb
+
+    @staticmethod
+    def pool_bytes_for(
+        *,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        tokens_per_page: int,
+        fixed_capacity: int,
+        window_tokens: int,
+        chunk_tokens: int,
+        causal_block_sizes: Sequence[int],
+    ) -> int:
+        """Device bytes the constructor allocates for this geometry: K and V of
+        every pool token in every layer."""
+        tokens = CausalKVCacheManager.pool_tokens_for(
+            tokens_per_page=tokens_per_page,
+            fixed_capacity=fixed_capacity,
+            window_tokens=window_tokens,
+            chunk_tokens=chunk_tokens,
+            causal_block_sizes=causal_block_sizes,
+        )
+        return (
+            tokens
+            * num_layers
+            * 2
+            * num_kv_heads
+            * head_dim
+            * torch.tensor([], dtype=dtype).element_size()
+        )
+
+    @property
+    def pool_bytes(self) -> int:
+        """Device bytes of this cache's page pool."""
+        return self.pool_bytes_for(
+            num_layers=self._num_layers,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            dtype=self._kv_dtype,
+            tokens_per_page=self.tokens_per_page,
+            fixed_capacity=self.fixed_capacity,
+            window_tokens=self.window_tokens,
+            chunk_tokens=self.chunk_tokens,
+            causal_block_sizes=self.causal_block_sizes,
+        )
+
     def __init__(
         self,
         *,
@@ -172,6 +237,7 @@ class CausalKVCacheManager(KVCacheManagerV2):
         self.window_tokens = window_tokens
         self.chunk_tokens = chunk_tokens
         self._num_layers = num_layers
+        self._kv_dtype = dtype
         # Resident tokens peak at fixed + window + (tpb - 1) stale + chunk; the
         # extra page covers the stale tokens and an unaligned fixed-region end.
         self.num_pages = ceil_div(fixed_capacity + window_tokens + chunk_tokens, tpb) + 1
@@ -186,6 +252,13 @@ class CausalKVCacheManager(KVCacheManagerV2):
             (chunk_tokens // b) * self._region_pages_for(b) for b in sizes
         )
         pool_tokens = (self.num_pages + self._num_private_pages) * tpb
+        assert pool_tokens == self.pool_tokens_for(
+            tokens_per_page=tpb,
+            fixed_capacity=fixed_capacity,
+            window_tokens=window_tokens,
+            chunk_tokens=chunk_tokens,
+            causal_block_sizes=sizes,
+        )
 
         kv_cache_config = KvCacheConfig(
             max_tokens=pool_tokens,

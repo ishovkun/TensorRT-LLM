@@ -546,6 +546,24 @@ class CudaGraphConfig(StrictBaseModel):
     enable: bool = Field(False, status="prototype")
 
 
+class KVCacheConfig(StrictBaseModel):
+    """Budget for the K/V cache of autoregressive video models.
+
+    The cache holds the finished frames a chunk attends to. Its size is settled
+    once at startup: the pipeline warms up at the largest shape the checkpoint
+    serves, measures the peak memory everything else needs, and gives the cache
+    this fraction of what is left.
+    """
+
+    free_gpu_memory_fraction: float = Field(
+        0.9,
+        gt=0.0,
+        le=1.0,
+        status="prototype",
+        description="Fraction of the GPU memory left after the warmup peak that the K/V cache may take.",
+    )
+
+
 class CpuOffloadConfig(StrictBaseModel):
     """Configuration for offloading visual-generation model components to CPU.
 
@@ -741,6 +759,10 @@ class VisualGenArgs(StrictBaseModel):
     )
     cuda_graph_config: CudaGraphConfig = Field(
         default_factory=CudaGraphConfig,
+        status="prototype",
+    )
+    kv_cache_config: KVCacheConfig = Field(
+        default_factory=KVCacheConfig,
         status="prototype",
     )
     cpu_offload_config: CpuOffloadConfig = Field(

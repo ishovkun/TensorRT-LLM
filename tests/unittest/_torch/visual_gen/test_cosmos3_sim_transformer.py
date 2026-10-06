@@ -379,7 +379,9 @@ def make_sim_pipeline(model):
     torch.nn.Module.__init__(pipe)  # BasePipeline is a Module; skip its loading constructor
     pipe.transformer = model
     pipe.sim = Cosmos3SimSettings.from_pretrained_config({SIM_CONFIG_KEY: SIM_BLOCK})
-    pipe._sim_caches = {}
+    pipe._history_frames = pipe.sim.history_frames
+    pipe._sim_cache_obj = None
+    pipe._sim_cache_key = None
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         {
             "num_train_timesteps": 1000,
@@ -394,7 +396,11 @@ def make_sim_pipeline(model):
     pipe.sampling = Cosmos3SamplingPolicy.from_scheduler(pipe.scheduler)
     pipe.offloader = SimpleNamespace(context_if_requested=lambda name: nullcontext())
     pipe._device = DEVICE
-    pipe.pipeline_config = SimpleNamespace(torch_dtype=DTYPE)
+    pipe.pipeline_config = SimpleNamespace(
+        torch_dtype=DTYPE, kv_cache=SimpleNamespace(free_gpu_memory_fraction=0.9)
+    )
+    pipe.vae_scale_factor_temporal = 4
+    pipe.vae_scale_factor_spatial = 16
     pipe._scheduler_cache = {}
     pipe._release_scheduler_solver_state = lambda: None
     return pipe
@@ -445,7 +451,8 @@ def rollout(model, num_latent_frames, seed, conditioned_first_frame=False):
         )
     torch.cuda.synchronize()
     assert audio is None and do_audio is False and actions is prepared.action_latents
-    cache = pipe._sim_caches[A + (H // 2) * (W // 2)]
+    cache = pipe._sim_cache_obj
+    assert pipe._sim_cache_key == A + (H // 2) * (W // 2)
     return out, latents, cache
 
 
