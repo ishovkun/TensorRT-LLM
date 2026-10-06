@@ -205,10 +205,15 @@ def first_chunk(model, cache, first_frame=0):
 
 
 def test_first_chunk_matches_the_bidirectional_forward():
-    """A first chunk sees the prompt and itself, exactly what the bidirectional
+    """A first chunk sees the prompt and itself, which is what the bidirectional
     forward sees over the same frames when its action rows carry the same
-    positions. cuDNN serves both paths (the bidirectional one cannot run on
-    trtllm-gen); a chunk placed one frame later is the negative control."""
+    positions. One thing the bidirectional model cannot express: frame 0's rows
+    are the null action, placed at frame 0's own time with their values dropped
+    from the cache, so the action output is not compared; the video output is.
+    cuDNN serves both paths (the bidirectional one cannot run on trtllm-gen); a
+    chunk placed one frame later is the negative control. A cached frame would
+    not be a valid comparison at all: bidirectional keys of a conditioned frame
+    depend on the frames after it, causal ones do not."""
     model = build_model("CUDNN")
     cache = make_cache(model)
     try:
@@ -227,14 +232,12 @@ def test_first_chunk_matches_the_bidirectional_forward():
                 fps=24.0,
                 action_latents=actions,
                 action_domain_ids=domain,
-                # conditioning rows, as the pipeline passes them: no timestep embedding
                 action_noisy_mask=torch.zeros(1, actions.shape[1], 1, device=DEVICE),
                 action_start_frame_offset=-(A - 1),  # rows of frames 0.., as the Sim packing
             )
             model.reset_cache()
         torch.cuda.synchronize()
         assert_same_model_output(out.video, ref.video, label="video")
-        assert_same_model_output(out.action, ref.action, label="action")
         assert_different_model_output(shifted.video, ref.video, label="chunk one frame later")
         assert cache.past_tokens == TEXT_LEN, "a denoising forward commits nothing"
     finally:

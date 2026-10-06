@@ -106,7 +106,8 @@ def sim_position_ids(
     Vision tokens of absolute frame ``f`` sit at time ``text_len + margin +
     f * base_fps / fps``; frame ``f``'s four action rows sit a quarter frame apart
     just before it, ending at its time, like the bidirectional model's actions
-    for frames ``1 ..`` with ``action_start_frame_offset = 1``.
+    for frames ``1 ..`` with ``action_start_frame_offset = 1``. Frame 0's rows are
+    the null action and all sit at frame 0's time.
     """
     from .transformer_cosmos3 import (  # the transformer imports this module
         compute_mrope_position_ids_action,
@@ -145,7 +146,11 @@ def sim_position_ids(
         start_frame_offset=first_frame * temporal_compression_factor - (a - 1),
     )
     dtype = torch.promote_types(vision.dtype, action.dtype)
-    per_frame = torch.cat(
-        [action.to(dtype).view(3, n, a), vision.to(dtype).view(3, n, packing.vision_tokens)], dim=2
-    )
+    action = action.to(dtype).view(3, n, a)
+    vision = vision.to(dtype).view(3, n, packing.vision_tokens)
+    if first_frame == 0:
+        # Frame 0 has no action before it: its rows are the null action, which the
+        # reference places at frame 0's own time rather than leading into it.
+        action[0, 0] = vision[0, 0, 0]
+    per_frame = torch.cat([action, vision], dim=2)
     return per_frame.reshape(3, packing.num_tokens)

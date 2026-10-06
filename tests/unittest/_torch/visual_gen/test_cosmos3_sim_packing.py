@@ -75,6 +75,8 @@ def test_positions_follow_the_spec(first_frame, num_frames, fps):
             [frame_time - (A - 1 - j) * (BASE_FPS / fps) / TCF for j in range(A)],
             dtype=torch.double,
         )
+        if f == 0:
+            expected_action = torch.full((A,), float(frame_time), dtype=expected_action.dtype)
         torch.testing.assert_close(ids[0, a_slice], expected_action, atol=1e-4, rtol=0)
         assert torch.all(ids[0, v_slice] == frame_time)
         assert torch.equal(ids[1, v_slice], torch.arange(H).repeat_interleave(W).double())
