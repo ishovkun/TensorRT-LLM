@@ -17,7 +17,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanRMSNorm, WanVAE, WanVAEConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -48,3 +48,21 @@ def test_stream_decode_matches_whole_clip_decode(chunks):
         vae.decode_stream_start()
         vae.decode_stream_step(z[:, :, :2])
     vae.decode_stream_end()
+
+
+def test_fused_channel_norm_matches_the_eager_norm():
+    """Channels-last bf16 video goes through the fused channel RMSNorm; any other
+    layout or dtype through the eager chain. The two agree to bf16 rounding."""
+    torch.manual_seed(1)
+    norm = WanRMSNorm(96, images=False).cuda().to(torch.bfloat16)
+    with torch.no_grad():
+        norm.gamma.mul_(torch.rand_like(norm.gamma) * 2)
+    x = (torch.randn(1, 96, 3, 20, 24, device="cuda") * 3).to(torch.bfloat16)
+    eager = norm(x)  # NCTHW contiguous: eager path
+    fused = norm(x.to(memory_format=torch.channels_last_3d))
+    assert fused.is_contiguous(memory_format=torch.channels_last_3d)
+    torch.testing.assert_close(fused.contiguous(), eager, rtol=2e-2, atol=2e-2)
+    ref = torch.nn.functional.normalize(x.float(), dim=1) * norm.scale * norm.gamma.float()
+    for name, y in (("eager", eager), ("fused", fused)):
+        err = (y.float() - ref).abs().max().item()
+        assert err < 0.05 * ref.abs().max().item(), f"{name}: {err}"

@@ -32,6 +32,8 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
+from tensorrt_llm._torch.custom_ops import IS_FLASHINFER_AVAILABLE
+
 # Trailing temporal frames cached across chunks so the causal Conv3d (temporal
 # kernel size 3, i.e. 2 frames of left context) stays continuous when encode /
 # decode run frame-by-frame.
@@ -1094,6 +1096,9 @@ class WanRMSNorm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fused = self._fused_channel_norm(x)
+        if fused is not None:
+            return fused
         norm_dim = 1 if self.channel_first else -1
         # Normalize in fp32 for low-precision dtypes, then cast back, to avoid
         # eps underflow producing NaNs (matches diffusers AutoencoderKLWan >=0.38.0).
@@ -1102,6 +1107,29 @@ class WanRMSNorm(nn.Module):
         )
         normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=norm_dim).to(x.dtype)
         return normalized * self.scale * self.gamma + self.bias
+
+    def _fused_channel_norm(self, x: torch.Tensor) -> torch.Tensor | None:
+        """``x / ||x||_C * sqrt(C) * gamma`` is an RMSNorm over the channel axis with
+        weight ``gamma``. For channels-last bf16/fp16 video tensors the channels are
+        contiguous, so one fused kernel over a ``[pixels, C]`` view does the work of
+        the six-kernel eager chain (fp32 math, weight in fp32, one rounding)."""
+        if (
+            not self.channel_first
+            or x.ndim != 5
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or not x.is_contiguous(memory_format=torch.channels_last_3d)
+            or not isinstance(self.bias, float)
+            or not IS_FLASHINFER_AVAILABLE
+        ):
+            return None
+        channels = x.shape[1]
+        rows = x.permute(0, 2, 3, 4, 1).reshape(-1, channels)  # a view: channels are innermost
+        weight = self.gamma.reshape(-1).to(x.dtype)
+        out = torch.ops.trtllm.flashinfer_rmsnorm(rows, weight, 1e-12)
+        out = out.view(x.shape[0], x.shape[2], x.shape[3], x.shape[4], channels).permute(
+            0, 4, 1, 2, 3
+        )
+        return out + self.bias if self.bias else out
 
 
 class WanUpsample(nn.Upsample):
