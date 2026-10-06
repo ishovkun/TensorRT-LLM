@@ -395,6 +395,9 @@ class _ResolvedRequest:
     use_state: bool
     action_content_height: Optional[int]
     action_content_width: Optional[int]
+    action_row_domain_ids: Optional[tuple[int, ...]] = None
+    """One embodiment id per action row, when the request gave a list; the rollout
+    may switch embodiment mid-trajectory."""
 
 
 @dataclass
@@ -409,6 +412,7 @@ class _PreparedLatents:
     action_velocity_mask: Optional[torch.Tensor] = None
     action_condition_latents: Optional[torch.Tensor] = None
     action_domain_id: Optional[int] = None
+    action_row_domain_ids: Optional[tuple[int, ...]] = None
     action_frame_offset: int = 1
     action_state_rows: int = 0
     raw_action_dim: Optional[int] = None

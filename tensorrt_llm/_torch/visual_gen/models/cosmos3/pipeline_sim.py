@@ -22,7 +22,7 @@ class_name`` fallback, where it would load and produce wrong video.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 import torch
@@ -46,6 +46,18 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
 
 def _optional_int(value: Any) -> Optional[int]:
     return None if value is None else int(value)
+
+
+def split_row_domain_ids(domain_id: Any) -> tuple[Any, Optional[tuple[int, ...]]]:
+    """A request's ``domain_id`` is one id or one id per action row. Returns the id
+    the generic resolution should see (the first row's) and the per-row tuple, or
+    ``(domain_id, None)`` for a single id."""
+    if not isinstance(domain_id, (list, tuple)):
+        return domain_id, None
+    if not domain_id:
+        raise ValueError("Cosmos3 Sim domain_id list must not be empty.")
+    row_ids = tuple(int(d) for d in domain_id)
+    return row_ids[0], row_ids
 
 
 @dataclass(frozen=True)
@@ -286,10 +298,14 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
     ):
         """The checkpoint, not the generic embodiment table, says which domain id and
         action width an embodiment has on this model."""
+        domain_id, row_ids = split_row_domain_ids(domain_id)
         if normalize_action_mode(action_mode) is not None:
             domain_name, domain_id, raw_action_dim = self.sim.action_contract(
                 domain_name, domain_id, raw_action_dim
             )
+            if row_ids is not None:
+                for d in set(row_ids):
+                    self.sim.action_contract(None, d, raw_action_dim)
         resolved = super()._resolve_request(
             action_mode=action_mode,
             domain_name=domain_name,
@@ -297,8 +313,22 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             raw_action_dim=raw_action_dim,
             **kwargs,
         )
+        if row_ids is not None:
+            if (
+                resolved.action_chunk_size is not None
+                and len(row_ids) != resolved.action_chunk_size
+            ):
+                raise ValueError(
+                    f"Cosmos3 Sim got {len(row_ids)} domain ids for {resolved.action_chunk_size} action rows."
+                )
+            resolved = replace(resolved, action_row_domain_ids=row_ids)
         self.check_envelope(resolved.height, resolved.width, resolved.num_frames)
         return resolved
+
+    def _prepare_request_latents(self, request, **kwargs):
+        prepared = super()._prepare_request_latents(request, **kwargs)
+        prepared.action_row_domain_ids = request.action_row_domain_ids
+        return prepared
 
     def check_envelope(self, height: int, width: int, num_frames: int) -> None:
         """Refuse what the checkpoint does not serve. The cache was sized at the
@@ -519,12 +549,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         Hp, Wp, _, _ = tf._pad_to_patch_size(H, W)
         A = sim.action_tokens_per_frame
         tokens_per_frame = A + Hp * Wp
-        actions = self._sim_action_rows(request, prepared, num_latent_frames, A, latents)
-        domain = (
-            torch.tensor([prepared.action_domain_id], dtype=torch.long, device=self.device)
-            if prepared.action_domain_id is not None
-            else None
-        )
+        actions, domains = self._sim_action_rows(request, prepared, num_latent_frames, A, latents)
         velocity_mask = prepared.velocity_mask
         offload = self.offloader.context_if_requested
 
@@ -543,6 +568,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 self._refresh_cache_metadata(cache, f1 - f0, tokens_per_frame)
                 x = latents[:, :, f0:f1]
                 chunk_actions = actions[:, f0 * A : f1 * A]
+                domain = domains[f0 * A : f1 * A]
                 mask = velocity_mask[:, :, f0:f1] if velocity_mask is not None else None
                 if mask is None or bool((mask > 0).any()):
                     # The scheduler restarts per chunk: same four noise levels,
@@ -591,30 +617,36 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     def _sim_action_rows(
         self, request, prepared, num_latent_frames: int, A: int, latents: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """``[1, T * A, action_dim]`` action rows, frame-major: frame ``f`` gets the ``A``
-        rows that lead into it. Frame 0 has nothing before it and gets null (zero)
-        rows; without an action stream every frame does."""
+        rows that lead into it, and ``[T * A]`` embodiment ids, one per row. Frame 0
+        has nothing before it and gets null (zero) rows in the first real row's
+        embodiment; without an action stream every frame does."""
+        tf = self.transformer
         rows = torch.zeros(
-            1,
-            num_latent_frames * A,
-            self.transformer.action_dim,
-            device=self.device,
-            dtype=self.dtype,
+            1, num_latent_frames * A, tf.action_dim, device=self.device, dtype=self.dtype
         )
+        first_domain = prepared.action_domain_id or 0
+        domains = torch.full((num_latent_frames * A,), first_domain, dtype=torch.long)
         given = prepared.action_latents
-        if given is None:
-            return rows
-        if prepared.action_state_rows:
-            raise ValueError("Cosmos3 Sim does not take a state row; pass the trajectory only.")
-        needed = (num_latent_frames - 1) * A
-        if given.shape[1] < needed:
-            raise ValueError(
-                f"{given.shape[1]} action rows for {num_latent_frames} latent frames; "
-                f"frames 1.. need {needed} ({A} per latent frame)"
-            )
-        rows[:, A : A + needed] = given[:, :needed]
-        return rows
+        if given is not None:
+            if prepared.action_state_rows:
+                raise ValueError("Cosmos3 Sim does not take a state row; pass the trajectory only.")
+            needed = (num_latent_frames - 1) * A
+            if given.shape[1] < needed:
+                raise ValueError(
+                    f"{given.shape[1]} action rows for {num_latent_frames} latent frames; "
+                    f"frames 1.. need {needed} ({A} per latent frame)"
+                )
+            rows[:, A : A + needed] = given[:, :needed]
+            if prepared.action_row_domain_ids is not None:
+                ids = torch.tensor(prepared.action_row_domain_ids[:needed], dtype=torch.long)
+                domains[A : A + needed] = ids
+                domains[:A] = ids[0]
+        domains = domains.to(self.device)
+        tf.action_proj_in.validate_domain_ids(domains)
+        tf.domain_ids_validated = True
+        return rows, domains
 
 
 __all__ = [

@@ -1734,7 +1734,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             with torch.autocast("cuda", enabled=True, dtype=torch.float32):
                 time_embed = self.time_embedder(raw_timestep * self.timestep_scale)
             hidden_vis = hidden_vis + time_embed.to(hidden_vis.dtype).unsqueeze(1)
-        hidden_action = self.action_proj_in(self.pack_action(action_latents), action_domain_ids)
+        hidden_action = self._project_action_rows(
+            self.action_proj_in, self.pack_action(action_latents), action_domain_ids
+        )
         hidden_action = hidden_action + self.action_modality_embed.to(hidden_action.dtype)
         hidden = packing.interleave(hidden_vis, hidden_action)
 
@@ -1783,8 +1785,25 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden = self.sharder.gather(hidden, dim=1, unpad_to=num_tokens)
         vision, action = packing.split(hidden)
         video_vel = self.unpatchify(self.llm2vae(vision), T, H, W)
-        action_vel = self.unpack_action(self.action_proj_out(action, action_domain_ids))
+        action_vel = self.unpack_action(
+            self._project_action_rows(self.action_proj_out, action, action_domain_ids)
+        )
         return video_vel, action_vel
+
+    @staticmethod
+    def _project_action_rows(
+        proj: DomainAwareLinear, rows: torch.Tensor, domain_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """``rows`` ``[1, N, D]`` through the domain-aware projection with either one
+        id for the whole chunk or one id per row (a trajectory that switches
+        embodiment); the per-row form gathers one small weight per row."""
+        if domain_ids.numel() == 1:
+            return proj(rows, domain_ids)
+        if domain_ids.numel() != rows.shape[1]:
+            raise ValueError(
+                f"{domain_ids.numel()} action domain ids for {rows.shape[1]} action rows"
+            )
+        return proj(rows[0], domain_ids).unsqueeze(0)
 
     def _sim_rope_tables(
         self,

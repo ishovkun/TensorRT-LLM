@@ -24,6 +24,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_sim import (
     Cosmos3NanoSimBimanualPipeline,
     Cosmos3SimSettings,
     SimEmbodiment,
+    split_row_domain_ids,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 
@@ -185,3 +186,18 @@ def test_envelope_check_refuses_larger_requests():
         pipe.check_envelope(720, 1280, 33)
     with pytest.raises(ValueError, match="901 frames"):
         pipe.check_envelope(480, 832, 905)
+
+
+def test_domain_id_may_be_one_per_action_row():
+    assert split_row_domain_ids(None) == (None, None)
+    assert split_row_domain_ids(15) == (15, None)
+    assert split_row_domain_ids([15, 15, 2, 2]) == (15, (15, 15, 2, 2))
+    with pytest.raises(ValueError, match="must not be empty"):
+        split_row_domain_ids([])
+    # every row's id is checked against the checkpoint's embodiment table
+    s = Cosmos3SimSettings.from_pretrained_config(
+        {SIM_CONFIG_KEY: dict(CHECKPOINT_BLOCK, conditioning=CONDITIONING_SCHEMA_5)}
+    )
+    assert s.action_contract(None, 2, 59) == ("camera_pose", 2, 59)
+    with pytest.raises(ValueError, match="contradicts the checkpoint"):
+        s.action_contract(None, 2, 29)

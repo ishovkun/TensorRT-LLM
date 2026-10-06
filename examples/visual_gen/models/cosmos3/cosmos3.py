@@ -541,7 +541,23 @@ def main():
         params.extra_params["view_point"] = args.view_point
     if args.action_json is not None:
         with open(args.action_json, encoding="utf-8") as f:
-            params.extra_params["action"] = json.load(f)
+            action_payload = json.load(f)
+        if isinstance(action_payload, dict) and "action" in action_payload:
+            # Sidecar object: {"action_space", "action": [T, D], "domain_names": [T]}.
+            # Values are already in the checkpoint's normalized space; a domain
+            # name per row becomes a domain id per row.
+            params.extra_params["action"] = action_payload["action"]
+            names = action_payload.get("domain_names")
+            if names:
+                from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+                    EMBODIMENT_TO_DOMAIN_ID,
+                )
+
+                params.extra_params["domain_id"] = [
+                    EMBODIMENT_TO_DOMAIN_ID[str(n).strip().lower()] for n in names
+                ]
+        else:
+            params.extra_params["action"] = action_payload
     if args.video_path is not None:
         params.video_reference = [MediaRef(content=args.video_path, format="path")]
     if args.extra_params:

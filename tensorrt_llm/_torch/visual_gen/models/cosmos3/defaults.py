@@ -796,9 +796,12 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         ),
     ),
     "domain_id": ExtraParamSchema(
-        type="int",
+        type="int | list[int]",
         default=None,
-        description="Embodiment domain id for action generation.",
+        description=(
+            "Embodiment domain id for action generation. The causal Sim pipelines also "
+            "take one id per action row, for trajectories that switch embodiment."
+        ),
     ),
     "raw_action_dim": ExtraParamSchema(
         type="int",

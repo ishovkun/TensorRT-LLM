@@ -500,3 +500,58 @@ def test_chunk_loop_under_cuda_graphs_matches_eager(model):
     torch.cuda.synchronize()
     assert_same_model_output(graphed, eager, label="rollout under CUDA graphs")
     assert cache.is_open is False
+
+
+def test_per_row_domain_ids_match_one_id_when_they_agree(model):
+    """A chunk with one id per action row, all the same, equals the one-id path."""
+    cache = make_cache(model)
+    try:
+        open_with_prompt(model, cache)
+        latents, actions = frames(CHUNK_FRAMES, seed=17, channels=model.latent_channel_size)
+        one = torch.tensor([3], device=DEVICE)
+        rows = torch.full((actions.shape[1],), 3, device=DEVICE)
+        outs = []
+        with torch.inference_mode():
+            for ids in (one, rows):
+                model.reset_cache()
+                out = model.forward_causal(
+                    latents,
+                    torch.full((1,), 500.0, device=DEVICE),
+                    kv_cache=cache,
+                    first_frame=0,
+                    text_len=TEXT_LEN,
+                    action_latents=actions,
+                    action_domain_ids=ids,
+                    fps=24.0,
+                )
+                outs.append((out.video.clone(), out.action.clone()))
+        torch.cuda.synchronize()
+        # per-row ids go through a batched matmul (one small weight per row), the
+        # one-id path through one matmul: same math, different summation order
+        assert_same_model_output(outs[1][0], outs[0][0], label="video, per-row domain ids")
+        assert_same_model_output(outs[1][1], outs[0][1], label="action, per-row domain ids")
+    finally:
+        cache.shutdown()
+
+
+def test_sim_action_rows_carry_per_row_domains(model):
+    """Frame f's rows get the action rows that lead into it and their embodiment;
+    frame 0's null rows take the first real row's embodiment."""
+    pipe = make_sim_pipeline(model)
+    T, given_rows = 5, (5 - 1) * A
+    given = torch.randn(1, given_rows, model.action_dim, device=DEVICE, dtype=DTYPE)
+    ids = tuple([3] * (2 * A) + [1] * (2 * A))  # frames 1-2 embodiment 3, frames 3-4 embodiment 1
+    prepared = SimpleNamespace(
+        action_latents=given, action_state_rows=0, action_domain_id=3, action_row_domain_ids=ids
+    )
+    rows, domains = pipe._sim_action_rows(None, prepared, T, A, None)
+    assert rows.shape == (1, T * A, model.action_dim) and domains.shape == (T * A,)
+    assert rows[:, :A].abs().max().item() == 0.0
+    torch.testing.assert_close(rows[:, A:], given)
+    assert domains[:A].tolist() == [3] * A
+    assert domains[A:].tolist() == list(ids)
+    assert model.domain_ids_validated
+    # one id for the whole request fills every row
+    prepared.action_row_domain_ids = None
+    _, domains = pipe._sim_action_rows(None, prepared, T, A, None)
+    assert domains.tolist() == [3] * (T * A)
