@@ -90,6 +90,8 @@ add_library(
   ulyssesPostUnscatterOp.cpp
   ulyssesPermuteScatterOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
+  wanVaeNormSiluOp.cpp
+  wanVaeUpsampleOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp

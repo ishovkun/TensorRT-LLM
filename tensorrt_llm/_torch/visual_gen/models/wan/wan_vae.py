@@ -159,6 +159,173 @@ def _to_channels_last(module: nn.Module) -> None:
         module.to(memory_format=torch.channels_last)
 
 
+@lru_cache(maxsize=1)
+def _norm_silu_op():
+    """The fused bias + shortcut + channel RMSNorm + SiLU kernel, or None on a build without it."""
+    try:
+        return torch.ops.trtllm.wan_vae_norm_silu
+    except (AttributeError, RuntimeError):
+        return None
+
+
+_NORM_EPS = 1e-12  # F.normalize's clamp, which the channel norm derives from
+
+
+def _glue_fusable(x: torch.Tensor, *channels: int) -> bool:
+    """Whether ``x`` and the given channel widths can go through the fused glue kernel."""
+    return (
+        _norm_silu_op() is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.ndim == 5
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+        and all(c % 8 == 0 and c <= 1024 for c in (x.shape[1], *channels))
+    )
+
+
+def _rows(x: torch.Tensor) -> torch.Tensor:
+    """Channels-last ``[B, C, T, H, W]`` seen as ``[B, T*H*W, C]`` pixel rows (a view)."""
+    batch, channels = x.shape[0], x.shape[1]
+    return x.permute(0, 2, 3, 4, 1).reshape(batch, -1, channels)
+
+
+class _PendingAdd:
+    """A convolution output whose bias and the block's shortcut have not been added yet.
+
+    The residual block hands this to whatever consumes its output, so the adds happen inside
+    the consumer's fused norm kernel instead of as separate passes over the video. Anything
+    that needs a plain tensor calls ``materialize()``, which resolves the sum in place into
+    ``x`` (so a caller holding ``x`` sees the finished residual stream).
+    """
+
+    __slots__ = ("x", "bias", "residual", "residual_bias")
+
+    def __init__(
+        self,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        residual: torch.Tensor | None = None,
+        residual_bias: torch.Tensor | None = None,
+    ) -> None:
+        self.x = x
+        self.bias = bias
+        self.residual = residual
+        self.residual_bias = residual_bias
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.x.shape
+
+    def materialize(self) -> torch.Tensor:
+        x = self.x
+        if _glue_fusable(x) and (self.residual is None or _glue_fusable(self.residual)):
+            _norm_silu_op()(
+                _rows(x),
+                self.bias,
+                _rows(self.residual) if self.residual is not None else None,
+                self.residual_bias,
+                None,
+                _NORM_EPS,
+                _rows(x),
+                None,
+            )
+        else:
+            shape = (1, -1, 1, 1, 1)
+            if self.bias is not None:
+                x.add_(self.bias.view(shape))
+            if self.residual is not None:
+                x.add_(self.residual)
+            if self.residual_bias is not None:
+                x.add_(self.residual_bias.view(shape))
+        self.bias = self.residual = self.residual_bias = None
+        return x
+
+
+def _materialized(x: "torch.Tensor | _PendingAdd") -> torch.Tensor:
+    return x.materialize() if isinstance(x, _PendingAdd) else x
+
+
+def _padded_conv_input(
+    conv: "WanCausalConv3d",
+    like: torch.Tensor,
+    feat_cache: list[torch.Tensor | str | None] | None,
+    feat_idx: list[int] | None,
+) -> torch.Tensor:
+    """Allocate ``conv``'s input with its causal context frames already in place, so the
+    fused norm can write the new frames behind them and the conv runs without a ``cat``."""
+    batch, channels, frames, height, width = like.shape
+    context = conv._padding[4]
+    buf = torch.empty(
+        (batch, channels, frames + context, height, width),
+        dtype=like.dtype,
+        device=like.device,
+        memory_format=torch.channels_last_3d,
+    )
+    if context:
+        cache = feat_cache[feat_idx[0]] if feat_cache is not None else None
+        cached = 0 if cache is None else cache.shape[2]
+        if cached < context:
+            buf[:, :, : context - cached].zero_()
+        if cached:
+            buf[:, :, context - cached : context].copy_(cache)
+    return buf
+
+
+def _run_causal_conv(
+    conv: "WanCausalConv3d",
+    buf: torch.Tensor,
+    feat_cache: list[torch.Tensor | str | None] | None,
+    feat_idx: list[int] | None,
+    *,
+    with_bias: bool = False,
+) -> torch.Tensor:
+    """Run ``conv`` on a buffer from ``_padded_conv_input`` and record the next chunk's context."""
+    out = F.conv3d(
+        buf,
+        conv.weight,
+        conv.bias if with_bias else None,
+        conv.stride,
+        conv.padding,
+        conv.dilation,
+        conv.groups,
+    )
+    if feat_cache is not None and conv._padding[4]:
+        feat_cache[feat_idx[0]] = buf[:, :, -CACHE_T:].clone(memory_format=torch.channels_last_3d)
+        feat_idx[0] += 1
+    return _channels_last_3d_if_needed(out)
+
+
+def _norm_silu_into(
+    x: "torch.Tensor | _PendingAdd",
+    gamma: torch.Tensor,
+    conv: "WanCausalConv3d",
+    feat_cache: list[torch.Tensor | str | None] | None,
+    feat_idx: list[int] | None,
+    *,
+    keep_stream: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``silu(norm(x))`` written straight into ``conv``'s padded input, with ``x``'s pending
+    bias and shortcut folded in. Returns ``(stream, conv_input)``; ``stream`` is ``x`` with the
+    adds resolved in place when ``keep_stream`` (the next block's residual), else untouched."""
+    pending = x if isinstance(x, _PendingAdd) else None
+    x = pending.x if pending is not None else x
+    buf = _padded_conv_input(conv, x, feat_cache, feat_idx)
+    frames_out = _rows(buf)[:, conv._padding[4] * x.shape[3] * x.shape[4] :, :]
+    _norm_silu_op()(
+        _rows(x),
+        pending.bias if pending is not None else None,
+        _rows(pending.residual) if pending is not None and pending.residual is not None else None,
+        pending.residual_bias if pending is not None else None,
+        gamma.reshape(-1),
+        _NORM_EPS,
+        _rows(x) if keep_stream and pending is not None else None,
+        frames_out,
+    )
+    if pending is not None:
+        pending.bias = pending.residual = pending.residual_bias = None
+    return x, buf
+
+
 def _activation(name: str):
     if name == "silu":
         return F.silu
@@ -1132,8 +1299,30 @@ class WanRMSNorm(nn.Module):
         return out + self.bias if self.bias else out
 
 
+@lru_cache(maxsize=1)
+def _upsample2x_op():
+    try:
+        return torch.ops.trtllm.wan_vae_upsample2x
+    except (AttributeError, RuntimeError):
+        return None
+
+
 class WanUpsample(nn.Upsample):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.mode in ("nearest", "nearest-exact"):
+            # A gather, exact in any dtype. For 2x on channels-last 16-bit images the
+            # dedicated kernel runs at memory speed; torch's channels-last nearest does not.
+            if (
+                self.scale_factor in (2, 2.0, (2.0, 2.0), (2, 2))
+                and x.ndim == 4
+                and x.dtype in (torch.bfloat16, torch.float16)
+                and x.is_cuda
+                and x.shape[1] % 8 == 0
+                and x.is_contiguous(memory_format=torch.channels_last)
+                and _upsample2x_op() is not None
+            ):
+                return _upsample2x_op()(x)
+            return super().forward(x)
         return super().forward(x.float()).type_as(x)
 
 
@@ -1170,10 +1359,11 @@ class WanResample(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: "torch.Tensor | _PendingAdd",
         feat_cache: list[torch.Tensor | str | None] | None = None,
         feat_idx: list[int] | None = None,
-    ) -> torch.Tensor:
+    ) -> "torch.Tensor | _PendingAdd":
+        x = _materialized(x)
         batch_size, channels, frames, height, width = x.size()
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
@@ -1215,9 +1405,29 @@ class WanResample(nn.Module):
         frames = x.shape[2]
         x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
         x = _channels_last_2d_if_needed(x_4d)
-        x = self.resample(x)
+        pending_bias = None
+        conv = self.resample[-1] if self.mode.startswith("upsample") else None
+        if (
+            type(conv) is WanConv2d
+            and conv.bias is not None
+            and x.dtype == torch.bfloat16
+            and x.is_cuda
+            and conv.out_channels % 8 == 0
+            and conv.out_channels <= 1024
+            and _norm_silu_op() is not None
+        ):
+            x = self.resample[0](x)
+            x = F.conv2d(
+                x, conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups
+            )
+            x = _channels_last_2d_if_needed(x)
+            pending_bias = conv.bias
+        else:
+            x = self.resample(x)
         x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
         x = _channels_last_3d_if_needed(x_5d)
+        if pending_bias is not None:
+            return _PendingAdd(x, pending_bias)
 
         if self.mode == "downsample3d" and feat_cache is not None and feat_idx is not None:
             idx = feat_idx[0]
@@ -1249,14 +1459,73 @@ class WanResidualBlock(nn.Module):
             WanCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
         )
 
+    def _glue_fusable(self, x: "torch.Tensor | _PendingAdd") -> bool:
+        tensor = x.x if isinstance(x, _PendingAdd) else x
+        return (
+            type(self.conv1) is WanCausalConv3d
+            and type(self.conv2) is WanCausalConv3d
+            and (
+                isinstance(self.conv_shortcut, nn.Identity)
+                or type(self.conv_shortcut) is WanCausalConv3d
+            )
+            and self.nonlinearity is F.silu
+            and isinstance(self.norm1.bias, float)
+            and isinstance(self.norm2.bias, float)
+            and _glue_fusable(tensor, self.out_dim)
+            and (not isinstance(x, _PendingAdd) or x.residual is None or _glue_fusable(x.residual))
+        )
+
+    def _forward_fused(
+        self,
+        x: "torch.Tensor | _PendingAdd",
+        feat_cache: list[torch.Tensor | str | None] | None,
+        feat_idx: list[int] | None,
+    ) -> _PendingAdd:
+        """One fused kernel per norm: the previous block's adds, the channel norm and the SiLU
+        land directly in the next convolution's padded input; the convolutions run without
+        their bias, which the consumer of their output folds in."""
+        x, buf = _norm_silu_into(
+            x, self.norm1.gamma, self.conv1, feat_cache, feat_idx, keep_stream=True
+        )
+        if isinstance(self.conv_shortcut, nn.Identity):
+            residual, residual_bias = x, None
+        else:
+            shortcut = self.conv_shortcut
+            residual = _channels_last_3d_if_needed(
+                F.conv3d(
+                    x,
+                    shortcut.weight,
+                    None,
+                    shortcut.stride,
+                    shortcut.padding,
+                    shortcut.dilation,
+                    shortcut.groups,
+                )
+            )
+            residual_bias = shortcut.bias
+        x = _run_causal_conv(self.conv1, buf, feat_cache, feat_idx)
+        _, buf = _norm_silu_into(
+            _PendingAdd(x, self.conv1.bias),
+            self.norm2.gamma,
+            self.conv2,
+            feat_cache,
+            feat_idx,
+            keep_stream=False,
+        )
+        x = _run_causal_conv(self.conv2, buf, feat_cache, feat_idx)
+        return _PendingAdd(x, self.conv2.bias, residual, residual_bias)
+
     def forward(
         self,
-        x: torch.Tensor,
+        x: "torch.Tensor | _PendingAdd",
         feat_cache: list[torch.Tensor | str | None] | None = None,
         feat_idx: list[int] | None = None,
-    ) -> torch.Tensor:
+    ) -> "torch.Tensor | _PendingAdd":
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
+        if self._glue_fusable(x):
+            return self._forward_fused(x, feat_cache, feat_idx)
+        x = _materialized(x)
 
         residual = self.conv_shortcut(x)
         # Fused SiLU and RMSNorm+SiLU commute with causal concatenation and
@@ -1311,7 +1580,8 @@ class WanAttentionBlock(nn.Module):
         self.to_qkv = WanConv2d(dim, dim * 3, 1)
         self.proj = WanConv2d(dim, dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: "torch.Tensor | _PendingAdd") -> torch.Tensor:
+        x = _materialized(x)
         residual = x
         batch_size, channels, frames, height, width = x.size()
         x = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
@@ -1353,7 +1623,7 @@ class WanMidBlock(nn.Module):
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             x = attn(x)
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
-        return _channels_last_3d_if_needed(x)
+        return x if isinstance(x, _PendingAdd) else _channels_last_3d_if_needed(x)
 
 
 class WanResidualDownBlock(nn.Module):
@@ -1392,6 +1662,7 @@ class WanResidualDownBlock(nn.Module):
         residual = x
         for resnet in self.resnets:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        x = _materialized(x)
         if self.downsampler is not None:
             x = self.downsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
         return _channels_last_3d_if_needed(x + self.avg_shortcut(residual))
@@ -1474,12 +1745,9 @@ class WanEncoder3d(nn.Module):
                 x = layer(x)
 
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
-        x = self.nonlinearity(self.norm_out(x))
-        if feat_cache is not None and feat_idx is not None:
-            x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
-        else:
-            x = self.conv_out(x)
-        return _channels_last_3d_if_needed(x)
+        return _norm_silu_conv_out(
+            self.norm_out, self.nonlinearity, self.conv_out, x, feat_cache, feat_idx
+        )
 
 
 class WanResidualUpBlock(nn.Module):
@@ -1520,14 +1788,20 @@ class WanResidualUpBlock(nn.Module):
         feat_idx: list[int] | None = None,
         first_chunk: bool = False,
     ) -> torch.Tensor:
-        residual = x
+        # The first resnet resolves a pending input in place, so this is the finished stream
+        # by the time the shortcut reads it.
+        residual = x.x if isinstance(x, _PendingAdd) else x
         for resnet in self.resnets:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
         if self.upsampler is not None:
-            x = self.upsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            x = self.upsampler(_materialized(x), feat_cache=feat_cache, feat_idx=feat_idx)
         if self.avg_shortcut is not None:
-            x = x + self.avg_shortcut(residual, first_chunk=first_chunk)
-        return _channels_last_3d_if_needed(x)
+            shortcut = self.avg_shortcut(residual, first_chunk=first_chunk)
+            if isinstance(x, _PendingAdd) and x.residual is None and _glue_fusable(shortcut):
+                x.residual = shortcut
+            else:
+                x = _materialized(x) + shortcut
+        return x if isinstance(x, _PendingAdd) else _channels_last_3d_if_needed(x)
 
 
 class WanUpBlock(nn.Module):
@@ -1563,8 +1837,8 @@ class WanUpBlock(nn.Module):
         for resnet in self.resnets:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
         if self.upsamplers is not None:
-            x = self.upsamplers[0](x, feat_cache=feat_cache, feat_idx=feat_idx)
-        return _channels_last_3d_if_needed(x)
+            x = self.upsamplers[0](_materialized(x), feat_cache=feat_cache, feat_idx=feat_idx)
+        return x if isinstance(x, _PendingAdd) else _channels_last_3d_if_needed(x)
 
 
 class WanDecoder3d(nn.Module):
@@ -1644,13 +1918,36 @@ class WanDecoder3d(nn.Module):
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
         for up_block in self.up_blocks:
             x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+        return _norm_silu_conv_out(
+            self.norm_out, self.nonlinearity, self.conv_out, x, feat_cache, feat_idx
+        )
 
-        x = self.nonlinearity(self.norm_out(x))
-        if feat_cache is not None and feat_idx is not None:
-            x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
-        else:
-            x = self.conv_out(x)
-        return _channels_last_3d_if_needed(x)
+
+def _norm_silu_conv_out(
+    norm: WanRMSNorm,
+    nonlinearity,
+    conv: WanCausalConv3d,
+    x: "torch.Tensor | _PendingAdd",
+    feat_cache: list[torch.Tensor | str | None] | None,
+    feat_idx: list[int] | None,
+) -> torch.Tensor:
+    """The encoder's and decoder's ``conv_out(silu(norm_out(x)))`` tail."""
+    tensor = x.x if isinstance(x, _PendingAdd) else x
+    if (
+        type(conv) is WanCausalConv3d
+        and nonlinearity is F.silu
+        and isinstance(norm.bias, float)
+        and _glue_fusable(tensor)
+        and (not isinstance(x, _PendingAdd) or x.residual is None or _glue_fusable(x.residual))
+    ):
+        _, buf = _norm_silu_into(x, norm.gamma, conv, feat_cache, feat_idx, keep_stream=False)
+        return _run_causal_conv(conv, buf, feat_cache, feat_idx, with_bias=True)
+    x = nonlinearity(norm(_materialized(x)))
+    if feat_cache is not None and feat_idx is not None:
+        x = _causal_conv_with_cache(conv, x, feat_cache, feat_idx)
+    else:
+        x = conv(x)
+    return _channels_last_3d_if_needed(x)
 
 
 def patchify(x: torch.Tensor, patch_size: int) -> torch.Tensor:
