@@ -1382,18 +1382,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         statistics undone, or its scaling factor."""
         latents = latents.to(self.vae.dtype)
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            if not hasattr(self, "_latents_mean"):
-                self._latents_mean = (
-                    torch.tensor(self.vae.config.latents_mean)
-                    .view(1, -1, 1, 1, 1)
-                    .to(self.device, self.vae.dtype)
+            stats = getattr(self, "_latents_stats", None)
+            if stats is None or stats[0].device != latents.device:
+                stats = tuple(
+                    torch.tensor(values).view(1, -1, 1, 1, 1).to(latents.device, self.vae.dtype)
+                    for values in (self.vae.config.latents_std, self.vae.config.latents_mean)
                 )
-                self._latents_std = (
-                    torch.tensor(self.vae.config.latents_std)
-                    .view(1, -1, 1, 1, 1)
-                    .to(self.device, self.vae.dtype)
-                )
-            return (latents * self._latents_std) + self._latents_mean
+                self._latents_stats = stats
+            std, mean = stats
+            return (latents * std) + mean
         scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
         return latents / scaling_factor
 
