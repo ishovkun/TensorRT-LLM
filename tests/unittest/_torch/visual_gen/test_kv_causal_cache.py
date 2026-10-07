@@ -270,6 +270,27 @@ def test_write_range_matches_indexed_write(cache):
         cache.write_range(0, cache.capacity - 1, *rand_kv(2))
 
 
+def test_zero_values_clears_v_of_the_range_only(cache):
+    """zero_values clears V of exactly the requested tokens in one layer: partial pages
+    at both ends, whole pages in between, and nothing else (K, the neighbours, the
+    other layers) changes."""
+    open_with_fixed(cache, 20)
+    tpb = cache.tokens_per_page
+    positions = torch.arange(cache.capacity, device=DEVICE)
+    for start, n in ((7, 3), (tpb - 1, 2 * tpb + 5), (tpb, tpb), (20, 1)):
+        for layer in range(NUM_LAYERS):
+            cache.write_range(layer, 0, *stamped_kv(positions, layer))
+        cache.zero_values(1, start, n)
+        inside = (positions >= start) & (positions < start + n)
+        for layer in range(NUM_LAYERS):
+            k_want, v_want = stamped_kv(positions, layer)
+            if layer == 1:
+                v_want[inside] = 0
+            k_back, v_back = read_kv(cache, layer, positions)
+            torch.testing.assert_close(k_back, k_want, rtol=0, atol=0)
+            torch.testing.assert_close(v_back, v_want, rtol=0, atol=0)
+
+
 def test_eviction_keeps_the_window_and_the_fixed_region(cache):
     """Content check across many chunks with a fixed region that shares a page with the history."""
     fixed = 13
