@@ -115,18 +115,23 @@ def model(request):
 
 def make_cache(model):
     tokens_per_frame = A + (H // 2) * (W // 2)
-    chunk = CHUNK_FRAMES * tokens_per_frame
-    return CausalKVCacheManager(
+    geometry = dict(
+        window_tokens=(WINDOW_FRAMES - 1) * tokens_per_frame,
+        max_staged_tokens=CHUNK_FRAMES * tokens_per_frame,
+        causal_block_sizes=tuple(k * tokens_per_frame for k in range(CHUNK_FRAMES, 0, -1)),
+    )
+    cache = CausalKVCacheManager(
         num_layers=len(model.gen_layers),
         num_kv_heads=model.cache_kv_heads,
         head_dim=model.gen_layers[0].cross_attention.head_dim,
         dtype=DTYPE,
         tokens_per_page=32,
-        fixed_capacity=MAX_TEXT,
-        window_tokens=(WINDOW_FRAMES - 1) * tokens_per_frame,
-        chunk_tokens=chunk,
-        causal_block_sizes=tuple(k * tokens_per_frame for k in range(CHUNK_FRAMES, 0, -1)),
+        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+            tokens_per_page=32, pin_tokens=MAX_TEXT, **geometry
+        ),
     )
+    cache.test_geometry = geometry
+    return cache
 
 
 def prompt():
@@ -146,7 +151,7 @@ def frames(num_frames, seed, channels=48):
 
 def open_with_prompt(model, cache):
     text_ids, text_mask = prompt()
-    cache.open(pin_tokens=TEXT_LEN)
+    cache.open(pin_tokens=TEXT_LEN, **cache.test_geometry)
     assert model.write_prompt_kv(cache, text_ids, text_mask) == TEXT_LEN
     cache.commit(TEXT_LEN)
     return text_ids, text_mask

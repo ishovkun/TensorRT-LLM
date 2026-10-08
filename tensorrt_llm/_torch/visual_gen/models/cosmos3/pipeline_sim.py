@@ -467,18 +467,30 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 hi = mid - 1
         return lo
 
+    def _cache_geometry(self, history_frames: int, tokens_per_frame: int) -> dict:
+        """The ``open()`` geometry of a rollout: the window, the most tokens a forward
+        stages (one chunk) and every causal block size a forward may use (a whole
+        chunk for a denoising step, one frame for the clean pass, shorter last chunks)."""
+        sim = self.sim
+        return dict(
+            window_tokens=max(history_frames, 1) * tokens_per_frame,
+            max_staged_tokens=sim.chunk_frames * tokens_per_frame,
+            causal_block_sizes=tuple(k * tokens_per_frame for k in range(sim.chunk_frames, 0, -1)),
+        )
+
+    def _max_pin_tokens(self, tokens_per_frame: int) -> int:
+        return self.sim.text_cache_max_len + self.sim.sink_frames * tokens_per_frame
+
     def _cache_bytes(self, history_frames: int, tokens_per_frame: int) -> int:
-        tf, sim = self.transformer, self.sim
+        tf = self.transformer
         return CausalKVCacheManager.pool_bytes_for(
             num_layers=len(tf.gen_layers),
             num_kv_heads=tf.cache_kv_heads,
             head_dim=tf.gen_layers[0].cross_attention.head_dim,
             dtype=self.dtype,
             tokens_per_page=32,
-            fixed_capacity=sim.text_cache_max_len + sim.sink_frames * tokens_per_frame,
-            window_tokens=max(history_frames, 1) * tokens_per_frame,
-            chunk_tokens=sim.chunk_frames * tokens_per_frame,
-            causal_block_sizes=tuple(k * tokens_per_frame for k in range(sim.chunk_frames, 0, -1)),
+            pin_tokens=self._max_pin_tokens(tokens_per_frame),
+            **self._cache_geometry(history_frames, tokens_per_frame),
         )
 
     def _tokens_per_frame(self, height: int, width: int) -> int:
@@ -572,17 +584,18 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 f"Cosmos3 Sim K/V window of {self._history_frames} frames is below one chunk "
                 f"({self.sim.chunk_frames} frames)."
             )
-        sim, tf = self.sim, self.transformer
+        tf = self.transformer
         self._sim_cache_obj = CausalKVCacheManager(
             num_layers=len(tf.gen_layers),
             num_kv_heads=tf.cache_kv_heads,
             head_dim=tf.gen_layers[0].cross_attention.head_dim,
             dtype=self.dtype,
             tokens_per_page=32,
-            fixed_capacity=sim.text_cache_max_len + sim.sink_frames * tokens_per_frame,
-            window_tokens=self._history_frames * tokens_per_frame,
-            chunk_tokens=sim.chunk_frames * tokens_per_frame,
-            causal_block_sizes=tuple(k * tokens_per_frame for k in range(sim.chunk_frames, 0, -1)),
+            pool_tokens=CausalKVCacheManager.pool_tokens_for(
+                tokens_per_page=32,
+                pin_tokens=self._max_pin_tokens(tokens_per_frame),
+                **self._cache_geometry(self._history_frames, tokens_per_frame),
+            ),
         )
         self._sim_cache_key = tokens_per_frame
         return self._sim_cache_obj
@@ -622,8 +635,16 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         tf.reset_cache()
         timer.mark_denoise_start()
         text_len = int(cond_mask.sum().item())
+        if text_len > sim.text_cache_max_len:
+            raise ValueError(
+                f"prompt of {text_len} tokens exceeds the checkpoint's text cache of "
+                f"{sim.text_cache_max_len} tokens"
+            )
         decoder = self._start_overlapped_decode(latents)
-        cache.open(pin_tokens=text_len + sim.sink_frames * tokens_per_frame)
+        cache.open(
+            pin_tokens=text_len + sim.sink_frames * tokens_per_frame,
+            **self._cache_geometry(self._history_frames, tokens_per_frame),
+        )
         try:
             tf.write_prompt_kv(cache, cond_ids, cond_mask, offload_context=offload)
             cache.commit(text_len)

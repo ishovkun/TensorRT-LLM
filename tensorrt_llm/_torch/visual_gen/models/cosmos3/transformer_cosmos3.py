@@ -1791,10 +1791,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         if text_ids.shape[0] != 1:
             raise ValueError("Cosmos3 Sim runs one video at a time.")
         text_len = int(text_mask.sum().item())
-        if text_len > kv_cache.fixed_capacity:
+        if text_len > kv_cache.pin_tokens:
             raise ValueError(
-                f"prompt of {text_len} tokens exceeds the checkpoint's text cache of "
-                f"{kv_cache.fixed_capacity} tokens"
+                f"prompt of {text_len} tokens does not fit the {kv_cache.pin_tokens} pinned "
+                "tokens the cache was opened with"
             )
         device, dtype = text_ids.device, self.vae2llm.weight.dtype
         freqs_und, _ = self._compute_rope_freqs(text_mask, 1, 1, 1, None, device, dtype)
