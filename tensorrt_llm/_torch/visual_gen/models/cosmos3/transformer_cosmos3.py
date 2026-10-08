@@ -1961,7 +1961,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         # keys, so later frames attend as in training, and lose their
                         # values, so they contribute nothing (the reference zeroes V).
                         action_slots, _ = packing.frame_slices(0)
-                        start = kv_cache.past_tokens + action_slots.start
+                        start = kv_cache.staging_offset + action_slots.start
                         for layer_idx in range(len(self.gen_layers)):
                             kv_cache.zero_values(layer_idx, start, packing.action_tokens)
                     return None

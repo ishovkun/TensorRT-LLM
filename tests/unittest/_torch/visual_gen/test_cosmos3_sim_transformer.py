@@ -248,7 +248,7 @@ def test_first_chunk_matches_the_bidirectional_forward():
         torch.cuda.synchronize()
         assert_same_model_output(out.video, ref.video, label="video")
         assert_different_model_output(shifted.video, ref.video, label="chunk one frame later")
-        assert cache.past_tokens == TEXT_LEN, "a denoising forward commits nothing"
+        assert cache.staging_offset == TEXT_LEN, "a denoising forward commits nothing"
     finally:
         cache.shutdown()
         del model
