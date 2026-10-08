@@ -48,7 +48,11 @@ class SingleProcessGroup:
         # so callers can pass it to torch collectives. In a larger job there
         # is no single-rank process group to return, so return this object:
         # its rank() is 0 and size() is 1, which is all a single-rank mapping
-        # needs.
+        # needs. It is not a torch ProcessGroup: a collective handed this
+        # object fails at the call instead of running on the whole job's
+        # group, which is what returning WORLD here used to do. No collective
+        # reaches it today; the VisualGen mapping hands out a mesh group
+        # whenever the mapping spans more than one rank.
         if dist.is_initialized() and dist.get_world_size() == 1:
             return dist.group.WORLD
         return SingleProcessGroup()
