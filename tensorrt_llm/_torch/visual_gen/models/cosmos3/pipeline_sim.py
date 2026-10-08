@@ -531,31 +531,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         self._cuda_graph_runners["transformer.forward_causal"] = runner
         logger.info("CUDA graph runner: wrapping transformer.forward_causal")
 
-    def _cache_metadata(self):
-        """The trtllm-gen metadata object every layer shares, or ``None`` on a backend
-        that reads the cache's state directly."""
-        attn = self.transformer.gen_layers[0].cross_attention.attn
-        while attn is not None:
-            metadata = getattr(attn, "metadata", None)
-            if metadata is not None and hasattr(metadata, "prepare_with_kv_cache"):
-                return metadata
-            attn = getattr(attn, "inner", None)
-        return None
-
-    def _refresh_cache_metadata(
-        self, cache: CausalKVCacheManager, frames: int, tokens_per_frame: int
-    ) -> None:
-        """Before a chunk's replays: re-prepare the attention metadata for its two
-        blockings (one block for the denoising steps, one block per frame for the
-        clean pass), since a replay does not re-read the cache's lengths."""
-        if not self._cuda_graph_runners:
-            return
-        metadata = self._cache_metadata()
-        if metadata is None:
-            return
-        metadata.prepare_with_kv_cache(cache, 1, frames * tokens_per_frame)
-        metadata.prepare_with_kv_cache(cache, frames, tokens_per_frame)
-
     # ------------------------------------------------------------------ the rollout
 
     def _sim_cache(self, tokens_per_frame: int) -> CausalKVCacheManager:
@@ -652,7 +627,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             step_kwargs = self.sampling.scheduler_step_kwargs(generator)
             zero_t = torch.zeros(1, device=self.device)
             for f0, f1 in sim.chunk_ranges(num_latent_frames):
-                self._refresh_cache_metadata(cache, f1 - f0, tokens_per_frame)
                 x = latents[:, :, f0:f1]
                 chunk_actions = actions[:, f0 * A : f1 * A]
                 domain = domains[f0 * A : f1 * A]

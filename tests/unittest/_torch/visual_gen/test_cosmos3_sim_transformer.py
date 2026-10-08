@@ -91,10 +91,14 @@ def _model_config(backend: str):
     return model_config
 
 
-def build_model(backend: str) -> Cosmos3VFMTransformer:
-    """Same random weights for every backend: the seed covers the initialisation."""
+def build_model(backend: str, mapping=None) -> Cosmos3VFMTransformer:
+    """Same random weights for every backend and rank: the seed covers the
+    initialisation. ``mapping`` shards the sequence (Ulysses) across ranks."""
     torch.manual_seed(0)
-    m = Cosmos3VFMTransformer(model_config=_model_config(backend)).to(DEVICE).eval()
+    model_config = _model_config(backend)
+    if mapping is not None:
+        model_config.visual_gen_mapping = mapping
+    m = Cosmos3VFMTransformer(model_config=model_config).to(DEVICE).eval()
     with torch.no_grad():
         for name, param in m.named_parameters():
             if "norm" in name and name.endswith(".weight"):
