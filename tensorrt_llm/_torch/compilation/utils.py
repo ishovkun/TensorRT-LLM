@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Optional, Union
 
@@ -224,10 +227,11 @@ def inplace_info():
             1: "output"
         },
         # The ordinary outputs are compact Q/index-Q; the next
-        # two outputs of auto_functionalized are the mutated paged caches.
+        # three outputs of auto_functionalized are the mutated paged caches.
         "minimax_m3_fused_sparse_qkv_producer": {
             2: "kv_cache",
-            3: "index_k_cache"
+            3: "index_k_cache",
+            4: "kv_scale_cache"
         },
         "fused_sigmoid_mul_inplace": {
             1: "attention_output"
@@ -246,6 +250,12 @@ def inplace_info():
             1: "output"
         },
         "cute_dsl_bf16_gemm_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_gemm_locality_domain_inplace_rubin": {
+            1: "output"
+        },
+        "cute_dsl_bf16_bmm_locality_domain_inplace_rubin": {
             1: "output"
         },
         "cute_dsl_fp8_bmm_rubin": {

@@ -18,6 +18,7 @@
 
 import java.lang.InterruptedException
 import groovy.transform.Field
+import com.nvidia.bloom.FailureEvidenceCollector
 import trtllm.FailureClassifier
 import trtllm.exceptions.InfraFailure
 
@@ -520,17 +521,25 @@ def runLLMBuild(
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
-    // place. Runs mypy directly (not via pre-commit) so this step does zero
-    // network: the pre-commit orchestrator clones every remote hook repo from
-    // github up front, which flakes on nodes without github access. mypy and its
+    // place. Runs mypy directly (not via pre-commit) so this step does not clone
+    // anything from github: the pre-commit orchestrator clones every remote hook
+    // repo up front, which flakes on nodes without github access. mypy and its
     // config come from requirements-dev.txt (installed above) via the internal
     // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
     // bindings can't be imported, rather than silently degrading to the
     // lightweight (no-bindings) check.
+    //
+    // The step still talks to the network: [tool.mypy] sets install_types, so
+    // mypy pip-installs the missing stub packages from the internal PyPI mirror
+    // before checking.
     if (typeCheck) {
         echo "-- Running mypy type check with compiled bindings..."
         withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-            sh "cd ${LLM_ROOT} && bash scripts/run_mypy.sh"
+            trtllm_utils.llmExecStepWithRetry(
+                pipeline,
+                script: "cd ${LLM_ROOT} && bash scripts/run_mypy.sh",
+                shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
+            )
         }
     }
 
@@ -701,7 +710,7 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     }
 }
 
-def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="")
+def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="", reconfigure=false)
 {
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -738,7 +747,14 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+    def buildCommand = "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}"
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"${buildCommand}\"")
+    if (reconfigure) {
+        // Verify that reconfiguration works.
+        // Configure the built tree again with identical arguments and rebuild it incrementally,
+        // so CMake logic that only breaks once the cache and fetched dependencies exist fails CI.
+        sh "bash -c \"${buildCommand} --configure_cmake --skip_building_wheel\""
+    }
 }
 
 def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
@@ -858,7 +874,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks", true)
                         }
                     }
                 })
@@ -876,7 +892,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         // ENABLE_INFRA_SCOPED_FAILFAST; off = plain failFast + parallel, as before.
         trtllm_utils.runBranchesWithInfraDefer(pipeline, parallelJobs, enableFailFast,
                 ENABLE_INFRA_SCOPED_FAILFAST) { e, stageName ->
-            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)
+            def evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, e, FailureClassifier.failureEvidenceQueries(InfraFailure.K8S))
+            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S, evidence)
         }
     } // Build stage
 }
@@ -898,7 +915,7 @@ pipeline {
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
         GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
     }
