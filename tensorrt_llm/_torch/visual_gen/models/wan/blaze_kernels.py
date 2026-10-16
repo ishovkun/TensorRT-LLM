@@ -1,0 +1,348 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Fused kernels for VaeBlaze. Triton prototypes; each has an exact PyTorch fallback."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+_NORM_EPS = 1e-12  # F.normalize default
+_MAX_TILE_ELEMENTS = 4096
+
+
+def cuda_op_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_rms_norm_silu")
+
+
+# (lanes per row, 16-byte vectors per lane) layouts instantiated in vaeRmsNormSiluKernel.cu.
+_CUDA_LAYOUTS = {(32, 1), (32, 2), (32, 4), (4, 5), (8, 5), (16, 5), (2, 3), (4, 3),
+                 (1, 1), (2, 1), (4, 1), (8, 1), (16, 1), (1, 3), (32, 3)}
+
+
+def _cuda_layout(channels: int) -> tuple[int, int] | None:
+    if channels % 8:
+        return None
+    nvec = channels // 8
+    lanes = 32
+    while nvec % lanes:
+        lanes //= 2
+    layout = (lanes, nvec // lanes)
+    return layout if layout in _CUDA_LAYOUTS else None
+
+
+def can_use_cuda_rms_norm_silu(x: torch.Tensor) -> bool:
+    return (
+        cuda_op_available()
+        and x.is_cuda
+        and x.dtype is torch.bfloat16
+        and _cuda_layout(x.shape[1]) is not None
+        and _channel_rows(x) is not None
+    )
+
+
+def _channel_rows(x: torch.Tensor) -> torch.Tensor | None:
+    """View a channels-last NC(T)HW tensor as [positions, C] without copying."""
+    if x.dim() == 5:
+        if not x.is_contiguous(memory_format=torch.channels_last_3d):
+            return None
+        return x.permute(0, 2, 3, 4, 1).reshape(-1, x.shape[1])
+    if x.dim() == 4:
+        if not x.is_contiguous(memory_format=torch.channels_last):
+            return None
+        return x.permute(0, 2, 3, 1).reshape(-1, x.shape[1])
+    return None
+
+
+def can_fuse_rms_norm_silu(x: torch.Tensor) -> bool:
+    return (
+        x.is_cuda
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.dim() in (4, 5)
+        and x.shape[1] <= _MAX_TILE_ELEMENTS
+        and _channel_rows(x) is not None
+    )
+
+
+@triton.jit
+def _rms_norm_silu_kernel(
+    x_ptr,
+    y_ptr,
+    gamma_ptr,
+    bias_ptr,
+    n_rows,
+    scale,
+    eps,
+    C: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    REFERENCE_ROUNDING: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    # One program normalizes BLOCK_M positions; channels are contiguous per position.
+    row0 = tl.program_id(0).to(tl.int64) * BLOCK_M
+    rows = row0 + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_C)
+    row_ok = rows < n_rows
+    col_ok = cols < C
+    mask = row_ok[:, None] & col_ok[None, :]
+    offs = rows[:, None] * C + cols[None, :]
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    xf = x.to(tl.float32)
+    sumsq = tl.sum(xf * xf, axis=1)
+    denom = tl.maximum(tl.sqrt(sumsq), eps)
+    n = xf / denom[:, None]
+    gamma = tl.load(gamma_ptr + cols, mask=col_ok, other=0.0)
+    if REFERENCE_ROUNDING:
+        # Today's eager sequence: round to the activation dtype after normalize,
+        # after each multiply and after the bias add; SiLU in fp32 on that value.
+        n = n.to(x.dtype).to(tl.float32)
+        r = (n * scale).to(x.dtype).to(tl.float32)
+        r = (r * gamma.to(tl.float32)).to(x.dtype).to(tl.float32)
+        if HAS_BIAS:
+            b = tl.load(bias_ptr + cols, mask=col_ok, other=0.0)
+            r = (r + b.to(tl.float32)).to(x.dtype).to(tl.float32)
+    else:
+        r = n * scale * gamma.to(tl.float32)
+        if HAS_BIAS:
+            b = tl.load(bias_ptr + cols, mask=col_ok, other=0.0)
+            r = r + b.to(tl.float32)
+    y = r * tl.sigmoid(r)
+    tl.store(y_ptr + offs, y.to(x.dtype), mask=mask)
+
+
+def rms_norm_silu_cuda(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale: float,
+    *,
+    reference_rounding: bool = False,
+    in_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The CUDA op (``trtllm::vae_rms_norm_silu``); same contract as ``rms_norm_silu``.
+
+    ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
+    """
+    rows = _channel_rows(x)
+    if rows is None:
+        raise ValueError("rms_norm_silu_cuda needs a channels-last CUDA tensor")
+    out_rows = torch.ops.trtllm.vae_rms_norm_silu(
+        rows,
+        gamma.reshape(-1),
+        bias.reshape(-1) if bias is not None else None,
+        float(scale),
+        reference_rounding,
+        in_bias.reshape(-1) if in_bias is not None else None,
+    )
+    # The op returns [rows, C]; view it back as the channels-last 4D/5D tensor.
+    if x.dim() == 5:
+        n, c, t, h, w = x.shape
+        return out_rows.view(n, t, h, w, c).permute(0, 4, 1, 2, 3)
+    n, c, h, w = x.shape
+    return out_rows.view(n, h, w, c).permute(0, 3, 1, 2)
+
+
+def _rows_to_like(rows: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    """View a [rows, C] result back as the channels-last 4D/5D tensor it came from."""
+    if like.dim() == 5:
+        n, c, t, h, w = like.shape
+        return rows.view(n, t, h, w, c).permute(0, 4, 1, 2, 3)
+    n, c, h, w = like.shape
+    return rows.view(n, h, w, c).permute(0, 3, 1, 2)
+
+
+def add_rms_norm_silu_cuda(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale: float,
+    *,
+    reference_rounding: bool = False,
+    in_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns ``(s, act)``."""
+    rows = _channel_rows(x)
+    rrows = _channel_rows(residual)
+    if rows is None or rrows is None:
+        raise ValueError("add_rms_norm_silu_cuda needs channels-last CUDA tensors")
+    s_rows, a_rows = torch.ops.trtllm.vae_add_rms_norm_silu(
+        rows,
+        rrows,
+        gamma.reshape(-1),
+        bias.reshape(-1) if bias is not None else None,
+        float(scale),
+        reference_rounding,
+        in_bias.reshape(-1) if in_bias is not None else None,
+    )
+    return _rows_to_like(s_rows, x), _rows_to_like(a_rows, x)
+
+
+def apply_in_bias(x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor:
+    """Eager form of the deferred convolution bias: ``x + bias`` broadcast over channels."""
+    if in_bias is None:
+        return x
+    return x + in_bias.reshape(1, -1, *([1] * (x.dim() - 2)))
+
+
+def add_rms_norm_silu_reference(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | float,
+    scale: float,
+    in_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    s = apply_in_bias(x, in_bias) + residual
+    return s, rms_norm_silu_reference(s, gamma, bias, scale)
+
+
+def rms_norm_silu(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale: float,
+    *,
+    reference_rounding: bool = False,
+    block_m: int | None = None,
+    num_warps: int | None = None,
+    enable_fp_fusion: bool | None = None,
+) -> torch.Tensor:
+    """SiLU(RMSNorm(x)) for a channels-last tensor, one memory pass (Triton prototype).
+
+    ``gamma``/``bias`` are the module parameters in their stored dtype with any
+    broadcast dims; ``scale`` is ``sqrt(C)``. ``reference_rounding`` reproduces
+    the eager path's intermediate roundings; otherwise everything stays in fp32
+    until the single store.
+    """
+    rows = _channel_rows(x)
+    if rows is None:
+        raise ValueError("rms_norm_silu needs a channels-last CUDA tensor")
+    n_rows, C = rows.shape
+    out = torch.empty_like(x)
+    out_rows = _channel_rows(out)
+    gamma_flat = gamma.reshape(-1)
+    bias_flat = bias.reshape(-1) if bias is not None else gamma_flat  # dummy pointer when unused
+    block_c = triton.next_power_of_2(C)
+    block_m = block_m or max(1, min(64, _MAX_TILE_ELEMENTS // block_c))
+    grid = (triton.cdiv(n_rows, block_m),)
+    _rms_norm_silu_kernel[grid](
+        rows,
+        out_rows,
+        gamma_flat,
+        bias_flat,
+        n_rows,
+        float(scale),
+        _NORM_EPS,
+        C=C,
+        HAS_BIAS=bias is not None,
+        REFERENCE_ROUNDING=reference_rounding,
+        BLOCK_M=block_m,
+        BLOCK_C=block_c,
+        num_warps=num_warps or (4 if block_c <= 512 else 8),
+        # FMA contraction would merge `r * gamma + b` across the intermediate rounding
+        # that reference mode exists to reproduce.
+        enable_fp_fusion=(not reference_rounding) if enable_fp_fusion is None else enable_fp_fusion,
+    )
+    return out
+
+
+def rms_norm_silu_reference(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | float,
+    scale: float,
+    in_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The eager path, verbatim (WanRMSNorm.forward followed by F.silu)."""
+    x = apply_in_bias(x, in_bias)
+    needs_fp32 = x.dtype in (torch.float16, torch.bfloat16)
+    normalized = F.normalize(x.float() if needs_fp32 else x, dim=1).to(x.dtype)
+    return F.silu(normalized * scale * gamma + bias)
+
+
+# ---------------------------------------------------------------------------
+# Nearest-2x upsample + 3x3 conv as one 2x2 conv on the low-res grid + phase gather
+# ---------------------------------------------------------------------------
+
+
+def cuda_upsample_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_upsample_gather")
+
+
+def can_use_cuda_upsample_gather(cout: int, factor_t: int, repeats: int) -> bool:
+    """Mirror of the kernel's instantiation table."""
+    return (
+        cuda_upsample_available()
+        and cout % 8 == 0
+        and factor_t in (1, 2)
+        and 1 <= repeats <= 32
+        and repeats & (repeats - 1) == 0
+    )
+
+
+def pack_upsample_weights(weight: torch.Tensor, bias: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Fold nearest-2x upsampling into a 3x3 conv's weights.
+
+    ``weight`` is ``[Cout, Cin, 3, 3]``. Returns ``[4*Cout, Cin, 2, 2]`` with output
+    phase ``2p + q`` in channel block ``p*2+q``: with the conv run at ``padding=1``,
+    temp position ``j`` covers low-res rows ``(j-1, j)`` and phase ``p`` of output ``i``
+    reads temp row ``i + p``, so original tap ``dy`` lands on ``ky = (p+dy)//2 - p + 1``.
+    Composed in fp32, cast once; the bias is replicated per phase.
+    """
+    cout, cin = weight.shape[:2]
+    w = weight.detach().float()
+    packed = w.new_zeros(4 * cout, cin, 2, 2)
+    for p in (0, 1):
+        for q in (0, 1):
+            block = packed[(2 * p + q) * cout : (2 * p + q + 1) * cout]
+            for dy in (-1, 0, 1):
+                ky = (p + dy) // 2 - p + 1
+                for dx in (-1, 0, 1):
+                    kx = (q + dx) // 2 - q + 1
+                    block[:, :, ky, kx] += w[:, :, dy + 1, dx + 1]
+    packed = packed.to(weight.dtype).contiguous(memory_format=torch.channels_last)
+    packed_bias = bias.detach().repeat(4).contiguous() if bias is not None else None
+    return packed, packed_bias
+
+
+def upsample_gather_reference(
+    temp: torch.Tensor,
+    batch: int,
+    frames: int,
+    shortcut_expanded: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Eager phase gather: ``out[.., 2i+p, 2j+q] = temp[.., phase, i+p, j+q]`` (+ bias, + shortcut)."""
+    bt, c4, hp1, wp1 = temp.shape
+    cout, h, w = c4 // 4, hp1 - 1, wp1 - 1
+    t4 = temp.view(bt, 4, cout, hp1, wp1)
+    out = temp.new_empty(bt, cout, 2 * h, 2 * w)
+    for p in (0, 1):
+        for q in (0, 1):
+            out[:, :, p::2, q::2] = t4[:, 2 * p + q, :, p : p + h, q : q + w]
+    out = out.view(batch, frames, cout, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
+    out = apply_in_bias(out, bias)
+    if shortcut_expanded is not None:
+        out = out + shortcut_expanded
+    return out.contiguous(memory_format=torch.channels_last_3d)
+
+
+def upsample_gather_cuda(
+    temp: torch.Tensor,
+    shortcut: torch.Tensor | None,
+    batch: int,
+    frames: int,
+    factor_t: int = 1,
+    repeats: int = 1,
+    crop: int = 0,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """CUDA phase gather with the conv bias and the DupUp3D shortcut add folded in."""
+    return torch.ops.trtllm.vae_upsample_gather(
+        temp, shortcut, batch, frames, factor_t, repeats, crop, bias.contiguous() if bias is not None else None
+    )
