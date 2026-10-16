@@ -266,6 +266,114 @@ def rms_norm_silu_reference(
 
 
 # ---------------------------------------------------------------------------
+# Temporal Winograd F(2,3): norm kernels that emit / consume the transformed frames
+# ---------------------------------------------------------------------------
+
+
+def cuda_wino_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_norm_silu")
+
+
+def winograd_weights(weight: torch.Tensor) -> list[torch.Tensor]:
+    """``[Cout, Cin, 3, kh, kw]`` -> four ``[Cout, Cin, kh, kw]`` channels-last filters
+    ``G0 = g0, G1 = (g0 + g1 + g2) / 2, G2 = (g0 - g1 + g2) / 2, G3 = g2`` (summed in fp32)."""
+    g0, g1, g2 = (weight[:, :, i].detach().float() for i in range(3))
+    gs = [g0, (g0 + g1 + g2) / 2, (g0 - g1 + g2) / 2, g2]
+    return [g.to(weight.dtype).contiguous(memory_format=torch.channels_last) for g in gs]
+
+
+def frames_view(x: torch.Tensor) -> torch.Tensor:
+    """Batch-1 channels-last ``[1, C, T, H, W]`` -> ``[T, H*W, C]`` view (no copy)."""
+    _, c, t, h, w = x.shape
+    rows = _channel_rows(x)
+    if rows is None or x.shape[0] != 1:
+        raise ValueError("frames_view needs a batch-1 channels-last CUDA tensor")
+    return rows.view(t, h * w, c)
+
+
+def frames_to_video(f: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """``[T, H*W, C]`` -> channels-last ``[1, C, T, H, W]`` view."""
+    t, _, c = f.shape
+    return f.view(1, t, h, w, c).permute(0, 4, 1, 2, 3)
+
+
+def pairs_to_images(d: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """``[pairs, H*W, C]`` -> channels-last ``[pairs, C, H, W]`` view for conv2d."""
+    p, _, c = d.shape
+    return d.view(p, h, w, c).permute(0, 3, 1, 2)
+
+
+def images_to_pairs(m: torch.Tensor) -> torch.Tensor:
+    """channels-last ``[pairs, C, H, W]`` -> ``[pairs, H*W, C]`` view."""
+    rows = _channel_rows(m)
+    if rows is None:
+        raise ValueError("images_to_pairs needs a channels-last CUDA tensor")
+    return rows.view(m.shape[0], m.shape[2] * m.shape[3], m.shape[1])
+
+
+def wino_norm_silu_cuda(
+    x: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+    residual: torch.Tensor | None,
+    in_bias: torch.Tensor | None,
+    cache: torch.Tensor | None,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale: float,
+    frames: int,
+    *,
+    reference_rounding: bool = False,
+) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
+    """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/2, P, C]``, cache ``[0..2, P, C]``).
+    Returns ``(sum or None, y_tail [2, P, C], [D0, D1, D2, D3])``."""
+    s, y_tail, d = torch.ops.trtllm.vae_wino_norm_silu(
+        x, m, residual, in_bias.reshape(-1) if in_bias is not None else None, cache, gamma.reshape(-1),
+        bias.reshape(-1) if bias is not None else None, float(scale), reference_rounding, frames,
+    )
+    return (s if residual is not None else None), y_tail, list(d)
+
+
+def wino_combine_reference(m: list[torch.Tensor]) -> torch.Tensor:
+    """``m[k] [pairs, P, C]`` -> frames ``[2*pairs, P, C]``: even = (m0 + m1) + m2, odd = (m1 - m2) - m3."""
+    even = (m[0] + m[1]) + m[2]
+    odd = (m[1] - m[2]) - m[3]
+    return torch.stack([even, odd], dim=1).reshape(2 * m[0].shape[0], *m[0].shape[1:])
+
+
+def wino_norm_silu_reference(
+    x: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+    residual: torch.Tensor | None,
+    in_bias: torch.Tensor | None,
+    cache: torch.Tensor | None,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | float,
+    scale: float,
+) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
+    """Eager form of the kernel, same rounding points (bf16 after every add)."""
+    if x is None:
+        assert m is not None
+        x = wino_combine_reference(m)
+    if in_bias is not None:
+        x = x + in_bias.reshape(1, 1, -1)
+    s = None
+    if residual is not None:
+        x = s = x + residual
+    t, p, c = x.shape
+    y = rms_norm_silu_reference(x.permute(0, 2, 1), gamma.reshape(1, -1, 1), bias, scale).permute(0, 2, 1)
+    cache_frames = cache.shape[0] if cache is not None else 0
+    pad = torch.zeros(2 - cache_frames, p, c, dtype=x.dtype, device=x.device)
+    hist = torch.cat([pad, cache], 0) if cache is not None and cache_frames else pad
+    f = torch.cat([hist, y], 0)  # frames -2 .. T-1
+    d = [[], [], [], []]
+    for pr in range(t // 2):
+        f0, f1, f2, f3 = f[2 * pr], f[2 * pr + 1], f[2 * pr + 2], f[2 * pr + 3]
+        for k, v in enumerate((f0 - f2, f1 + f2, f2 - f1, f1 - f3)):
+            d[k].append(v)
+    return s, y[-2:].contiguous(), [torch.stack(dk) for dk in d]
+
+
+# ---------------------------------------------------------------------------
 # Nearest-2x upsample + 3x3 conv as one 2x2 conv on the low-res grid + phase gather
 # ---------------------------------------------------------------------------
 

@@ -313,3 +313,61 @@ def test_cuda_upsample_gather_with_shortcut(factor_t: int, first_chunk: bool, ci
     diff = (got.float() - eager.float()).abs()
     assert (diff.norm() / eager.float().norm()).item() < 5e-3  # one extra bf16 rounding of the summed taps
     assert diff.max().item() <= 2**-6 * eager.float().abs().max().item()
+
+
+# ---------------------------------------------------------------------------
+# Temporal Winograd norm kernel vs its eager reference
+# ---------------------------------------------------------------------------
+
+from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+    cuda_wino_available,
+    wino_norm_silu_cuda,
+    wino_norm_silu_reference,
+)
+
+wino_op = pytest.mark.skipif(not cuda_wino_available(), reason="trtllm::vae_wino_norm_silu not built")
+
+
+@wino_op
+@pytest.mark.parametrize("C", [256, 512, 1024, 160, 48])
+@pytest.mark.parametrize("cache_frames", [0, 1, 2])
+@pytest.mark.parametrize("source", ["x", "m"])
+@pytest.mark.parametrize("extras", ["plain", "residual_bias"])
+def test_wino_norm_silu_reference_mode_is_bitwise(C: int, cache_frames: int, source: str, extras: str) -> None:
+    gen = torch.Generator(device="cuda").manual_seed(C + cache_frames)
+    T, P = 4, 9 * 13
+    bf = torch.bfloat16
+    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
+    x = rnd(T, P, C) if source == "x" else None
+    m = [rnd(T // 2, P, C) for _ in range(4)] if source == "m" else None
+    residual = rnd(T, P, C) if extras == "residual_bias" else None
+    in_bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf) if extras == "residual_bias" else None
+    cache = rnd(cache_frames, P, C) if cache_frames else None
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    scale = C**0.5
+    s_ref, tail_ref, d_ref = wino_norm_silu_reference(x, m, residual, in_bias, cache, gamma, 0.0, scale)
+    s, tail, d = wino_norm_silu_cuda(x, m, residual, in_bias, cache, gamma, None, scale, T, reference_rounding=True)
+    if residual is not None:
+        assert torch.equal(s, s_ref), "sum must be bit-identical to the eager adds"
+    # The normalized frames (cache) and the slabs match eager up to the fp32 reduction
+    # order of the sum of squares: at most 1 bf16 ulp on a tiny fraction of elements.
+    for name, a, b in [("cache", tail, tail_ref), *((f"D{k}", d[k], d_ref[k]) for k in range(4))]:
+        diff = (a.float() - b.float()).abs()
+        ulp = b.float().abs().clamp_min(1e-3) * 2**-7
+        assert (diff > ulp).float().mean().item() < 1e-3, f"{name} differs from the eager form"
+
+
+@wino_op
+@pytest.mark.parametrize("C", [256, 160])
+def test_wino_norm_silu_fp32_mode_close(C: int) -> None:
+    gen = torch.Generator(device="cuda").manual_seed(C)
+    T, P = 6, 20 * 20
+    bf = torch.bfloat16
+    x = torch.randn(T, P, C, generator=gen, device="cuda").to(bf)
+    cache = torch.randn(2, P, C, generator=gen, device="cuda").to(bf)
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    _, tail_ref, d_ref = wino_norm_silu_reference(x, None, None, None, cache, gamma, 0.0, C**0.5)
+    _, tail, d = wino_norm_silu_cuda(x, None, None, None, cache, gamma, None, C**0.5, T)
+    for a, b in [(tail, tail_ref), *zip(d, d_ref)]:
+        rel = ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-6)).item()
+        assert rel < 1e-2, rel

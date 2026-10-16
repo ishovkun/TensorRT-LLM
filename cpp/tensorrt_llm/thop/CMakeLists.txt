@@ -148,7 +148,7 @@ add_th_common_family(
   th_common_visual_gen fusedAdaptiveLayerNormOp.cpp fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp vaeRmsNormSiluOp.cpp
-  vaeUpsampleGatherOp.cpp)
+  vaeUpsampleGatherOp.cpp vaeWinoNormSiluOp.cpp)
 
 add_th_common_family(
   th_common_decoding

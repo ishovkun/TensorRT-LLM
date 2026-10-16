@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/packedVector.cuh"
+#include "vaeNormCommon.cuh"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -45,121 +46,7 @@ constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / 32;
 constexpr int kBlocksPerSm = 4;
 
-template <typename T>
-struct Elem;
-
-// Pairs are converted with the packed intrinsics: one F2FP per two outputs.
-template <>
-struct Elem<__nv_bfloat16>
-{
-    using Pair = __nv_bfloat162;
-
-    static __device__ __forceinline__ float toFloat(__nv_bfloat16 v)
-    {
-        return __bfloat162float(v);
-    }
-
-    static __device__ __forceinline__ float2 toFloat2(__nv_bfloat162 v)
-    {
-        return __bfloat1622float2(v);
-    }
-
-    static __device__ __forceinline__ __nv_bfloat162 fromFloat2(float2 v)
-    {
-        return __float22bfloat162_rn(v);
-    }
-};
-
-template <>
-struct Elem<__half>
-{
-    using Pair = __half2;
-
-    static __device__ __forceinline__ float toFloat(__half v)
-    {
-        return __half2float(v);
-    }
-
-    static __device__ __forceinline__ float2 toFloat2(__half2 v)
-    {
-        return __half22float2(v);
-    }
-
-    static __device__ __forceinline__ __half2 fromFloat2(float2 v)
-    {
-        return __float22half2_rn(v);
-    }
-};
-
-template <typename T, int V>
-__device__ __forceinline__ float2 pairAt(PackedAligned<T, V> const& v, int i)
-{
-    static_assert(V % 2 == 0, "vector width must be even for pair conversion");
-    return Elem<T>::toFloat2(*reinterpret_cast<typename Elem<T>::Pair const*>(&v.val[2 * i]));
-}
-
-template <typename T, int V>
-__device__ __forceinline__ void setPair(PackedAligned<T, V>& v, int i, float2 f)
-{
-    *reinterpret_cast<typename Elem<T>::Pair*>(&v.val[2 * i]) = Elem<T>::fromFloat2(f);
-}
-
-// Round through the activation dtype and back; the conversion intrinsics are opaque
-// to the compiler, so a multiply and an add on either side cannot be contracted.
-template <typename T>
-__device__ __forceinline__ float roundTo(float v)
-{
-    return Elem<T>::toFloat2(Elem<T>::fromFloat2(make_float2(v, v))).x;
-}
-
-struct RowLayout
-{
-    int lanesPerRow; // L: lanes cooperating on one row (divides 32)
-    int vecsPerLane; // K: vectors of V elements each lane handles
-};
-
-template <int V>
-RowLayout makeRowLayout(int channels)
-{
-    int const nvec = channels / V;
-    int lanes = 32;
-    while (nvec % lanes != 0)
-    {
-        lanes >>= 1;
-    }
-    return RowLayout{lanes, nvec / lanes};
-}
-
-template <typename TIn, bool REF, bool HAS_BIAS>
-__device__ __forceinline__ float normElement(float x, float denom, float invDenom, float scale, float gamma, float bias)
-{
-    if constexpr (REF)
-    {
-        // PyTorch's eager sequence: IEEE divide, round, scale, round, gamma, round, bias,
-        // round, then SiLU as x / (1 + exp(-x)) with IEEE divide and accurate expf.
-        float n = roundTo<TIn>(x / denom);
-        float r = roundTo<TIn>(n * scale);
-        r = roundTo<TIn>(r * gamma);
-        if constexpr (HAS_BIAS)
-        {
-            r = roundTo<TIn>(r + bias);
-        }
-        return r / (1.0f + expf(-r));
-    }
-    else
-    {
-        // gamma arrives as 0.5 * scale * gamma, so h = r / 2 and
-        // SiLU(r) = r * sigmoid(r) = h * (1 + tanh(h)): one MUFU and one FFMA.
-        float h = x * invDenom * gamma;
-        if constexpr (HAS_BIAS)
-        {
-            h += 0.5f * bias;
-        }
-        float t;
-        asm("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(h));
-        return fmaf(h, t, h);
-    }
-}
+using namespace vae_norm;
 
 // Rows per warp per step: enough independent dependency chains to cover latency.
 // With a residual input each row costs two vectors per lane, so half as many rows.
@@ -503,22 +390,7 @@ void launchLayout(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn 
             x, y, gamma, bias, inBias, residual, sumOut, numRows, channels, scale, eps, ref, stream);                 \
         return;                                                                                                        \
     }
-    // Wan VAE widths, then the small powers of two and a few generic ones.
-    TRY_LAYOUT(32, 1) // 256
-    TRY_LAYOUT(32, 2) // 512
-    TRY_LAYOUT(32, 4) // 1024
-    TRY_LAYOUT(4, 5)  // 160
-    TRY_LAYOUT(8, 5)  // 320
-    TRY_LAYOUT(16, 5) // 640
-    TRY_LAYOUT(2, 3)  // 48
-    TRY_LAYOUT(4, 3)  // 96
-    TRY_LAYOUT(1, 1)  // 8
-    TRY_LAYOUT(2, 1)  // 16
-    TRY_LAYOUT(4, 1)  // 32
-    TRY_LAYOUT(8, 1)  // 64
-    TRY_LAYOUT(16, 1) // 128
-    TRY_LAYOUT(1, 3)  // 24
-    TRY_LAYOUT(32, 3) // 768
+    VAE_NORM_FOR_EACH_LAYOUT(TRY_LAYOUT)
 #undef TRY_LAYOUT
     TLLM_THROW("vaeRmsNormSilu: no lane layout for %d channels (lanes %d, vectors %d)", channels, l.lanesPerRow,
         l.vecsPerLane);

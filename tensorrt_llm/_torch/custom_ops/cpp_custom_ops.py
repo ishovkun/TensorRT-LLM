@@ -192,6 +192,14 @@ def _register_fake():
         cout = temp.shape[1] // 4
         return temp.new_empty((batch, cout, frames, 2 * (temp.shape[2] - 1), 2 * (temp.shape[3] - 1)))
 
+    @torch.library.register_fake("trtllm::vae_wino_norm_silu")
+    def _(x, m, residual, in_bias, cache, gamma, bias, scale, reference_rounding, frames):
+        src = x if x is not None else m[0]
+        pair = (frames // 2, src.shape[1], src.shape[2])
+        full = (frames, src.shape[1], src.shape[2])
+        return (src.new_empty(full if residual is not None else (0,)), src.new_empty((2,) + full[1:]),
+                [src.new_empty(pair) for _ in range(4)])
+
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
