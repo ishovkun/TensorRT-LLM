@@ -179,6 +179,19 @@ def _register_fake():
           trigger_completion_at_end):
         return [torch.empty_like(q), torch.empty_like(k)]
 
+    @torch.library.register_fake("trtllm::vae_rms_norm_silu")
+    def _(x, gamma, bias, scale, reference_rounding, in_bias=None):
+        return x.new_empty(x.shape)
+
+    @torch.library.register_fake("trtllm::vae_add_rms_norm_silu")
+    def _(x, residual, gamma, bias, scale, reference_rounding, in_bias=None):
+        return x.new_empty(x.shape), x.new_empty(x.shape)
+
+    @torch.library.register_fake("trtllm::vae_upsample_gather")
+    def _(temp, shortcut, batch, frames, factor_t, repeats, crop, bias=None):
+        cout = temp.shape[1] // 4
+        return temp.new_empty((batch, cout, frames, 2 * (temp.shape[2] - 1), 2 * (temp.shape[3] - 1)))
+
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
