@@ -236,7 +236,8 @@ def _register_fake():
         n, _, w, c = frames.shape
         return frames.new_empty(
             (components * 16,
-             (n // components) * (row1 - row0) * ((w + 1) // 2), c))
+             (n // components) * (row1 - row0) * ((w + 1) // 2), c),
+            dtype=torch.float16)
 
     @torch.library.register_fake("trtllm::vae_wino_spatial_out")
     def _(m, frames, components, row0, row1):

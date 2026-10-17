@@ -31,7 +31,8 @@ from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-IO_DTYPE = cutlass.BFloat16
+IO_DTYPE = cutlass.Float16  # transformed data (V, U, partials): fp16 end to end
+OUT_DTYPE = cutlass.BFloat16  # output frames
 ACC_DTYPE = cutlass.Float32
 MMA_INST_MNK = (128, 128, 16)
 MMA_TILER_MNK = (128, 128, 64)
@@ -535,8 +536,8 @@ def wino_fused_kernel(
                 acc = (va + vb) + vc
                 if r1_sel == 1:
                     acc = (vb - va) - vc
-                out = cute.make_rmem_tensor(quad.shape, IO_DTYPE)
-                out.store(acc.to(IO_DTYPE))
+                out = cute.make_rmem_tensor(quad.shape, OUT_DTYPE)
+                out.store(acc.to(OUT_DTYPE))
                 gdst = cute.make_tensor((mY.iterator + (ybase + unit * 4)).align(8), quad)
                 cute.autovec_copy(out, gdst)
 
@@ -615,8 +616,8 @@ def wino_fused_host(
 @functools.lru_cache(maxsize=None)
 def _compiled_fused(key: tuple[int, ...]):
     nl, m_pad, n, k, pixels = key
-    v = torch.empty(nl, m_pad, k, dtype=torch.bfloat16, device="cuda")
-    u = torch.empty(nl, n, k, dtype=torch.bfloat16, device="cuda")
+    v = torch.empty(nl, m_pad, k, dtype=torch.float16, device="cuda")
+    u = torch.empty(nl, n, k, dtype=torch.float16, device="cuda")
     y = torch.empty(pixels, n, dtype=torch.bfloat16, device="cuda")
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     return cute.compile(
@@ -706,9 +707,7 @@ def wino_spatial_conv_fused(
 
 P_PAIR = 2  # 2: 2-CTA MMA across a CTA pair (256-row tile blocks); 1: single-CTA MMA
 P_N = 128  # output channels per tile block; 256 needs 16-bit accumulators (tensor memory)
-P_IO = (
-    IO_DTYPE  # operand type (bf16 operands require fp32 accumulation; fp16 may accumulate in fp16)
-)
+P_IO = IO_DTYPE  # operand type
 P_ACC = ACC_DTYPE
 P_TILER_MNK = (128 * P_PAIR, P_N, 64)  # 128 rows per CTA
 P_INST_MNK = (128 * P_PAIR, P_N, 16)
@@ -1092,8 +1091,8 @@ def wino_persistent_kernel(
                 res = (mine + sa) + sb  # r1 = 0: t0 + t1 + t2 (own + lower + higher)
                 if r1_sel == 1:
                     res = (sa - mine) - sb  # r1 = 1: t1 - t2 - t3 (lower - own - higher)
-                out = cute.make_rmem_tensor(seg32, IO_DTYPE)
-                out.store(res.to(IO_DTYPE))
+                out = cute.make_rmem_tensor(seg32, OUT_DTYPE)
+                out.store(res.to(OUT_DTYPE))
                 if valid:
                     gdst = cute.make_tensor(
                         (mY.iterator + (ybase + (P_CPG * group + cc) * 32)).align(16), seg32
@@ -1763,10 +1762,10 @@ def wino_pass_kernel(
                             tmp = cute.make_rmem_tensor(seg8, IO_DTYPE)
                             cute.autovec_copy(src, tmp)
                             tx[x] = tmp.load().to(ACC_DTYPE)
-                        y0 = cute.make_rmem_tensor(seg8, IO_DTYPE)
-                        y1 = cute.make_rmem_tensor(seg8, IO_DTYPE)
-                        y0.store(((tx[0] + tx[1]) + tx[2]).to(IO_DTYPE))
-                        y1.store(((tx[1] - tx[2]) - tx[3]).to(IO_DTYPE))
+                        y0 = cute.make_rmem_tensor(seg8, OUT_DTYPE)
+                        y1 = cute.make_rmem_tensor(seg8, OUT_DTYPE)
+                        y0.store(((tx[0] + tx[1]) + tx[2]).to(OUT_DTYPE))
+                        y1.store(((tx[1] - tx[2]) - tx[3]).to(OUT_DTYPE))
                         pcol = pcol0 + b
                         if r_valid & (pcol < width):
                             if prow0 < height:
@@ -1892,9 +1891,9 @@ def _max_active_pairs() -> int:
 @functools.lru_cache(maxsize=None)
 def _compiled_pass(key: tuple[int, ...]):
     nl, m_pad, n, k, pixels, num_clusters = key
-    v = torch.empty(nl, m_pad, k, dtype=torch.bfloat16, device="cuda")
-    u = torch.empty(nl, n, k, dtype=torch.bfloat16, device="cuda")
-    t = torch.empty(nl // 2 * m_pad, n, dtype=torch.bfloat16, device="cuda")
+    v = torch.empty(nl, m_pad, k, dtype=torch.float16, device="cuda")
+    u = torch.empty(nl, n, k, dtype=torch.float16, device="cuda")
+    t = torch.empty(nl // 2 * m_pad, n, dtype=torch.float16, device="cuda")
     y = torch.empty(pixels, n, dtype=torch.bfloat16, device="cuda")
     counters = torch.zeros(1, dtype=torch.int32, device="cuda")
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2006,9 +2005,9 @@ def _as_mkl(t: torch.Tensor, leading_dim: int) -> cute.Tensor:
 @functools.lru_cache(maxsize=None)
 def _compiled(shape_key: tuple[int, ...]):
     nl, m, n, k = shape_key
-    v = torch.empty(nl, m, k, dtype=torch.bfloat16, device="cuda")
-    u = torch.empty(nl, n, k, dtype=torch.bfloat16, device="cuda")
-    out = torch.empty(nl, m, n, dtype=torch.bfloat16, device="cuda")
+    v = torch.empty(nl, m, k, dtype=torch.float16, device="cuda")
+    u = torch.empty(nl, n, k, dtype=torch.float16, device="cuda")
+    out = torch.empty(nl, m, n, dtype=torch.float16, device="cuda")
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     return cute.compile(gemm_host, _as_mkl(v, 1), _as_mkl(u, 1), _as_mkl(out, 1), stream)
 
@@ -2059,17 +2058,14 @@ def _main_fused(args) -> None:
     m_valid = pairs * th * tw
     m_pad = m_valid if args.no_pad else (m_valid + 255) // 256 * 256
     v_exact = torch.ops.trtllm.vae_wino_spatial_in(frames, components, 0, th)  # [64, m_valid, cin]
-    v = torch.zeros(components * 16, m_pad, cin, dtype=torch.bfloat16, device="cuda")
+    v = torch.zeros(components * 16, m_pad, cin, dtype=v_exact.dtype, device="cuda")
     v[:, :m_valid] = v_exact
     u_nk = winograd_spatial_weights(weight).transpose(1, 2).contiguous()  # [64, cout, cin]
     out = torch.empty(components * pairs, h, w, cout, dtype=torch.bfloat16, device="cuda")
-    if args.persistent and P_IO is cutlass.Float16:
-        v = v.half()
-        u_nk = u_nk.half()
     run = wino_spatial_conv_persistent if args.persistent else wino_spatial_conv_fused
     if args.pass2:
         t_part = torch.empty(
-            pass2_workspace_numel(components, m_pad, cout), dtype=torch.bfloat16, device="cuda"
+            pass2_workspace_numel(components, m_pad, cout), dtype=v.dtype, device="cuda"
         )
         u_pass = winograd_pass_filters(u_nk)
 

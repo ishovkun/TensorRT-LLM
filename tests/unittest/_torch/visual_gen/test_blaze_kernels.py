@@ -610,9 +610,10 @@ def test_spatial_winograd_transforms(C: int, strip: tuple[int, int], hw: tuple[i
     v = torch.ops.trtllm.vae_wino_spatial_in(frames, components, row0, row1)
     v_ref = _ref_spatial_in(frames, components, row0, row1)
     assert v.shape == v_ref.shape
-    assert torch.equal(v.float(), v_ref.to(torch.bfloat16).float())
+    assert v.dtype == torch.float16
+    assert torch.equal(v.float(), v_ref.to(torch.float16).float())
 
-    m = torch.randn(components * 16, v.shape[1], C, device="cuda").to(torch.bfloat16)
+    m = torch.randn(components * 16, v.shape[1], C, device="cuda").to(torch.float16)
     out = torch.full((n, h, w, C), float("nan"), device="cuda", dtype=torch.bfloat16)
     torch.ops.trtllm.vae_wino_spatial_out(m, out, components, row0, row1)
     got = out[:, 2 * row0 : min(2 * row1, h)]

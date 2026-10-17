@@ -44,12 +44,14 @@ tensorrt_llm::kernels::VaeWinoSpatialParams params(
 }
 } // namespace
 
-// V = B^T d B for tile rows [row0, row1): frames [N, H, W, C] -> [components*16, (N/components)*ntiles, C].
+// V = B^T d B for tile rows [row0, row1): frames [N, H, W, C] bf16 -> fp16 [components*16,
+// (N/components)*ntiles, C].
 torch::Tensor vae_wino_spatial_in(torch::Tensor const& frames, int64_t components, int64_t row0, int64_t row1)
 {
     auto const p = params(frames, components, row0, row1);
     int64_t const ntiles = static_cast<int64_t>(p.row1 - p.row0) * ((p.width + 1) / 2);
-    auto v = torch::empty({components * 16, (p.frames / components) * ntiles, p.channels}, frames.options());
+    auto v = torch::empty(
+        {components * 16, (p.frames / components) * ntiles, p.channels}, frames.options().dtype(torch::kHalf));
     tensorrt_llm::kernels::launchVaeWinoSpatialInput(
         frames.data_ptr(), v.data_ptr(), p, at::cuda::getCurrentCUDAStream(frames.get_device()));
     return v;
@@ -60,7 +62,7 @@ torch::Tensor vae_wino_spatial_out(
     torch::Tensor const& m, torch::Tensor const& frames, int64_t components, int64_t row0, int64_t row1)
 {
     auto const p = params(frames, components, row0, row1);
-    CHECK_INPUT(m, torch::kBFloat16);
+    CHECK_INPUT(m, torch::kHalf);
     int64_t const ntiles = static_cast<int64_t>(p.row1 - p.row0) * ((p.width + 1) / 2);
     TORCH_CHECK(m.dim() == 3 && m.size(0) == components * 16 && m.size(1) == (p.frames / components) * ntiles
             && m.size(2) == p.channels,

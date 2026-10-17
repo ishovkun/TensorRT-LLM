@@ -333,15 +333,16 @@ _WINO_G = torch.tensor(
 
 
 def winograd_spatial_weights(weight: torch.Tensor) -> torch.Tensor:
-    """``[Cout, Cin, 3, 3, 3]`` -> ``U [64, Cin, Cout]``: the four temporal components of
+    """``[Cout, Cin, 3, 3, 3]`` -> ``U [64, Cin, Cout]`` fp16: the four temporal components of
     :func:`winograd_weights`, each transformed as ``G g G^T`` (fp32, rounded once), ordered
-    ``component * 16 + row * 4 + col`` to match ``trtllm::vae_wino_spatial_in``."""
+    ``component * 16 + row * 4 + col`` to match ``trtllm::vae_wino_spatial_in``. The transformed
+    data is fp16 end to end (V, U, M): three more mantissa bits than bf16 through the GEMMs."""
     g0, g1, g2 = (weight[:, :, i].detach().float() for i in range(3))
     comps = torch.stack([g0, (g0 + g1 + g2) / 2, (g0 - g1 + g2) / 2, g2])  # [4, Cout, Cin, 3, 3]
     gm = _WINO_G.to(weight.device)
     u = torch.einsum("xa,noiab,yb->nxyoi", gm, comps, gm)  # [4, 4, 4, Cout, Cin]
     cout, cin = weight.shape[:2]
-    return u.reshape(64, cout, cin).transpose(1, 2).contiguous().to(weight.dtype)
+    return u.reshape(64, cout, cin).transpose(1, 2).contiguous().to(torch.float16)
 
 
 def cuda_wino_spatial_available() -> bool:

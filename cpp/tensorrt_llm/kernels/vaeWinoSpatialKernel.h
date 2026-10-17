@@ -25,7 +25,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// Spatial Winograd F(2x2, 3x3) transforms for channels-last frames, bf16.
+// Spatial Winograd F(2x2, 3x3) transforms for channels-last bf16 frames; the transformed
+// data (V, M) is fp16, which keeps three more mantissa bits than bf16 through the GEMMs.
 //
 // A frame [H, W, C] is covered by ceil(H/2) x ceil(W/2) output tiles of 2x2 pixels; tile
 // (i, j) is computed from the 4x4 input window at rows 2i-1..2i+2, cols 2j-1..2j+2 (zero

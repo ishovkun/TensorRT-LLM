@@ -34,9 +34,11 @@ using common::PackedAligned;
 using namespace vae_norm;
 
 constexpr int kThreads = 256;
-using T = __nv_bfloat16;
+using T = __nv_bfloat16; // frames
+using TS = __half;       // transformed data (V, M): fp16 keeps three more mantissa bits than bf16
 constexpr int V = static_cast<int>(sizeof(float4) / sizeof(T));
 using Vec = PackedAligned<T, V>;
+using VecS = PackedAligned<TS, V>;
 
 struct Geometry
 {
@@ -68,7 +70,7 @@ __device__ __forceinline__ int64_t vmOffset(
 
 // V = B^T d B for one 4x4 window and 8 channels, written as 16 vectors.
 __global__ void __launch_bounds__(kThreads)
-    vaeWinoSpatialInputKernel(T const* __restrict__ frames, T* __restrict__ v, VaeWinoSpatialParams p)
+    vaeWinoSpatialInputKernel(T const* __restrict__ frames, TS* __restrict__ v, VaeWinoSpatialParams p)
 {
     Geometry const g = geometry(p);
     int const C = p.channels;
@@ -108,7 +110,7 @@ __global__ void __launch_bounds__(kThreads)
         }
         // Rows: t[a] = BT[a] . d  (t0 = d0 - d2, t1 = d1 + d2, t2 = d2 - d1, t3 = d1 - d3), then the
         // same combination along columns; one 16-byte vector per coordinate.
-        Vec out[16];
+        VecS out[16];
 #pragma unroll
         for (int e = 0; e < V / 2; ++e)
         {
@@ -136,14 +138,14 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
         for (int k = 0; k < 16; ++k)
         {
-            *reinterpret_cast<Vec*>(v + vmOffset(g, comp, k, pair, tile, c0, C)) = out[k];
+            *reinterpret_cast<VecS*>(v + vmOffset(g, comp, k, pair, tile, c0, C)) = out[k];
         }
     }
 }
 
 // y = A^T M A for one tile and 8 channels: 16 vectors in, 4 output pixels out.
 __global__ void __launch_bounds__(kThreads)
-    vaeWinoSpatialOutputKernel(T const* __restrict__ m, T* __restrict__ frames, VaeWinoSpatialParams p)
+    vaeWinoSpatialOutputKernel(TS const* __restrict__ m, T* __restrict__ frames, VaeWinoSpatialParams p)
 {
     Geometry const g = geometry(p);
     int const C = p.channels;
@@ -160,11 +162,11 @@ __global__ void __launch_bounds__(kThreads)
         int const j = static_cast<int>(tile - static_cast<int64_t>(i - p.row0) * g.tw);
         int const comp = n / g.pairs, pair = n - comp * g.pairs;
 
-        Vec mv[16];
+        VecS mv[16];
 #pragma unroll
         for (int k = 0; k < 16; ++k)
         {
-            mv[k] = *reinterpret_cast<Vec const*>(m + vmOffset(g, comp, k, pair, tile, c0, C));
+            mv[k] = *reinterpret_cast<VecS const*>(m + vmOffset(g, comp, k, pair, tile, c0, C));
         }
         Vec out[2][2];
 #pragma unroll
@@ -232,7 +234,7 @@ void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams
     check(p);
     int64_t const total = static_cast<int64_t>(p.frames) * (p.row1 - p.row0) * ((p.width + 1) / 2) * (p.channels / V);
     vaeWinoSpatialInputKernel<<<gridFor(total), kThreads, 0, stream>>>(
-        static_cast<T const*>(frames), static_cast<T*>(v), p);
+        static_cast<T const*>(frames), static_cast<TS*>(v), p);
     sync_check_cuda_error(stream);
 }
 
@@ -241,7 +243,7 @@ void launchVaeWinoSpatialOutput(void const* m, void* frames, VaeWinoSpatialParam
     check(p);
     int64_t const total = static_cast<int64_t>(p.frames) * (p.row1 - p.row0) * ((p.width + 1) / 2) * (p.channels / V);
     vaeWinoSpatialOutputKernel<<<gridFor(total), kThreads, 0, stream>>>(
-        static_cast<T const*>(m), static_cast<T*>(frames), p);
+        static_cast<TS const*>(m), static_cast<T*>(frames), p);
     sync_check_cuda_error(stream);
 }
 
