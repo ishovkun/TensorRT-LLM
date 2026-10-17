@@ -2,17 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Spatial Winograd F(2x2, 3x3) GEMMs for Blackwell (sm100) in CuTe DSL.
 
-Stage 0: the 64 batched GEMMs ``M[l] = V[l] @ U[l]`` (l = temporal component x tile
-coordinate) as one tcgen05 kernel: TMA loads into a multi-stage shared-memory ring, one
-128x128x64 MMA tile per CTA, fp32 accumulation in tensor memory, bf16 output.
+Kernels, oldest first (the earlier ones are kept as the measured steps towards the last):
 
-Tensors (torch, bf16, CUDA):
-    v: [L, M, K]   transformed input tiles, K contiguous
-    u: [L, N, K]   transformed filters, K contiguous (``winograd_spatial_weights`` gives
-                   [L, K, N]; transpose once at load time)
-    m: [L, M, N]   output, N contiguous
-M must be a multiple of 128 and N of 128, K of 64 (pad M on the host; padded rows are
-independent garbage and are never read).
+- stage 0, ``wino_gemm_cute``: the 64 batched GEMMs ``M[l] = V[l] @ U[l]`` (l = temporal
+  component x tile coordinate) as one plain tcgen05 kernel (calibration).
+- stage 1, ``wino_spatial_conv_fused``: GEMMs + output transform in one kernel, a cluster of
+  four CTAs (one per coordinate row) exchanging partial sums through shared memory.
+- stage 2, ``wino_spatial_conv_persistent``: the persistent, warp-specialized form of stage 1
+  with 2-CTA MMA (256x128 tiles). The path for Cout % 256 != 0.
+- stage 4, ``wino_spatial_gemm_pass2`` + ``trtllm::vae_wino_spatial_combine``: 256x256 tiles,
+  cluster of 2, the row combination folded into two accumulator passes, the column
+  combination in a CUDA kernel. The path for Cout % 256 == 0.
+
+Tensors (torch, bf16, CUDA): ``v [L, M, K]`` transformed input tiles (K contiguous), ``u
+[L, N, K]`` transformed filters (K contiguous; ``winograd_spatial_weights`` gives [L, K, N],
+transpose once at load time), outputs N contiguous. K must be a multiple of 64.
 """
 
 import functools
@@ -1280,6 +1284,460 @@ def wino_spatial_conv_persistent(
     return out
 
 
+# ---------------------------------------------------------------------------------------
+# Stage 4: 256x256 tiles, two passes per block, no cluster exchange.
+#
+# The per-SM limiter of the 256x128 kernel is shared-memory traffic per MMA cycle (TMA
+# writes plus the MMA's operand reads); a 256x256 tile halves it per FLOP, which is the
+# shape cuDNN and the CuTe DSL reference GEMM reach ~1400 TF/s with. Tensor memory holds
+# two 128x256 fp32 accumulators, so a block (one coordinate row x of 4 column coordinates)
+# runs its four coordinates one at a time, each over all of K, in the order 1, 2, 0, 3:
+# y = 1 and 2 fill the two accumulators, the epilogue rewrites them in place as a1 + a2
+# and a1 - a2 (fp32 read-modify-write in tensor memory), then y = 0 accumulates onto the
+# first and y = 3, with its filter pre-negated by the caller, onto the second, which
+# leaves exactly t0 = a0 + a1 + a2 and t1 = a1 - a2 - a3: the row combinations, written
+# as bf16 partials, two per (tile, x), with no extra GEMMs and fp32 accumulation
+# throughout. The accumulator handshake is per accumulator, so draining one overlaps the
+# MMA on the other. The combination across the four coordinate rows (3 partials per
+# output pixel) is a separate memory-bound pass. The cluster is just the MMA pair, so
+# every SM takes part.
+# ---------------------------------------------------------------------------------------
+
+Q_N = 256
+Q_K = 64
+Q_TILER_MNK = (128 * P_PAIR, Q_N, Q_K)
+Q_INST_MNK = (128 * P_PAIR, Q_N, 16)
+Q_STAGES = 6
+Q_CPS = 1  # one coordinate per stage
+Q_ACCS = 2  # accumulators in tensor memory (2 x 128 x 256 fp32 = all 512 columns)
+Q_ORDER = (1, 2, 0, 3)  # coordinate order; coordinate slot s uses accumulator s % 2
+Q_EPI_WARPS = 8  # two warps per tensor-memory lane quarter, each owning half the columns
+Q_TMA_WARP = 8
+Q_MMA_WARP = 9
+Q_THREADS = 32 * 12  # epilogue warpgroups 0-1, producer warpgroup 2 (TMA, MMA, two idle warps)
+Q_AB_ELEMS = Q_STAGES * Q_CPS * (Q_TILER_MNK[0] // P_PAIR + Q_TILER_MNK[1] // P_PAIR) * Q_K
+Q_CHUNKS = Q_N // 32
+Q_CHUNKS_PER_THREAD = Q_CHUNKS // (Q_EPI_WARPS // 4)
+
+
+@cute.struct
+class PassSharedStorage:
+    ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, Q_STAGES * 2]
+    acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, Q_ACCS * 2]
+    tmem_dealloc_mbar: cutlass.Int64
+    tmem_holding_buf: cutlass.Int32
+    smem_ab: cute.struct.Align[cute.struct.MemRange[IO_DTYPE, Q_AB_ELEMS], 1024]
+
+
+@cute.kernel
+def wino_pass_kernel(
+    tiled_mma: cute.TiledMma,
+    tma_atom_a: cute.CopyAtom,
+    mA_mkl: cute.Tensor,
+    tma_atom_b: cute.CopyAtom,
+    mB_nkl: cute.Tensor,
+    mT: cute.Tensor,
+    a_smem_layout: cute.ComposedLayout,
+    b_smem_layout: cute.ComposedLayout,
+    cluster_layout_vmnk: cute.Layout,
+    m_valid: cutlass.Int32,
+    m_pad: cutlass.Int32,
+    n_blocks: cutlass.Int32,
+    m_tiles: cutlass.Int32,
+    num_blocks: cutlass.Int32,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    bidx, _, _ = cute.arch.block_idx()
+    gdim, _, _ = cute.arch.grid_dim()
+    num_clusters = gdim // P_PAIR
+    cluster_id = bidx // P_PAIR
+    v_half = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    is_leader = v_half == 0
+
+    smem = utils.SmemAllocator()
+    storage = smem.allocate(PassSharedStorage)
+    a_elems = Q_STAGES * Q_CPS * (Q_TILER_MNK[0] // P_PAIR) * Q_K
+    sA = storage.smem_ab.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+    sB = cute.make_tensor(
+        cute.recast_ptr(storage.smem_ab.data_ptr() + a_elems, swizzle_=b_smem_layout.inner),
+        b_smem_layout.outer,
+    )
+
+    if warp_idx == Q_TMA_WARP:
+        cpasync.prefetch_descriptor(tma_atom_a)
+        cpasync.prefetch_descriptor(tma_atom_b)
+
+    tma_bytes = (
+        P_PAIR
+        * Q_CPS
+        * (
+            cute.size_in_bytes(IO_DTYPE, cute.select(a_smem_layout, mode=[0, 1, 2]))
+            + cute.size_in_bytes(IO_DTYPE, cute.select(b_smem_layout, mode=[0, 1, 2]))
+        )
+    )
+    ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+        num_stages=Q_STAGES,
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+        consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+        tx_count=tma_bytes,
+        barrier_storage=storage.ab_mbar_ptr.data_ptr(),
+        cta_layout_vmnk=cluster_layout_vmnk,
+        defer_sync=True,
+    ).make_participants()
+    # The epilogue warps synchronize on a named barrier and one thread per CTA releases.
+    acc_pipeline = pipeline.PipelineUmmaAsync.create(
+        num_stages=Q_ACCS,
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+        consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, P_PAIR),
+        barrier_storage=storage.acc_mbar_ptr.data_ptr(),
+        cta_layout_vmnk=cluster_layout_vmnk,
+        defer_sync=True,
+    )
+    cute.arch.mbarrier_init_fence()
+    cute.arch.cluster_arrive_relaxed()
+
+    tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * (1 + Q_EPI_WARPS))
+    tmem = utils.TmemAllocator(
+        storage.tmem_holding_buf.ptr,
+        barrier_for_retrieve=tmem_alloc_barrier,
+        allocator_warp_id=0,
+        is_two_cta=P_PAIR == 2,
+        two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+    )
+
+    gA = cute.local_tile(mA_mkl, cute.slice_(Q_TILER_MNK, (None, 0, None)), (None, None, None))
+    gB = cute.local_tile(mB_nkl, cute.slice_(Q_TILER_MNK, (0, None, None)), (None, None, None))
+    thr_mma = tiled_mma.get_slice(v_half)
+    tCgA = thr_mma.partition_A(gA)
+    tCgB = thr_mma.partition_B(gB)
+    tCrA = tiled_mma.make_fragment_A(sA)
+    tCrB = tiled_mma.make_fragment_B(sB)
+    acc_shape = tiled_mma.partition_shape_C(Q_TILER_MNK[:2])
+    tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, Q_ACCS))
+    tAsA, tAgA = cpasync.tma_partition(
+        tma_atom_a, 0, cute.make_layout(1), cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3)
+    )
+    tBsB, tBgB = cpasync.tma_partition(
+        tma_atom_b, 0, cute.make_layout(1), cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3)
+    )
+    num_k_tiles = cute.size(gA, mode=[3])
+    blocks_per_x = n_blocks * m_tiles
+
+    cute.arch.cluster_wait()
+
+    # ---------------- TMA warp ----------------
+    if warp_idx == Q_TMA_WARP:
+        blk = cluster_id
+        while blk < num_blocks:
+            n_block = blk % n_blocks
+            m_tile = (blk // n_blocks) % m_tiles
+            x_row = (blk // blocks_per_x) % P_COORDS
+            comp = blk // (blocks_per_x * P_COORDS)
+            l_base = comp * 16 + x_row * P_COORDS
+            for sl in cutlass.range_constexpr(P_COORDS):
+                l_coord = l_base + Q_ORDER[sl]
+                for k_tile in cutlass.range(num_k_tiles):
+                    ab_empty = ab_producer.acquire_and_advance()
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA[(None, m_tile, k_tile, l_coord)],
+                        tAsA[(None, ab_empty.index)],
+                        tma_bar_ptr=ab_empty.barrier,
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB[(None, n_block, k_tile, l_coord)],
+                        tBsB[(None, ab_empty.index)],
+                        tma_bar_ptr=ab_empty.barrier,
+                    )
+            blk += num_clusters
+        ab_producer.tail()
+
+    # ---------------- MMA warp ----------------
+    if warp_idx == Q_MMA_WARP:
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+        acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, Q_ACCS)
+        if is_leader:
+            blk = cluster_id
+            while blk < num_blocks:
+                for sl in cutlass.range_constexpr(P_COORDS):
+                    acc_pipeline.producer_acquire(acc_state)
+                    acc_y = tCtAcc[(None, None, None, sl % Q_ACCS)]
+                    for k_tile in cutlass.range(num_k_tiles):
+                        ab_full = ab_consumer.wait_and_advance()
+                        if cutlass.const_expr(sl < Q_ACCS):
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                        else:
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        for k_block in cutlass.range(cute.size(tCrA, mode=[2]), unroll_full=True):
+                            coord = (None, None, k_block, ab_full.index)
+                            cute.gemm(tiled_mma, acc_y, tCrA[coord], tCrB[coord], acc_y)
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        ab_full.release()
+                    acc_pipeline.producer_commit(acc_state)
+                    acc_state.advance()
+                blk += num_clusters
+            acc_pipeline.producer_tail(acc_state)
+
+    # ---------------- epilogue warps ----------------
+    if warp_idx < Q_EPI_WARPS:
+        tmem.allocate(512)
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+        quarter = warp_idx % 4
+        col_half = warp_idx // 4
+        lane = tidx % 32
+        row_m = quarter * 32 + lane
+        acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, Q_ACCS)
+        epi_tiler = ((128, 32),)
+        tmem_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), ACC_DTYPE)
+        acc0_epi = cute.zipped_divide(tCtAcc[(None, None, None, 0)], epi_tiler)
+        tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_atom, acc0_epi[None, 0])
+        tmem_thr_copy = tmem_tiled_copy.get_slice(row_m)
+        tDtAcc = [
+            tmem_thr_copy.partition_S(cute.zipped_divide(tCtAcc[(None, None, None, yy)], epi_tiler))
+            for yy in range(Q_ACCS)
+        ]
+        st_atom = cute.make_copy_atom(tcgen05.St32x32bOp(tcgen05.Repetition.x32), ACC_DTYPE)
+        tmem_st_copy = tcgen05.make_tmem_copy(st_atom, acc0_epi[None, 0])
+        tmem_st_thr = tmem_st_copy.get_slice(row_m)
+        tStAcc = [
+            tmem_st_thr.partition_D(cute.zipped_divide(tCtAcc[(None, None, None, yy)], epi_tiler))
+            for yy in range(Q_ACCS)
+        ]
+        c_view = cute.make_tensor(
+            cute.recast_ptr(storage.smem_ab.data_ptr(), dtype=ACC_DTYPE),
+            cute.make_layout((128, Q_N), stride=(Q_N, 1)),
+        )
+        c_epi = cute.zipped_divide(thr_mma.partition_C(c_view), epi_tiler)
+        frag_shape = tmem_thr_copy.partition_D(c_epi)[None, None, 0].shape
+        seg32 = cute.make_layout(frag_shape)
+        r0 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        r1 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        r2 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        r3 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        epi_bar = pipeline.NamedBarrier(barrier_id=5, num_threads=32 * Q_EPI_WARPS)
+        epi_leader = tidx == 0
+        n_cols = cute.size(mT, mode=[1])
+        blk = cluster_id
+        while blk < num_blocks:
+            n_block = blk % n_blocks
+            m_tile = (blk // n_blocks) % m_tiles
+            x_row = (blk // blocks_per_x) % P_COORDS
+            comp = blk // (blocks_per_x * P_COORDS)
+            m_global = m_tile * Q_TILER_MNK[0] + v_half * 128 + row_m
+            valid = m_global < m_valid
+            row0 = ((comp * P_COORDS + x_row) * 2 + 0) * m_pad + m_global
+            col0 = n_block * Q_N + col_half * (Q_CHUNKS_PER_THREAD * 32)
+
+            # a1 ready: prefetch its first two chunks while the MMA still works on a2.
+            acc_pipeline.consumer_wait(acc_state)
+            st_a1 = acc_state.clone()
+            acc_state.advance()
+            cute.copy(tmem_tiled_copy, tDtAcc[0][None, None, col_half * Q_CHUNKS_PER_THREAD], r0)
+            cute.copy(
+                tmem_tiled_copy, tDtAcc[0][None, None, col_half * Q_CHUNKS_PER_THREAD + 1], r1
+            )
+            # a2 ready: rewrite both accumulators as a1 + a2 and a1 - a2, two chunks per round.
+            acc_pipeline.consumer_wait(acc_state)
+            st_a2 = acc_state.clone()
+            acc_state.advance()
+            for c in cutlass.range_constexpr(0, Q_CHUNKS_PER_THREAD, 2):
+                cc = col_half * Q_CHUNKS_PER_THREAD + c
+                if cutlass.const_expr(c > 0):
+                    cute.copy(tmem_tiled_copy, tDtAcc[0][None, None, cc], r0)
+                    cute.copy(tmem_tiled_copy, tDtAcc[0][None, None, cc + 1], r1)
+                cute.copy(tmem_tiled_copy, tDtAcc[1][None, None, cc], r2)
+                cute.copy(tmem_tiled_copy, tDtAcc[1][None, None, cc + 1], r3)
+                a1 = r0.load()
+                a2 = r2.load()
+                r0.store(a1 + a2)
+                r2.store(a1 - a2)
+                a1 = r1.load()
+                a2 = r3.load()
+                r1.store(a1 + a2)
+                r3.store(a1 - a2)
+                cute.copy(tmem_st_copy, r0, tStAcc[0][None, None, cc])
+                cute.copy(tmem_st_copy, r2, tStAcc[1][None, None, cc])
+                cute.copy(tmem_st_copy, r1, tStAcc[0][None, None, cc + 1])
+                cute.copy(tmem_st_copy, r3, tStAcc[1][None, None, cc + 1])
+            cute.arch.fence_view_async_tmem_store()
+            epi_bar.arrive_and_wait()
+            if epi_leader:
+                acc_pipeline.consumer_release(st_a1)
+                acc_pipeline.consumer_release(st_a2)
+
+            # t0 = a0 + a1 + a2 ready (y = 0 accumulated on top), then t1 = a1 - a2 - a3.
+            # Each is converted to bf16 in registers and released before its stores, so the
+            # drain overlaps the MMA on the other accumulator.
+            for acc_i in cutlass.range_constexpr(Q_ACCS):
+                acc_pipeline.consumer_wait(acc_state)
+                outs = [None] * Q_CHUNKS_PER_THREAD
+                for c in cutlass.range_constexpr(0, Q_CHUNKS_PER_THREAD, 2):
+                    cc = col_half * Q_CHUNKS_PER_THREAD + c
+                    cute.copy(tmem_tiled_copy, tDtAcc[acc_i][None, None, cc], r0)
+                    cute.copy(tmem_tiled_copy, tDtAcc[acc_i][None, None, cc + 1], r1)
+                    o0 = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                    o1 = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                    o0.store(r0.load().to(IO_DTYPE))
+                    o1.store(r1.load().to(IO_DTYPE))
+                    outs[c] = o0
+                    outs[c + 1] = o1
+                epi_bar.arrive_and_wait()
+                if epi_leader:
+                    acc_pipeline.consumer_release(acc_state)
+                acc_state.advance()
+                row_b = row0 + acc_i * m_pad
+                for c in cutlass.range_constexpr(Q_CHUNKS_PER_THREAD):
+                    if valid:
+                        g = cute.make_tensor(
+                            (mT.iterator + (row_b * n_cols + col0 + c * 32)).align(16), seg32
+                        )
+                        cute.autovec_copy(outs[c], g)
+            blk += num_clusters
+        pipeline.NamedBarrier(barrier_id=4, num_threads=32 * Q_EPI_WARPS).arrive_and_wait()
+        tmem.relinquish_alloc_permit()
+        tmem.free(tmem_ptr)
+
+    cute.arch.cluster_arrive()
+    cute.arch.cluster_wait()
+
+
+@cute.jit
+def wino_pass_host(
+    a: cute.Tensor,
+    b: cute.Tensor,
+    t: cute.Tensor,
+    m_valid: cutlass.Int32,
+    components: cutlass.Constexpr[int],
+    num_clusters: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+):
+    op = tcgen05.MmaF16BF16Op(
+        IO_DTYPE,
+        ACC_DTYPE,
+        Q_INST_MNK,
+        P_CTA_GROUP,
+        tcgen05.OperandSource.SMEM,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
+    )
+    tiled_mma = cute.make_tiled_mma(op)
+    a_smem_layout = sm100_utils.make_smem_layout_a(
+        tiled_mma, Q_TILER_MNK, IO_DTYPE, Q_STAGES * Q_CPS
+    )
+    b_smem_layout = sm100_utils.make_smem_layout_b(
+        tiled_mma, Q_TILER_MNK, IO_DTYPE, Q_STAGES * Q_CPS
+    )
+    a_one = cute.select(a_smem_layout, mode=[0, 1, 2])
+    b_one = cute.select(b_smem_layout, mode=[0, 1, 2])
+    cluster_layout_vmnk = cute.tiled_divide(cute.make_layout((P_PAIR, 1, 1)), (tiled_mma.thr_id,))
+    tma_op = cpasync.CopyBulkTensorTileG2SOp(P_CTA_GROUP)
+    a_tma_atom, a_tma_tensor = cute.nvgpu.make_tiled_tma_atom_A(
+        tma_op, a, a_one, Q_TILER_MNK, tiled_mma, cluster_layout_vmnk.shape
+    )
+    b_tma_atom, b_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
+        tma_op, b, b_one, Q_TILER_MNK, tiled_mma, cluster_layout_vmnk.shape
+    )
+    m_pad, _, _ = a.layout.shape
+    n, _, _ = b.layout.shape
+    n_blocks = cute.ceil_div(n, Q_N)
+    m_tiles = cute.ceil_div(m_pad, Q_TILER_MNK[0])
+    num_blocks = n_blocks * m_tiles * P_COORDS * components
+    wino_pass_kernel(
+        tiled_mma,
+        a_tma_atom,
+        a_tma_tensor,
+        b_tma_atom,
+        b_tma_tensor,
+        t,
+        a_smem_layout,
+        b_smem_layout,
+        cluster_layout_vmnk,
+        m_valid,
+        m_pad,
+        n_blocks,
+        m_tiles,
+        num_blocks,
+    ).launch(
+        grid=(P_PAIR * num_clusters, 1, 1),
+        block=(Q_THREADS, 1, 1),
+        cluster=(P_PAIR, 1, 1),
+        min_blocks_per_mp=1,
+        stream=stream,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _max_active_pairs() -> int:
+    return int(utils.HardwareInfo().get_max_active_clusters(P_PAIR))
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_pass(key: tuple[int, ...]):
+    nl, m_pad, n, k, num_clusters = key
+    v = torch.empty(nl, m_pad, k, dtype=torch.bfloat16, device="cuda")
+    u = torch.empty(nl, n, k, dtype=torch.bfloat16, device="cuda")
+    t = torch.empty(nl // 2 * m_pad, n, dtype=torch.bfloat16, device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return cute.compile(
+        wino_pass_host,
+        _as_mkl(v, 1),
+        _as_mkl(u, 1),
+        _as_rows(t),
+        cutlass.Int32(1),
+        nl // 16,
+        num_clusters,
+        stream,
+    )
+
+
+def wino_spatial_gemm_pass2(
+    v: torch.Tensor, u_nk: torch.Tensor, t: torch.Tensor, m_valid: int
+) -> torch.Tensor:
+    """GEMMs + row combination of the spatial Winograd conv: ``v`` [components*16, rows, Cin]
+    (coordinate l = comp*16 + x*4 + y), ``u_nk`` [components*16, Cout, Cin] **with the y = 3
+    coordinate negated** (see :func:`winograd_pass_filters`); writes the partials ``t``
+    [components*8, rows, Cout] with t[comp*8 + x*2 + b] = sum_y M[comp, x, y] A[y, b]. Any
+    row count (the TMA loads zero-fill past the end, the stores stop at ``m_valid``);
+    Cout % 256 == 0, Cin % 64 == 0."""
+    nl, m_pad, k = v.shape
+    n = u_nk.shape[1]
+    assert nl % 16 == 0 and n % Q_N == 0 and k % Q_K == 0
+    assert t.shape == (nl // 2, m_pad, n) and m_valid <= m_pad
+    components = nl // 16
+    num_blocks = (n // Q_N) * -(-m_pad // Q_TILER_MNK[0]) * P_COORDS * components
+    num_clusters = min(_max_active_pairs(), num_blocks)
+    fn = _compiled_pass((nl, m_pad, n, k, num_clusters))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        _as_mkl(v, 1),
+        _as_mkl(u_nk, 1),
+        _as_rows(t.view(nl // 2 * m_pad, n)),
+        cutlass.Int32(m_valid),
+        stream,
+    )
+    return t
+
+
+def winograd_pass_filters(u_nk: torch.Tensor) -> torch.Tensor:
+    """Filters for :func:`wino_spatial_gemm_pass2`: ``u_nk`` [components*16, Cout, Cin] with the
+    y = 3 coordinate of every row negated, so the second pass accumulates -a3."""
+    u = u_nk.clone()
+    u.view(-1, 4, 4, *u.shape[1:])[:, :, 3].neg_()
+    return u
+
+
+def wino_spatial_combine_rows(t: torch.Tensor, out: torch.Tensor, components: int) -> torch.Tensor:
+    """y = A^T t: combines the row partials of :func:`wino_spatial_gemm_pass2` into the output
+    frames ``out`` [N, H, W, Cout] (CUDA kernel, 3 partials per output pixel)."""
+    return torch.ops.trtllm.vae_wino_spatial_combine(t, out, components)
+
+
 def _as_mkl(t: torch.Tensor, leading_dim: int) -> cute.Tensor:
     """torch ``[L, R, C]`` (C contiguous) -> cute tensor ``(R, C, L)`` with the C mode contiguous."""
     return (
@@ -1343,7 +1801,7 @@ def _main_fused(args) -> None:
     )
     th, tw = (h + 1) // 2, (w + 1) // 2
     m_valid = pairs * th * tw
-    m_pad = (m_valid + 255) // 256 * 256  # multiple of both kernels' tile heights
+    m_pad = m_valid if args.no_pad else (m_valid + 255) // 256 * 256
     v_exact = torch.ops.trtllm.vae_wino_spatial_in(frames, components, 0, th)  # [64, m_valid, cin]
     v = torch.zeros(components * 16, m_pad, cin, dtype=torch.bfloat16, device="cuda")
     v[:, :m_valid] = v_exact
@@ -1353,6 +1811,14 @@ def _main_fused(args) -> None:
         v = v.half()
         u_nk = u_nk.half()
     run = wino_spatial_conv_persistent if args.persistent else wino_spatial_conv_fused
+    if args.pass2:
+        t_part = torch.empty(components * 8, m_pad, cout, dtype=torch.bfloat16, device="cuda")
+        u_pass = winograd_pass_filters(u_nk)
+
+        def run(v, u_nk, out, components, pairs, h, w):
+            wino_spatial_gemm_pass2(v, u_pass, t_part, m_valid)
+            return wino_spatial_combine_rows(t_part, out, components)
+
     run(v, u_nk, out, components, pairs, h, w)
     torch.cuda.synchronize()
     g = winograd_weights(weight)
@@ -1370,6 +1836,52 @@ def _main_fused(args) -> None:
     ).permute(0, 2, 3, 1)
     rel = ((out.float() - ref).norm() / ref.norm()).item()
     print(f"fused rel-L2 vs fp32 conv2d of the component filters: {rel:.3e}")
+    if args.diag:
+        for pr in range(2):
+            for pc in range(2):
+                o, r = out[:, pr::2, pc::2].float(), ref[:, pr::2, pc::2]
+                print(f"  parity ({pr},{pc}) rel-L2 {((o - r).norm() / r.norm()).item():.3e}")
+        for nb in range(min(4, cout // 64)):
+            o, r = out[..., nb * 64 : (nb + 1) * 64].float(), ref[..., nb * 64 : (nb + 1) * 64]
+            print(
+                f"  channels {nb * 64}..{(nb + 1) * 64 - 1} rel-L2 {((o - r).norm() / r.norm()).item():.3e}"
+            )
+        # Identity filters: the GEMMs must return V itself, so the kernel output is the plain
+        # inverse transform of V. Any channel/row permutation of A shows up as a permutation here.
+        u_eye = (
+            torch.eye(cout, cin, dtype=torch.bfloat16, device="cuda")
+            .expand(components * 16, -1, -1)
+            .contiguous()
+        )
+        ref_eye = torch.empty_like(out)
+        torch.ops.trtllm.vae_wino_spatial_out(v_exact, ref_eye, components, 0, th)
+        run(v, u_eye, out, components, pairs, h, w)
+        torch.cuda.synchronize()
+        o2, r2 = out.float().reshape(-1, cout), ref_eye.float().reshape(-1, cout)
+        print(f"  identity-filter rel-L2 {((o2 - r2).norm() / r2.norm()).item():.3e}")
+        on = o2 / (o2.norm(dim=0, keepdim=True) + 1e-6)
+        rn = r2 / (r2.norm(dim=0, keepdim=True) + 1e-6)
+        corr = on.t() @ rn  # [cout_out, cout_ref]
+        best = corr.argmax(dim=1)
+        print(f"  channel match: out ch -> ref ch (first 40): {best[:40].tolist()}")
+        print(
+            f"  best corr (first 8): {[round(x, 3) for x in corr.max(dim=1).values[:8].tolist()]}"
+        )
+        on_r = o2 / (o2.norm(dim=1, keepdim=True) + 1e-6)
+        rn_r = r2 / (r2.norm(dim=1, keepdim=True) + 1e-6)
+        rows = min(512, o2.shape[0])
+        corr_r = on_r[:rows] @ rn_r[:rows].t()
+        print(f"  row match (first 24 of pixels): {corr_r.argmax(dim=1)[:24].tolist()}")
+        print(
+            f"  per-pixel-row cosine (first 8): {[round(x, 3) for x in (on_r * rn_r).sum(dim=1)[:8].tolist()]}"
+        )
+        for pr in range(2):
+            for pc in range(2):
+                o, r = out[:, pr::2, pc::2].float(), ref_eye[:, pr::2, pc::2].float()
+                print(
+                    f"  identity parity ({pr},{pc}) rel-L2 {((o - r).norm() / r.norm()).item():.3e}"
+                )
+        return
     if args.probe:
         for _ in range(3):
             run(v, u_nk, out, components, pairs, h, w)
@@ -1383,6 +1895,17 @@ def _main_fused(args) -> None:
         args.iters,
         use_graph=True,
     )["span"]["median_us"]
+    if args.pass2:
+        t_gemm = _time_cupti(
+            lambda: wino_spatial_gemm_pass2(v, u_pass, t_part, m_valid),
+            3,
+            args.iters,
+            use_graph=True,
+        )["span"]["median_us"]
+        print(
+            f"pass2 GEMMs  : {t_gemm / 1000:8.3f} ms  {wino_flops / t_gemm / 1e6:6.0f} TF/s on Winograd FLOPs"
+            f" (GEMM kernel alone; the line below includes the combine kernel)"
+        )
     wts = [g[k].contiguous(memory_format=torch.channels_last) for k in range(components)]
     d_comp = [frames[k * pairs : (k + 1) * pairs].permute(0, 3, 1, 2) for k in range(components)]
 
@@ -1402,6 +1925,28 @@ def _main_fused(args) -> None:
     print(
         f"cuBLAS bmm   : {t_bmm / 1e3:8.3f} ms  {wino_flops / (t_bmm * 1e-6) / 1e12:6.0f} TF/s (GEMMs alone)"
     )
+    if args.pass2:
+        from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+            cute_spatial_filters,
+            wino_spatial_conv_cuda,
+            wino_spatial_conv_cute,
+        )
+
+        d4 = frames.view(components, pairs, h * w, cin)
+        u_portable = winograd_spatial_weights(weight)
+        u_cute = cute_spatial_filters(u_portable.transpose(1, 2).contiguous())
+        t_port = _time_cupti(
+            lambda: wino_spatial_conv_cuda(d4, u_portable, h, w), 3, args.iters, use_graph=True
+        )["span"]["median_us"]
+        t_cute = _time_cupti(
+            lambda: wino_spatial_conv_cute(d4, u_cute, h, w), 3, args.iters, use_graph=True
+        )["span"]["median_us"]
+        print(
+            f"portable path: {t_port / 1000:8.3f} ms  (in-transform + cuBLAS bmm + out-transform, exact rows)"
+        )
+        print(
+            f"cute path    : {t_cute / 1000:8.3f} ms  (in-transform + two-pass GEMM + combine, exact rows)"
+        )
 
 
 def _main() -> None:
@@ -1425,6 +1970,17 @@ def _main() -> None:
     parser.add_argument("--case", default="1024,1024,90,160", help="cin,cout,H,W for --fused")
     parser.add_argument(
         "--persistent", action="store_true", help="with --fused: the persistent kernel"
+    )
+    parser.add_argument(
+        "--diag", action="store_true", help="with --fused: correctness diagnostics only"
+    )
+    parser.add_argument(
+        "--pass2",
+        action="store_true",
+        help="with --fused: the 256x256 two-pass kernel + torch combine",
+    )
+    parser.add_argument(
+        "--no-pad", action="store_true", help="with --fused: exact row count, no padding to 256"
     )
     args = parser.parse_args()
     if args.fused:

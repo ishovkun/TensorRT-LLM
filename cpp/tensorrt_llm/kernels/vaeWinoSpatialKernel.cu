@@ -205,6 +205,68 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// y = A^T t for one tile and 8 channels from the row partials t[(comp, x, b)][m][c]
+// (t[x, b] = sum_y M[x, y] A[y, b], rows m = pair * tiles + tile with stride rowStride).
+__global__ void __launch_bounds__(kThreads) vaeWinoSpatialCombineKernel(
+    T const* __restrict__ t, T* __restrict__ frames, VaeWinoSpatialParams p, int64_t rowStride)
+{
+    Geometry const g = geometry(p);
+    int const C = p.channels;
+    int const cvec = C / V;
+    int64_t const total = static_cast<int64_t>(p.frames) * g.tilesPerFrame * cvec;
+    for (int64_t idx = static_cast<int64_t>(blockIdx.x) * kThreads + threadIdx.x; idx < total;
+         idx += static_cast<int64_t>(gridDim.x) * kThreads)
+    {
+        int const c0 = static_cast<int>(idx % cvec) * V;
+        int64_t const tl = idx / cvec;
+        int const n = static_cast<int>(tl / g.tilesPerFrame);
+        int64_t const tile = tl - static_cast<int64_t>(n) * g.tilesPerFrame;
+        int const i = p.row0 + static_cast<int>(tile / g.tw);
+        int const j = static_cast<int>(tile - static_cast<int64_t>(i - p.row0) * g.tw);
+        int const comp = n / g.pairs, pair = n - comp * g.pairs;
+        int64_t const m = pair * g.tilesPerFrame + tile;
+
+        Vec tv[4][2];
+#pragma unroll
+        for (int x = 0; x < 4; ++x)
+        {
+#pragma unroll
+            for (int b = 0; b < 2; ++b)
+            {
+                int64_t const row = (static_cast<int64_t>(comp) * 4 + x) * 2 + b;
+                tv[x][b] = *reinterpret_cast<Vec const*>(t + (row * rowStride + m) * C + c0);
+            }
+        }
+        Vec out[2][2];
+#pragma unroll
+        for (int e = 0; e < V / 2; ++e)
+        {
+#pragma unroll
+            for (int b = 0; b < 2; ++b)
+            {
+                float2 const t0 = pairAt(tv[0][b], e), t1 = pairAt(tv[1][b], e), t2 = pairAt(tv[2][b], e),
+                             t3 = pairAt(tv[3][b], e);
+                setPair(out[0][b], e, make_float2(t0.x + t1.x + t2.x, t0.y + t1.y + t2.y));
+                setPair(out[1][b], e, make_float2(t1.x - t2.x - t3.x, t1.y - t2.y - t3.y));
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+        {
+#pragma unroll
+            for (int c = 0; c < 2; ++c)
+            {
+                if (2 * i + r < p.height && 2 * j + c < p.width)
+                {
+                    int64_t const off
+                        = ((static_cast<int64_t>(n) * p.height + 2 * i + r) * p.width + 2 * j + c) * C + c0;
+                    *reinterpret_cast<Vec*>(frames + off) = out[r][c];
+                }
+            }
+        }
+    }
+}
+
 unsigned gridFor(int64_t total)
 {
     int device = 0;
@@ -242,6 +304,16 @@ void launchVaeWinoSpatialOutput(void const* m, void* frames, VaeWinoSpatialParam
     int64_t const total = static_cast<int64_t>(p.frames) * (p.row1 - p.row0) * ((p.width + 1) / 2) * (p.channels / V);
     vaeWinoSpatialOutputKernel<<<gridFor(total), kThreads, 0, stream>>>(
         static_cast<T const*>(m), static_cast<T*>(frames), p);
+    sync_check_cuda_error(stream);
+}
+
+void launchVaeWinoSpatialCombine(
+    void const* t, void* frames, VaeWinoSpatialParams const& p, int64_t rowStride, cudaStream_t stream)
+{
+    check(p);
+    int64_t const total = static_cast<int64_t>(p.frames) * (p.row1 - p.row0) * ((p.width + 1) / 2) * (p.channels / V);
+    vaeWinoSpatialCombineKernel<<<gridFor(total), kThreads, 0, stream>>>(
+        static_cast<T const*>(t), static_cast<T*>(frames), p, rowStride);
     sync_check_cuda_error(stream);
 }
 

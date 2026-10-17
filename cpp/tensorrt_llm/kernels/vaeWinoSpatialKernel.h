@@ -50,6 +50,10 @@ struct VaeWinoSpatialParams
 
 void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream);
 void launchVaeWinoSpatialOutput(void const* m, void* frames, VaeWinoSpatialParams const& p, cudaStream_t stream);
+// Output from row partials t[(comp, x, b)][m][C] (m = pair * ntiles + tile, row stride `rowStride`
+// >= pairs * ntiles): y[frame, 2i+a, 2j+b, C] = sum_x A^T[a, x] t[x, b].
+void launchVaeWinoSpatialCombine(
+    void const* t, void* frames, VaeWinoSpatialParams const& p, int64_t rowStride, cudaStream_t stream);
 
 } // namespace kernels
 

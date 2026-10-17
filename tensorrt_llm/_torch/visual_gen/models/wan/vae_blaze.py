@@ -43,6 +43,7 @@ from .blaze_kernels import (
     cuda_op_available,
     cuda_wino_available,
     cuda_wino_spatial_available,
+    cute_spatial_filters,
     cute_wino_available,
     frames_to_video,
     frames_view,
@@ -131,11 +132,10 @@ class VaeBlazeOptions:
     # channel): "auto" uses it on convs with >= 1024 input channels and at most 90x160
     # pixels, "all" on every Winograd conv (tests), "off" never. Needs winograd_temporal.
     winograd_spatial: str = "off"
-    # Which kernel does the spatial-Winograd GEMMs: "cublas" (input/output transform kernels
-    # around a cuBLAS batched GEMM, the transformed data round-trips through memory) or "cute"
-    # (one persistent CuTe DSL kernel on Blackwell that keeps it on chip; falls back to cuBLAS
-    # where unavailable or for convs it does not support).
-    winograd_spatial_kernel: str = "cublas"
+    # Spatial-Winograd GEMM kernel: "cute" = the CuTe DSL two-pass kernel + CUDA combine on
+    # Blackwell for convs with Cout % 256 == 0 and frames of at least 45x80 pixels (cuBLAS
+    # elsewhere); "cublas" = the portable path everywhere.
+    winograd_spatial_kernel: str = "cute"
     # Checklist item 9: the convs that still run as 3D with a causal cache (one frame per
     # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
     # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
@@ -606,18 +606,22 @@ class BlazeCausalConv3d(nn.Conv3d):
             self._wino_u = (*key, winograd_spatial_weights(self.weight))
         return self._wino_u[2]
 
-    def _winograd_spatial_weights_nk(self) -> torch.Tensor:
+    def _winograd_spatial_weights_cute(self) -> torch.Tensor:
         key = (self.weight.data_ptr(), self.weight._version)
         if self._wino_u_nk is None or self._wino_u_nk[:2] != key:
-            self._wino_u_nk = (*key, self._winograd_spatial_weights().transpose(1, 2).contiguous())
+            u_nk = self._winograd_spatial_weights().transpose(1, 2).contiguous()
+            self._wino_u_nk = (*key, cute_spatial_filters(u_nk))
         return self._wino_u_nk[2]
 
-    def _use_cute_spatial(self) -> bool:
+    def _use_cute_spatial(self, height: int, width: int) -> bool:
+        # The 256-wide two-pass kernel beats the portable path from 45x80 pixels up (its
+        # 256-row tiles waste too many rows below that); smaller frames stay on cuBLAS.
         return (
             self.winograd_spatial_kernel == "cute"
             and cute_wino_available()
             and self.in_channels % 64 == 0
-            and self.out_channels % 128 == 0
+            and self.out_channels % 256 == 0
+            and height * width >= 45 * 80
         )
 
     def spatial_eligible(self, height: int, width: int) -> bool:
@@ -632,8 +636,10 @@ class BlazeCausalConv3d(nn.Conv3d):
         conv2d per slab, or spatial Winograd on all four at once where that is faster."""
         _, _, h, w = slabs.d[0].shape
         if self.spatial_eligible(h, w):
-            if self._use_cute_spatial():
-                m = wino_spatial_conv_cute(slabs.stacked, self._winograd_spatial_weights_nk(), h, w)
+            if self._use_cute_spatial(h, w):
+                m = wino_spatial_conv_cute(
+                    slabs.stacked, self._winograd_spatial_weights_cute(), h, w
+                )
             else:
                 m = wino_spatial_conv_cuda(slabs.stacked, self._winograd_spatial_weights(), h, w)
             return [pairs_to_images(m[k], h, w) for k in range(4)]

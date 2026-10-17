@@ -360,21 +360,40 @@ def cute_wino_available() -> bool:
     return True
 
 
+def cute_spatial_filters(u_nk: torch.Tensor) -> torch.Tensor:
+    """Filters for :func:`wino_spatial_conv_cute` from ``u_nk [64, Cout, Cin]``: the 256-wide
+    two-pass kernel wants the y = 3 coordinate negated; the 128-wide kernel takes them as is."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_cute import winograd_pass_filters
+
+    return winograd_pass_filters(u_nk) if u_nk.shape[1] % 256 == 0 else u_nk
+
+
 def wino_spatial_conv_cute(
-    d: torch.Tensor, u_nk: torch.Tensor, height: int, width: int
+    d: torch.Tensor, u_cute: torch.Tensor, height: int, width: int
 ) -> torch.Tensor:
-    """Same contract as :func:`wino_spatial_conv_cuda` with ``u_nk [64, Cout, Cin]``: input transform
-    by the CUDA kernel, then the persistent CuTe DSL kernel does the 64 GEMMs and the output
-    transform on chip (no round trip of the products)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_cute import wino_spatial_conv_persistent
+    """Same contract as :func:`wino_spatial_conv_cuda` with ``u_cute`` from
+    :func:`cute_spatial_filters`: input transform by the CUDA kernel, then the CuTe DSL kernels.
+    Cout % 256 == 0: the 256x256-tile two-pass kernel writes the row-combined partials and a CUDA
+    kernel finishes the output transform; otherwise the 128-wide persistent kernel does the 64
+    GEMMs and the whole output transform on chip."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_cute import (
+        wino_spatial_conv_persistent,
+        wino_spatial_gemm_pass2,
+    )
 
     comps, pairs, positions, cin = d.shape
-    cout = u_nk.shape[1]
+    cout = u_cute.shape[1]
     frames = d.view(comps * pairs, height, width, cin)
     tile_rows = (height + 1) // 2
     v = torch.ops.trtllm.vae_wino_spatial_in(frames, comps, 0, tile_rows)
     out = torch.empty((comps * pairs, height, width, cout), dtype=d.dtype, device=d.device)
-    wino_spatial_conv_persistent(v, u_nk, out, comps, pairs, height, width)
+    if cout % 256 == 0:
+        rows = v.shape[1]
+        t = torch.empty((comps * 8, rows, cout), dtype=d.dtype, device=d.device)
+        wino_spatial_gemm_pass2(v, u_cute, t, rows)
+        torch.ops.trtllm.vae_wino_spatial_combine(t, out, comps)
+    else:
+        wino_spatial_conv_persistent(v, u_cute, out, comps, pairs, height, width)
     return out.view(comps, pairs, positions, cout)
 
 

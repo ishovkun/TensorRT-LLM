@@ -653,9 +653,10 @@ def test_spatial_winograd_conv_matches_conv2d(
 
 
 @spatial_op
-@pytest.mark.parametrize("cin_cout_hw", [(64, 128, 6, 10), (128, 256, 9, 13)])
+@pytest.mark.parametrize("cin_cout_hw", [(64, 128, 6, 10), (128, 256, 9, 13), (64, 512, 30, 52)])
 def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, int, int]) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        cute_spatial_filters,
         cute_wino_available,
         wino_spatial_conv_cuda,
         wino_spatial_conv_cute,
@@ -671,6 +672,31 @@ def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, 
     d = torch.randn(4, pairs, h * w, cin, device="cuda").to(torch.bfloat16)
     u = winograd_spatial_weights(weight)
     ref = wino_spatial_conv_cuda(d, u, h, w).float()
-    got = wino_spatial_conv_cute(d, u.transpose(1, 2).contiguous(), h, w).float()
+    got = wino_spatial_conv_cute(
+        d, cute_spatial_filters(u.transpose(1, 2).contiguous()), h, w
+    ).float()
     rel = ((got - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@spatial_op
+@pytest.mark.parametrize("hw", [(6, 10), (9, 13)])
+def test_spatial_winograd_combine_matches_output_transform(hw: tuple[int, int]) -> None:
+    """y = A^T t from row partials t[x, b] = sum_y M[x, y] A[y, b] equals y = A^T M A."""
+    torch.manual_seed(3)
+    comps, pairs, C = 2, 3, 16
+    h, w = hw
+    th, tw = (h + 1) // 2, (w + 1) // 2
+    rows = pairs * th * tw
+    m = torch.randn(comps * 16, rows, C, device="cuda").to(torch.bfloat16)
+    ref = torch.empty(comps * pairs, h, w, C, dtype=torch.bfloat16, device="cuda")
+    torch.ops.trtllm.vae_wino_spatial_out(m, ref, comps, 0, th)
+    mv = m.float().view(comps, 4, 4, rows, C)
+    t = torch.stack(
+        [mv[:, :, 0] + mv[:, :, 1] + mv[:, :, 2], mv[:, :, 1] - mv[:, :, 2] - mv[:, :, 3]], dim=2
+    )
+    t = t.reshape(comps * 8, rows, C).to(torch.bfloat16)
+    got = torch.empty_like(ref)
+    torch.ops.trtllm.vae_wino_spatial_combine(t, got, comps)
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"

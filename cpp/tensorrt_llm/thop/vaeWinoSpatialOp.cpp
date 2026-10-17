@@ -70,16 +70,33 @@ torch::Tensor vae_wino_spatial_out(
     return frames;
 }
 
+// y[:, 2i+a, 2j+b, :] = sum_x A^T[a, x] t[comp, x, b] from row partials t [components*8, m_pad, C]
+// (m_pad >= (N/components) * ntiles); writes into ``frames`` and returns it.
+torch::Tensor vae_wino_spatial_combine(torch::Tensor const& t, torch::Tensor const& frames, int64_t components)
+{
+    auto const p = params(frames, components, 0, (frames.size(1) + 1) / 2);
+    CHECK_INPUT(t, torch::kBFloat16);
+    int64_t const ntiles = static_cast<int64_t>(p.row1) * ((p.width + 1) / 2);
+    TORCH_CHECK(t.dim() == 3 && t.size(0) == components * 8 && t.size(1) >= (p.frames / components) * ntiles
+            && t.size(2) == p.channels,
+        "t must be [components*8, m_pad >= (N/components)*ntiles, C]");
+    tensorrt_llm::kernels::launchVaeWinoSpatialCombine(
+        t.data_ptr(), frames.data_ptr(), p, t.size(1), at::cuda::getCurrentCUDAStream(frames.get_device()));
+    return frames;
+}
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("vae_wino_spatial_in(Tensor frames, int components, int row0, int row1) -> Tensor");
     m.def("vae_wino_spatial_out(Tensor m, Tensor(a!) frames, int components, int row0, int row1) -> Tensor(a!)");
+    m.def("vae_wino_spatial_combine(Tensor t, Tensor(a!) frames, int components) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("vae_wino_spatial_in", &vae_wino_spatial_in);
     m.impl("vae_wino_spatial_out", &vae_wino_spatial_out);
+    m.impl("vae_wino_spatial_combine", &vae_wino_spatial_combine);
 }
 
 } // namespace torch_ext
