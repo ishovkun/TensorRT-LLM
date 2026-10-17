@@ -699,15 +699,18 @@ def wino_spatial_conv_fused(
 # a remote mbarrier arrive. Only the kernel start and end use cluster-wide barriers.
 # ---------------------------------------------------------------------------------------
 
-P_TILER_MNK = (128, 128, 32)
-P_INST_MNK = (128, 128, 16)
-P_STAGES = 3
+P_TILER_MNK = (256, 128, 32)  # M spans the CTA pair (2-CTA MMA): 128 rows per CTA
+P_INST_MNK = (256, 128, 16)
+P_STAGES = 4
+P_PAIR = 2
 P_COORDS = 4
 P_EPI_WARPS = 8
 P_THREADS = 32 * (2 + P_EPI_WARPS)
 P_TMA_WARP = 0
 P_MMA_WARP = 1
-P_AB_ELEMS = P_STAGES * P_COORDS * (P_TILER_MNK[0] + P_TILER_MNK[1]) * P_TILER_MNK[2]
+P_AB_ELEMS = (
+    P_STAGES * P_COORDS * (P_TILER_MNK[0] // P_PAIR + P_TILER_MNK[1] // P_PAIR) * P_TILER_MNK[2]
+)
 P_SLOT_BYTES = 128 * 32 * 2  # one received chunk: 128 rows x 32 cols bf16
 P_SCRATCH_ELEMS = P_EPI_WARPS * 32 * 32  # bf16 per warp: 32 rows x 32 cols
 
@@ -718,6 +721,7 @@ class PersistentSharedStorage:
     acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
     recv_mbar: cutlass.Int64
     free_mbar: cutlass.Int64
+    tmem_dealloc_mbar: cutlass.Int64
     tmem_holding_buf: cutlass.Int32
     recv: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, 2 * 128 * 32], 128]
     scratch: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_SCRATCH_ELEMS], 128]
@@ -734,6 +738,7 @@ def wino_persistent_kernel(
     mY: cute.Tensor,
     a_smem_layout: cute.ComposedLayout,
     b_smem_layout: cute.ComposedLayout,
+    cluster_layout_vmnk: cute.Layout,
     m_valid: cutlass.Int32,
     ntiles: cutlass.Int32,
     tiles_w: cutlass.Int32,
@@ -748,13 +753,17 @@ def wino_persistent_kernel(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     bidx, _, _ = cute.arch.block_idx()
     gdim, _, _ = cute.arch.grid_dim()
-    num_clusters = gdim // P_COORDS
-    cluster_id = bidx // P_COORDS
-    x_row = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    # Cluster (2, 4): x = the MMA pair half (v), y = the coordinate row. Rank = v + 2 * row.
+    num_clusters = gdim // P_PAIR
+    cluster_id = bidx // P_PAIR
+    rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    x_row = rank // P_PAIR
+    v_half = rank % P_PAIR
+    is_leader = v_half == 0
 
     smem = utils.SmemAllocator()
     storage = smem.allocate(PersistentSharedStorage)
-    a_elems = P_STAGES * P_COORDS * P_TILER_MNK[0] * P_TILER_MNK[2]
+    a_elems = P_STAGES * P_COORDS * (P_TILER_MNK[0] // P_PAIR) * P_TILER_MNK[2]
     sA = storage.smem_ab.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
     sB = cute.make_tensor(
         cute.recast_ptr(storage.smem_ab.data_ptr() + a_elems, swizzle_=b_smem_layout.inner),
@@ -769,9 +778,16 @@ def wino_persistent_kernel(
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
 
-    tma_bytes = P_COORDS * (
-        cute.size_in_bytes(IO_DTYPE, cute.select(a_smem_layout, mode=[0, 1, 2]))
-        + cute.size_in_bytes(IO_DTYPE, cute.select(b_smem_layout, mode=[0, 1, 2]))
+    # Both CTAs of the pair load into the leader's full barrier (hence x2); the leader's MMA
+    # warp releases both CTAs' empty barriers. Signaling is confined to the pair (B-mode
+    # multicast of size 1), never across coordinate rows, whose operands differ.
+    tma_bytes = (
+        P_PAIR
+        * P_COORDS
+        * (
+            cute.size_in_bytes(IO_DTYPE, cute.select(a_smem_layout, mode=[0, 1, 2]))
+            + cute.size_in_bytes(IO_DTYPE, cute.select(b_smem_layout, mode=[0, 1, 2]))
+        )
     )
     ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
         num_stages=P_STAGES,
@@ -779,13 +795,16 @@ def wino_persistent_kernel(
         consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         tx_count=tma_bytes,
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
+        cta_layout_vmnk=cluster_layout_vmnk,
+        mcast_mode_mn=(0, 1),
         defer_sync=True,
     ).make_participants()
     acc_pipeline = pipeline.PipelineUmmaAsync.create(
         num_stages=1,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-        consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * P_EPI_WARPS),
+        consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, P_PAIR * 32 * P_EPI_WARPS),
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
+        cta_layout_vmnk=cluster_layout_vmnk,
         defer_sync=True,
     )
     # Receivers this CTA pushes to per round: rows 1 and 2 feed three owners, rows 0 and 3 one.
@@ -801,12 +820,16 @@ def wino_persistent_kernel(
 
     tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * (1 + P_EPI_WARPS))
     tmem = utils.TmemAllocator(
-        storage.tmem_holding_buf.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=2
+        storage.tmem_holding_buf.ptr,
+        barrier_for_retrieve=tmem_alloc_barrier,
+        allocator_warp_id=2,
+        is_two_cta=True,
+        two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
     )
 
     gA = cute.local_tile(mA_mkl, cute.slice_(P_TILER_MNK, (None, 0, None)), (None, None, None))
     gB = cute.local_tile(mB_nkl, cute.slice_(P_TILER_MNK, (0, None, None)), (None, None, None))
-    thr_mma = tiled_mma.get_slice(0)
+    thr_mma = tiled_mma.get_slice(v_half)
     tCgA = thr_mma.partition_A(gA)
     tCgB = thr_mma.partition_B(gB)
     tCrA = tiled_mma.make_fragment_A(sA)
@@ -856,24 +879,25 @@ def wino_persistent_kernel(
         tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
         tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
         acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
-        blk = cluster_id
-        while blk < num_blocks:
-            acc_pipeline.producer_acquire(acc_state)
-            for k_tile in cutlass.range(num_k_tiles):
-                ab_full = ab_consumer.wait_and_advance()
-                for y in cutlass.range_constexpr(P_COORDS):
-                    slot = ab_full.index * P_COORDS + y
-                    acc_y = tCtAcc[(None, None, None, y)]
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                    for k_block in cutlass.range(cute.size(tCrA, mode=[2]), unroll_full=True):
-                        coord = (None, None, k_block, slot)
-                        cute.gemm(tiled_mma, acc_y, tCrA[coord], tCrB[coord], acc_y)
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                ab_full.release()
-            acc_pipeline.producer_commit(acc_state)
-            acc_state.advance()
-            blk += num_clusters
-        acc_pipeline.producer_tail(acc_state)
+        if is_leader:
+            blk = cluster_id
+            while blk < num_blocks:
+                acc_pipeline.producer_acquire(acc_state)
+                for k_tile in cutlass.range(num_k_tiles):
+                    ab_full = ab_consumer.wait_and_advance()
+                    for y in cutlass.range_constexpr(P_COORDS):
+                        slot = ab_full.index * P_COORDS + y
+                        acc_y = tCtAcc[(None, None, None, y)]
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                        for k_block in cutlass.range(cute.size(tCrA, mode=[2]), unroll_full=True):
+                            coord = (None, None, k_block, slot)
+                            cute.gemm(tiled_mma, acc_y, tCrA[coord], tCrB[coord], acc_y)
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    ab_full.release()
+                acc_pipeline.producer_commit(acc_state)
+                acc_state.advance()
+                blk += num_clusters
+            acc_pipeline.producer_tail(acc_state)
 
     # ---------------- epilogue warps ----------------
     if warp_idx >= 2:
@@ -953,7 +977,7 @@ def wino_persistent_kernel(
             acc_state.advance()
 
             # Pixel coordinates of this thread's tile row.
-            m_global = m_tile * 128 + row_m
+            m_global = m_tile * P_TILER_MNK[0] + v_half * 128 + row_m
             pair = m_global // ntiles
             t_in_frame = m_global - pair * ntiles
             ti = t_in_frame // tiles_w
@@ -1004,20 +1028,36 @@ def wino_persistent_kernel(
                                 d1 = (recv_ptr + (128 * 32 + grow * 32 + seg * 8)).align(16)
                                 if pas == 0:
                                     if x_row == 0:
-                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 1)
+                                        cute.arch.store_async_dsmem(
+                                            d0, vv, recv_bar, 1 * P_PAIR + v_half
+                                        )
                                     elif x_row == 1:
-                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 0)
-                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 2)
+                                        cute.arch.store_async_dsmem(
+                                            d0, vv, recv_bar, 0 * P_PAIR + v_half
+                                        )
+                                        cute.arch.store_async_dsmem(
+                                            d0, vv, recv_bar, 2 * P_PAIR + v_half
+                                        )
                                     elif x_row == 2:
-                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 1)
-                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 3)
+                                        cute.arch.store_async_dsmem(
+                                            d1, vv, recv_bar, 1 * P_PAIR + v_half
+                                        )
+                                        cute.arch.store_async_dsmem(
+                                            d1, vv, recv_bar, 3 * P_PAIR + v_half
+                                        )
                                     else:
-                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 2)
+                                        cute.arch.store_async_dsmem(
+                                            d1, vv, recv_bar, 2 * P_PAIR + v_half
+                                        )
                                 else:
                                     if x_row == 1:
-                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 3)
+                                        cute.arch.store_async_dsmem(
+                                            d0, vv, recv_bar, 3 * P_PAIR + v_half
+                                        )
                                     else:
-                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 0)
+                                        cute.arch.store_async_dsmem(
+                                            d1, vv, recv_bar, 0 * P_PAIR + v_half
+                                        )
                             cute.arch.sync_warp()
                     # Receive the two peers' partial sums and combine with the own one.
                     cute.arch.mbarrier_wait(recv_bar, c % 2)
@@ -1046,17 +1086,33 @@ def wino_persistent_kernel(
                     group_bar.arrive_and_wait()
                     if leader:
                         if x_row == 0:
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=1)
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=2)
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
+                            )
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
+                            )
                         elif x_row == 1:
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=0)
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=2)
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=0 * P_PAIR + v_half
+                            )
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
+                            )
                         elif x_row == 2:
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=1)
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=3)
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
+                            )
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=3 * P_PAIR + v_half
+                            )
                         else:
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=1)
-                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=2)
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
+                            )
+                            cute.arch.mbarrier_arrive(
+                                free_bar, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
+                            )
                 # Both groups step through the rounds in lockstep: one receive barrier, one slot pair.
                 round_bar.arrive_and_wait()
             blk += num_clusters
@@ -1089,7 +1145,7 @@ def wino_persistent_host(
         IO_DTYPE,
         ACC_DTYPE,
         P_INST_MNK,
-        tcgen05.CtaGroup.ONE,
+        tcgen05.CtaGroup.TWO,
         tcgen05.OperandSource.SMEM,
         tcgen05.OperandMajorMode.K,
         tcgen05.OperandMajorMode.K,
@@ -1103,12 +1159,18 @@ def wino_persistent_host(
     )
     a_one = cute.select(a_smem_layout, mode=[0, 1, 2])
     b_one = cute.select(b_smem_layout, mode=[0, 1, 2])
-    tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+    # The TMA atoms see only the pair (no multicast across coordinate rows); the pipelines see
+    # the whole (2, 4) cluster so ranks map to the right coordinates.
+    pair_layout_vmnk = cute.tiled_divide(cute.make_layout((P_PAIR, 1, 1)), (tiled_mma.thr_id,))
+    cluster_layout_vmnk = cute.tiled_divide(
+        cute.make_layout((P_PAIR, P_COORDS, 1)), (tiled_mma.thr_id,)
+    )
+    tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
     a_tma_atom, a_tma_tensor = cute.nvgpu.make_tiled_tma_atom_A(
-        tma_op, a, a_one, P_TILER_MNK, tiled_mma
+        tma_op, a, a_one, P_TILER_MNK, tiled_mma, pair_layout_vmnk.shape
     )
     b_tma_atom, b_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
-        tma_op, b, b_one, P_TILER_MNK, tiled_mma
+        tma_op, b, b_one, P_TILER_MNK, tiled_mma, pair_layout_vmnk.shape
     )
     m_pad, _, _ = a.layout.shape
     n, _, _ = b.layout.shape
@@ -1124,6 +1186,7 @@ def wino_persistent_host(
         y,
         a_smem_layout,
         b_smem_layout,
+        cluster_layout_vmnk,
         m_valid,
         ntiles,
         tiles_w,
@@ -1134,16 +1197,16 @@ def wino_persistent_host(
         m_tiles,
         num_blocks,
     ).launch(
-        grid=(P_COORDS * num_clusters, 1, 1),
+        grid=(P_PAIR * num_clusters, P_COORDS, 1),
         block=(P_THREADS, 1, 1),
-        cluster=(P_COORDS, 1, 1),
+        cluster=(P_PAIR, P_COORDS, 1),
         stream=stream,
     )
 
 
 @functools.lru_cache(maxsize=None)
 def _max_active_clusters() -> int:
-    return int(utils.HardwareInfo().get_max_active_clusters(P_COORDS))
+    return int(utils.HardwareInfo().get_max_active_clusters(P_PAIR * P_COORDS))
 
 
 @functools.lru_cache(maxsize=None)
@@ -1188,13 +1251,13 @@ def wino_spatial_conv_persistent(
     m_valid = pairs * ntiles
     assert (
         nl == components * 16
-        and m_pad % 128 == 0
+        and m_pad % 256 == 0
         and m_pad >= m_valid
         and n % 128 == 0
         and k % 32 == 0
     )
     pixels = components * pairs * height * width
-    num_blocks = (n // 128) * (m_pad // 128) * components
+    num_blocks = (n // 128) * (m_pad // 256) * components
     num_clusters = min(_max_active_clusters(), num_blocks)
     out_rows = out.view(pixels, n)
     fn = _compiled_persistent((nl, m_pad, n, k, pixels, num_clusters))
@@ -1277,7 +1340,7 @@ def _main_fused(args) -> None:
     )
     th, tw = (h + 1) // 2, (w + 1) // 2
     m_valid = pairs * th * tw
-    m_pad = (m_valid + 127) // 128 * 128
+    m_pad = (m_valid + 255) // 256 * 256
     v_exact = torch.ops.trtllm.vae_wino_spatial_in(frames, components, 0, th)  # [64, m_valid, cin]
     v = torch.zeros(components * 16, m_pad, cin, dtype=torch.bfloat16, device="cuda")
     v[:, :m_valid] = v_exact
