@@ -692,17 +692,18 @@ def wino_spatial_conv_fused(
 # soon as their contents are in registers, so the MMA warp starts the next block during the
 # exchange.
 #
-# Exchange, per 32-column chunk (four rounds per block): the partial sum a peer needs is
-# transposed through a per-warp scratch and pushed as bf16 with coalesced st.async into the
-# receiver's two 8 KB slots (completing on the receiver's barrier); the receiver combines it
-# with its own fp32 partial sum from registers and signals "slot free" to its two senders by
-# a remote mbarrier arrive. Only the kernel start and end use cluster-wide barriers.
+# Exchange, per 32-column chunk: the partial sum a peer needs is pushed as bf16 straight from
+# registers with st.async into the receiver's buffer for the group, two 8 KB slots (lower /
+# higher source row), completing on the receiver's barrier; the receiver combines it with its
+# own fp32 partial sum from registers and signals "buffer free" to its two senders by a
+# remote mbarrier arrive, which gates their next push. Only the kernel start and end use
+# cluster-wide barriers.
 # ---------------------------------------------------------------------------------------
 
 P_PAIR = 2  # 2: 2-CTA MMA across a CTA pair (256-row tile blocks); 1: single-CTA MMA
 P_TILER_MNK = (128 * P_PAIR, 128, 64)  # 128 rows per CTA
 P_INST_MNK = (128 * P_PAIR, 128, 16)
-P_STAGES = 3 if P_PAIR == 2 else 2
+P_STAGES = 4 if P_PAIR == 2 else 3
 P_CTA_GROUP = tcgen05.CtaGroup.TWO if P_PAIR == 2 else tcgen05.CtaGroup.ONE
 P_CPS = 2  # coordinates per pipeline stage (a stage = 2 coordinates x 64 K)
 P_COORDS = 4
@@ -715,8 +716,7 @@ P_AB_ELEMS = (
 )
 P_SLOT_BYTES = 128 * 32 * 2  # one received chunk: 128 rows x 32 cols bf16
 P_SLOT_ELEMS = 128 * 32
-P_NBUF = 4  # receive buffers: one per (epilogue group, chunk) so all chunks push back to back
-P_SCRATCH_ELEMS = P_EPI_WARPS * 32 * 32  # bf16 per warp: 32 rows x 32 cols
+P_NBUF = 2  # receive buffers: one per epilogue group (its two chunks are sequenced)
 
 
 @cute.struct
@@ -728,7 +728,6 @@ class PersistentSharedStorage:
     tmem_dealloc_mbar: cutlass.Int64
     tmem_holding_buf: cutlass.Int32
     recv: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_NBUF * 2 * P_SLOT_ELEMS], 128]
-    scratch: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_SCRATCH_ELEMS], 128]
     smem_ab: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_AB_ELEMS], 1024]
 
 
@@ -774,7 +773,6 @@ def wino_persistent_kernel(
         b_smem_layout.outer,
     )
     recv_ptr = storage.recv.data_ptr()
-    scratch_ptr = storage.scratch.data_ptr()
     recv_bars = storage.recv_mbar.data_ptr()
     free_bars = storage.free_mbar.data_ptr()
 
@@ -956,10 +954,6 @@ def wino_persistent_kernel(
         r1_sel = x_row // 2
         r2_sel = x_row % 2
         leader = (lane == 0) & (quarter == 0)
-        scratch_w = scratch_ptr + epi_warp * (32 * 32)  # this warp's 32x32 bf16 scratch
-        it_par = cutlass.Int32(
-            0
-        )  # parity of the block iteration (receive buffers alternate phases)
         blk = cluster_id
         while blk < num_blocks:
             n_block = blk % n_blocks
@@ -1001,20 +995,20 @@ def wino_persistent_kernel(
             pixel = (frame * height + prow) * width + pcol
             ybase = pixel * cute.size(mY, mode=[1]) + n_block * P_TILER_MNK[1]
 
-            # Push both chunks of this group (buffer = group * 2 + chunk, same index on the receiver).
+            # Per chunk of this group (buffer = group, rounds alternate parity = chunk): push the
+            # partial sums the peers need, receive theirs, combine with the own fp32 one, store,
+            # and free the buffer for the peers' next round.
+            buf = group
+            recv_b = recv_bars + buf
+            free_b = free_bars + buf
+            rbase = buf * (2 * P_SLOT_ELEMS)
             for cc in cutlass.range_constexpr(2):
-                buf = group * 2 + cc
-                recv_b = recv_bars + buf
-                free_b = free_bars + buf
-                # The receivers consumed this buffer's previous contents (one block ago).
-                cute.arch.mbarrier_wait(free_b, it_par ^ 1)
+                cute.arch.mbarrier_wait(free_b, cc ^ 1)
                 if leader:
                     cute.arch.mbarrier_arrive_and_expect_tx(recv_b, 2 * P_SLOT_BYTES)
-                rbase = buf * (2 * P_SLOT_ELEMS)
                 for pas in cutlass.range_constexpr(2):
                     do_pass = cutlass.Boolean(True) if pas == 0 else push_own
                     if do_pass:
-                        src = cute.make_tensor(scratch_w + lane * 32, seg32)
                         tmp = cute.make_rmem_tensor(seg32, IO_DTYPE)
                         if pas == 0:
                             if cc == 0:
@@ -1026,19 +1020,15 @@ def wino_persistent_kernel(
                                 tmp.store(own0.load().to(IO_DTYPE))
                             else:
                                 tmp.store(own1.load().to(IO_DTYPE))
-                        cute.autovec_copy(tmp, src)
-                        cute.arch.sync_warp()
-                        for k in cutlass.range_constexpr(4):
-                            srow = 8 * k + lane // 4
-                            seg = lane % 4
-                            v = cute.make_tensor(
-                                (scratch_w + (srow * 32 + seg * 8)).align(16), oct_
-                            ).load()
-                            vi = v.bitcast(cutlass.Int32)
+                        for u in cutlass.range_constexpr(4):
+                            vi = (
+                                cute.make_tensor(tmp.iterator + 8 * u, oct_)
+                                .load()
+                                .bitcast(cutlass.Int32)
+                            )
                             vv = (vi[0], vi[1], vi[2], vi[3])
-                            grow = quarter * 32 + srow
-                            d0 = (recv_ptr + (rbase + grow * 32 + seg * 8)).align(16)
-                            d1 = (recv_ptr + (rbase + P_SLOT_ELEMS + grow * 32 + seg * 8)).align(16)
+                            d0 = (recv_ptr + (rbase + row_m * 32 + u * 8)).align(16)
+                            d1 = (recv_ptr + (rbase + P_SLOT_ELEMS + row_m * 32 + u * 8)).align(16)
                             if pas == 0:
                                 if x_row == 0:
                                     cute.arch.store_async_dsmem(d0, vv, recv_b, 1 * P_PAIR + v_half)
@@ -1055,14 +1045,7 @@ def wino_persistent_kernel(
                                     cute.arch.store_async_dsmem(d0, vv, recv_b, 3 * P_PAIR + v_half)
                                 else:
                                     cute.arch.store_async_dsmem(d1, vv, recv_b, 0 * P_PAIR + v_half)
-                        cute.arch.sync_warp()
-
-            # Receive, combine with the own fp32 partial sum, store, and free the buffers.
-            for cc in cutlass.range_constexpr(2):
-                buf = group * 2 + cc
-                recv_b = recv_bars + buf
-                rbase = buf * (2 * P_SLOT_ELEMS)
-                cute.arch.mbarrier_wait(recv_b, it_par)
+                cute.arch.mbarrier_wait(recv_b, cc)
                 sa = (
                     cute.make_tensor((recv_ptr + (rbase + row_m * 32)).align(16), seg32)
                     .load()
@@ -1088,10 +1071,9 @@ def wino_persistent_kernel(
                         (mY.iterator + (ybase + (2 * group + cc) * 32)).align(16), seg32
                     )
                     cute.autovec_copy(out, gdst)
-                # All 128 threads of the group are done reading this buffer: tell the two senders.
+                # All 128 threads of the group are done reading the buffer: tell the two senders.
                 group_bar.arrive_and_wait()
                 if leader:
-                    free_b = free_bars + buf
                     if x_row == 0:
                         cute.arch.mbarrier_arrive(
                             free_b, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
@@ -1120,7 +1102,6 @@ def wino_persistent_kernel(
                         cute.arch.mbarrier_arrive(
                             free_b, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
                         )
-            it_par = it_par ^ 1
             blk += num_clusters
         # Dealloc tensor memory once every epilogue warp is done.
         pipeline.NamedBarrier(barrier_id=4, num_threads=32 * P_EPI_WARPS).arrive_and_wait()
