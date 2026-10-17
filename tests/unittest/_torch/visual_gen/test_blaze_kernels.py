@@ -554,3 +554,70 @@ def test_cuda_norm_without_activation(C: int, reference: bool) -> None:
     ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
     mismatched = ((actual.float() - expected.float()).abs() > ulp).float().mean().item()
     assert mismatched < (1e-3 if reference else 5e-2)
+
+
+# --- spatial Winograd F(2x2, 3x3) transforms -------------------------------------------
+
+spatial_op = pytest.mark.skipif(
+    not (hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_spatial_in")),
+    reason="trtllm::vae_wino_spatial_in not built",
+)
+_BT = torch.tensor([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], dtype=torch.float32)
+_AT = torch.tensor([[1, 1, 1, 0], [0, 1, -1, -1]], dtype=torch.float32)
+
+
+def _ref_spatial_in(frames: torch.Tensor, components: int, row0: int, row1: int) -> torch.Tensor:
+    """frames [N, H, W, C] -> V [components*16, (N/components) * strip tiles, C] in fp32."""
+    n, h, w, c = frames.shape
+    x = frames.permute(0, 3, 1, 2).float()
+    tiles = F.unfold(
+        F.pad(x, (1, 1 + w % 2, 1, 1 + h % 2)), kernel_size=4, stride=2
+    )  # [n, c*16, L]
+    th, tw = (h + 1) // 2, (w + 1) // 2
+    tiles = tiles.view(n, c, 4, 4, th, tw)[..., row0:row1, :].reshape(n, c, 4, 4, -1)
+    bt = _BT.to(frames.device)
+    v = torch.einsum("xa,ncabl,yb->nxylc", bt, tiles, bt)
+    pairs = n // components
+    return (
+        v.reshape(components, pairs, 16, -1, c)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(components * 16, -1, c)
+    )
+
+
+def _ref_spatial_out(
+    m: torch.Tensor, n: int, h: int, w: int, components: int, row0: int, row1: int
+) -> torch.Tensor:
+    """M [components*16, (N/components) * strip tiles, C] -> y [N, 2*(row1-row0), W, C] in fp32."""
+    comp16, _, c = m.shape
+    pairs = n // components
+    rows, tw = row1 - row0, (w + 1) // 2
+    mm = m.float().view(components, 4, 4, pairs, rows, tw, c)
+    at = _AT.to(m.device)
+    y = torch.einsum("rx,nxyphwc,sy->nphrwsc", at, mm, at)
+    return y.reshape(n, rows * 2, tw * 2, c)[:, : min(rows * 2, h - 2 * row0), :w]
+
+
+@spatial_op
+@pytest.mark.parametrize("C", [8, 160, 256])
+@pytest.mark.parametrize("hw", [(6, 10), (5, 9)])
+@pytest.mark.parametrize("strip", [(0, 3), (1, 2), (2, 3)])
+def test_spatial_winograd_transforms(C: int, strip: tuple[int, int], hw: tuple[int, int]) -> None:
+    torch.manual_seed(0)
+    n, components = 8, 4
+    (h, w), (row0, row1) = hw, strip
+    frames = torch.randn(n, h, w, C, device="cuda").to(torch.bfloat16)
+    v = torch.ops.trtllm.vae_wino_spatial_in(frames, components, row0, row1)
+    v_ref = _ref_spatial_in(frames, components, row0, row1)
+    assert v.shape == v_ref.shape
+    assert torch.equal(v.float(), v_ref.to(torch.bfloat16).float())
+
+    m = torch.randn(components * 16, v.shape[1], C, device="cuda").to(torch.bfloat16)
+    out = torch.full((n, h, w, C), float("nan"), device="cuda", dtype=torch.bfloat16)
+    torch.ops.trtllm.vae_wino_spatial_out(m, out, components, row0, row1)
+    got = out[:, 2 * row0 : min(2 * row1, h)]
+    assert torch.equal(
+        got.float(), _ref_spatial_out(m, n, h, w, components, row0, row1).to(torch.bfloat16).float()
+    )
+    untouched = torch.cat([out[:, : 2 * row0], out[:, 2 * row1 :]], dim=1)
+    assert torch.isnan(untouched.float()).all()

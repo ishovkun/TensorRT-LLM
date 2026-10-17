@@ -145,10 +145,17 @@ add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
 
 add_th_common_family(
-  th_common_visual_gen fusedAdaptiveLayerNormOp.cpp fusedDiTQKNormRopeOp.cpp
-  fusedDiTSplitQKNormRopeOp.cpp fusedDiTSplitNormOp.cpp
-  fusedDiTGateResidNormShiftScaleOp.cpp vaeRmsNormSiluOp.cpp
-  vaeUpsampleGatherOp.cpp vaeWinoNormSiluOp.cpp vaeFrameOpsOp.cpp)
+  th_common_visual_gen
+  fusedAdaptiveLayerNormOp.cpp
+  fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
+  fusedDiTSplitNormOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
+  vaeRmsNormSiluOp.cpp
+  vaeUpsampleGatherOp.cpp
+  vaeWinoNormSiluOp.cpp
+  vaeFrameOpsOp.cpp
+  vaeWinoSpatialOp.cpp)
 
 add_th_common_family(
   th_common_decoding

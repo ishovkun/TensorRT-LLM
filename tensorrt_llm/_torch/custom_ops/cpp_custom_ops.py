@@ -232,6 +232,17 @@ def _register_fake():
     def _(u, bias):
         return u.new_empty((2 * u.shape[0], u.shape[1], u.shape[2] // 2))
 
+    @torch.library.register_fake("trtllm::vae_wino_spatial_in")
+    def _(frames, components, row0, row1):
+        n, _, w, c = frames.shape
+        return frames.new_empty(
+            (components * 16,
+             (n // components) * (row1 - row0) * ((w + 1) // 2), c))
+
+    @torch.library.register_fake("trtllm::vae_wino_spatial_out")
+    def _(m, frames, components, row0, row1):
+        return frames
+
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)

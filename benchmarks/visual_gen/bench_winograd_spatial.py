@@ -28,11 +28,17 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_wan_vae import _time_cupti  # noqa: E402
 
-# (cin, cout, H, W): the widest decoder level, the middle one, the full-resolution one.
+import tensorrt_llm  # noqa: E402, F401  (loads the trtllm:: custom ops)
+
+# (cin, cout, H, W): the 720p decoder levels, then the two 1024-channel levels of the
+# 480x832 bimanual clip.
 CASES = [
+    (1024, 1024, 45, 80),
     (1024, 1024, 90, 160),
     (512, 512, 180, 320),
     (256, 256, 360, 640),
+    (1024, 1024, 30, 52),
+    (1024, 1024, 60, 104),
 ]
 COMPONENTS = 4  # temporal Winograd components per frame pair
 PAIRS = 2  # frame pairs per steady chunk (4 output frames)
@@ -71,7 +77,7 @@ def transform_input(d: torch.Tensor) -> torch.Tensor:
     """
     n, cin, h, w = d.shape
     bt = _const("BT", BT, d.device)
-    padded = F.pad(d.float(), (1, 1, 1, 1))
+    padded = F.pad(d.float(), (1, 1 + w % 2, 1, 1 + h % 2))  # odd sizes: a dropped last row/col
     tiles = F.unfold(padded, kernel_size=4, stride=2)  # [n, cin*16, L]
     L = tiles.shape[-1]
     tiles = tiles.view(n, cin, 4, 4, L)
@@ -87,7 +93,7 @@ def transform_input(d: torch.Tensor) -> torch.Tensor:
 def transform_output(m: torch.Tensor, h: int, w: int) -> torch.Tensor:
     """M [comp*16, pairs*tiles, Cout] -> y [comp*pairs, Cout, H, W] (fp32 arithmetic, caller casts)."""
     at = _const("AT", AT, m.device)
-    th, tw = h // 2, w // 2
+    th, tw = (h + 1) // 2, (w + 1) // 2
     L = th * tw
     comp16, pl, cout = m.shape
     comp = comp16 // 16
@@ -99,9 +105,9 @@ def transform_output(m: torch.Tensor, h: int, w: int) -> torch.Tensor:
     y = (
         y.reshape(comp * pairs, th, tw, cout, 2, 2)
         .permute(0, 3, 1, 4, 2, 5)
-        .reshape(comp * pairs, cout, h, w)
+        .reshape(comp * pairs, cout, 2 * th, 2 * tw)
     )
-    return y
+    return y[..., :h, :w]
 
 
 def main() -> None:
@@ -115,8 +121,17 @@ def main() -> None:
         help="measured large-copy bandwidth for the traffic floor",
     )
     parser.add_argument("--out", default=None)
+    parser.add_argument("--case", type=int, default=None, help="run only CASES[i]")
+    parser.add_argument(
+        "--probe",
+        type=int,
+        default=None,
+        help="no timing, for ncu: 0 runs the CUDA path once whole-frame, N > 0 once with N tile rows per strip",
+    )
     args = parser.parse_args()
-    atexit.register(lambda: __import__("cupti.cupti", fromlist=["cupti"]).finalize())
+    cases = CASES if args.case is None else [CASES[args.case]]
+    if args.probe is None:
+        atexit.register(lambda: __import__("cupti.cupti", fromlist=["cupti"]).finalize())
     torch.backends.cudnn.allow_tf32 = False
     torch.backends.cuda.matmul.allow_tf32 = False
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -128,7 +143,7 @@ def main() -> None:
     ]
     print("".join(header))
     rows = []
-    for cin, cout, h, w in CASES:
+    for cin, cout, h, w in cases:
         gen = torch.Generator(device="cuda").manual_seed(cin + h)
         n = COMPONENTS * PAIRS
         d32 = torch.randn(n, cin, h, w, generator=gen, device="cuda")
@@ -164,6 +179,54 @@ def main() -> None:
                 torch.bfloat16
             )
 
+        # CUDA transform kernels (trtllm::vae_wino_spatial_in/out), whole frame and strip-blocked.
+        have_cuda_xf = hasattr(torch.ops, "trtllm") and hasattr(
+            torch.ops.trtllm, "vae_wino_spatial_in"
+        )
+        frames_nhwc = d.permute(0, 2, 3, 1).contiguous()  # [N, H, W, Cin]
+        th = (h + 1) // 2
+        y_buf = torch.empty(n, h, w, cout, dtype=torch.bfloat16, device="cuda")
+
+        def cuda_full():
+            v = torch.ops.trtllm.vae_wino_spatial_in(frames_nhwc, COMPONENTS, 0, th)
+            mm = torch.bmm(v, U)
+            return torch.ops.trtllm.vae_wino_spatial_out(mm, y_buf, COMPONENTS, 0, th)
+
+        def make_strips(rows_per_strip: int):
+            def run():
+                for r0 in range(0, th, rows_per_strip):
+                    r1 = min(th, r0 + rows_per_strip)
+                    v = torch.ops.trtllm.vae_wino_spatial_in(frames_nhwc, COMPONENTS, r0, r1)
+                    mm = torch.bmm(v, U)
+                    torch.ops.trtllm.vae_wino_spatial_out(mm, y_buf, COMPONENTS, r0, r1)
+                return y_buf
+
+            return run
+
+        if args.probe is not None:
+            if args.probe == 0:
+                cuda_full()
+            else:
+                make_strips(args.probe)()
+            torch.cuda.synchronize()
+            continue
+
+        t_cuda_full = float("nan")
+        strip_results: dict[int, float] = {}
+        if have_cuda_xf:
+            t_cuda_full = (
+                _time_cupti(cuda_full, args.warmup, args.iters, use_graph=True)["span"]["median_us"]
+                / 1e3
+            )
+            for rows_per in (2, 4, 8, 16):
+                if rows_per < th:
+                    strip_results[rows_per] = (
+                        _time_cupti(make_strips(rows_per), args.warmup, args.iters, use_graph=True)[
+                            "span"
+                        ]["median_us"]
+                        / 1e3
+                    )
+
         t_conv = (
             _time_cupti(conv_path, args.warmup, args.iters, use_graph=True)["span"]["median_us"]
             / 1e3
@@ -183,7 +246,7 @@ def main() -> None:
             _time_cupti(full, args.warmup, args.iters, use_graph=True)["span"]["median_us"] / 1e3
         )
 
-        L = (h // 2) * (w // 2)
+        L = ((h + 1) // 2) * ((w + 1) // 2)
         gemm_flops = 2.0 * 64 * (PAIRS * L) * cin * cout
         gemm_tflops = gemm_flops / (t_gemm / 1e3) / 1e12
         xfm_bytes = 2 * (V.numel() + M.numel()) * 2  # V and M each written once and read once, bf16
@@ -201,12 +264,26 @@ def main() -> None:
         y_wino = full().float()
         y_wino32 = transform_output(torch.bmm(transform_input(d32), transform_weights(w32)), h, w)
         rel = lambda a: ((a - ref).norm() / ref.norm()).item()  # noqa: E731
+        rel_cuda = float("nan")
+        if have_cuda_xf:
+            y_cuda = cuda_full().permute(0, 3, 1, 2).float()
+            rel_cuda = rel(y_cuda)
+            y_strip = make_strips(4)().permute(0, 3, 1, 2).float()
+            assert torch.equal(y_strip, y_cuda), (
+                "strip and whole-frame CUDA paths must agree bitwise"
+            )
         print(
             f"{cin:5d}->{cout:4d} @ {h:3d}x{w:3d} |"
             f" {t_conv:9.3f} {t_gemm:9.3f} {t_xin:8.3f} {t_xout:9.3f} {t_full:8.3f} |"
             f" {gemm_tflops:9.0f} {t_conv / t_gemm:5.2f}x | {xfm_bytes / 1e9:6.2f} {floor_ms:8.3f} {net_ms:+7.3f} |"
             f" {rel(y_conv):10.2e} {rel(y_wino):10.2e}   (fp32 algebra {rel(y_wino32):.1e})"
         )
+        if have_cuda_xf:
+            strips = ", ".join(f"{k} rows: {v:.3f}" for k, v in strip_results.items())
+            print(
+                f"{'':>20s} | CUDA transforms: whole frame {t_cuda_full:.3f} ms"
+                f" (net vs conv {t_conv - t_cuda_full:+.3f}); strips [{strips}] ms; relL2 {rel_cuda:.2e}"
+            )
         rows.append(
             {
                 "cin": cin,
@@ -225,6 +302,9 @@ def main() -> None:
                 "rel_l2_conv_bf16": rel(y_conv),
                 "rel_l2_wino_bf16": rel(y_wino),
                 "rel_l2_wino_fp32": rel(y_wino32),
+                "cuda_full_ms": t_cuda_full,
+                "strip_ms": strip_results,
+                "rel_l2_cuda": rel_cuda,
             }
         )
     if args.out:
