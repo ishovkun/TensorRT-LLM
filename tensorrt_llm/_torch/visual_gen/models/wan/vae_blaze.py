@@ -43,6 +43,7 @@ from .blaze_kernels import (
     cuda_op_available,
     cuda_wino_available,
     cuda_wino_spatial_available,
+    cute_wino_available,
     frames_to_video,
     frames_view,
     images_to_pairs,
@@ -57,6 +58,7 @@ from .blaze_kernels import (
     wino_combine_reference,
     wino_norm_silu_cuda,
     wino_spatial_conv_cuda,
+    wino_spatial_conv_cute,
     winograd_spatial_weights,
     winograd_weights,
 )
@@ -129,6 +131,11 @@ class VaeBlazeOptions:
     # channel): "auto" uses it on convs with >= 1024 input channels and at most 90x160
     # pixels, "all" on every Winograd conv (tests), "off" never. Needs winograd_temporal.
     winograd_spatial: str = "off"
+    # Which kernel does the spatial-Winograd GEMMs: "cublas" (input/output transform kernels
+    # around a cuBLAS batched GEMM, the transformed data round-trips through memory) or "cute"
+    # (one persistent CuTe DSL kernel on Blackwell that keeps it on chip; falls back to cuBLAS
+    # where unavailable or for convs it does not support).
+    winograd_spatial_kernel: str = "cublas"
     # Checklist item 9: the convs that still run as 3D with a causal cache (one frame per
     # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
     # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
@@ -150,6 +157,10 @@ class VaeBlazeOptions:
         if self.winograd_spatial not in ("off", "auto", "all"):
             raise ValueError(
                 f"winograd_spatial must be 'off', 'auto' or 'all', got {self.winograd_spatial!r}"
+            )
+        if self.winograd_spatial_kernel not in ("cublas", "cute"):
+            raise ValueError(
+                f"winograd_spatial_kernel must be 'cublas' or 'cute', got {self.winograd_spatial_kernel!r}"
             )
         if self.conv_out_frame_split < 0 or self.conv_out_frame_split in (1, 2):
             raise ValueError("conv_out_frame_split must be 0 (off) or at least 3 input frames")
@@ -470,6 +481,8 @@ class BlazeCausalConv3d(nn.Conv3d):
         self._wino_w: tuple[int, int, list[torch.Tensor]] | None = None
         # Spatial Winograd mode for forward_winograd ("off", "auto", "all"), set by the block.
         self.winograd_spatial = "off"
+        self.winograd_spatial_kernel = "cublas"
+        self._wino_u_nk: tuple[int, int, torch.Tensor] | None = None
         self._wino_u: tuple[int, int, torch.Tensor] | None = None
 
     # ---- frame buffer ("slab") for the causal history -------------------------------
@@ -593,6 +606,20 @@ class BlazeCausalConv3d(nn.Conv3d):
             self._wino_u = (*key, winograd_spatial_weights(self.weight))
         return self._wino_u[2]
 
+    def _winograd_spatial_weights_nk(self) -> torch.Tensor:
+        key = (self.weight.data_ptr(), self.weight._version)
+        if self._wino_u_nk is None or self._wino_u_nk[:2] != key:
+            self._wino_u_nk = (*key, self._winograd_spatial_weights().transpose(1, 2).contiguous())
+        return self._wino_u_nk[2]
+
+    def _use_cute_spatial(self) -> bool:
+        return (
+            self.winograd_spatial_kernel == "cute"
+            and cute_wino_available()
+            and self.in_channels % 64 == 0
+            and self.out_channels % 128 == 0
+        )
+
     def spatial_eligible(self, height: int, width: int) -> bool:
         if self.winograd_spatial == "off" or self.padding[1:] != (1, 1) or self.in_channels % 8:
             return False
@@ -605,7 +632,10 @@ class BlazeCausalConv3d(nn.Conv3d):
         conv2d per slab, or spatial Winograd on all four at once where that is faster."""
         _, _, h, w = slabs.d[0].shape
         if self.spatial_eligible(h, w):
-            m = wino_spatial_conv_cuda(slabs.stacked, self._winograd_spatial_weights(), h, w)
+            if self._use_cute_spatial():
+                m = wino_spatial_conv_cute(slabs.stacked, self._winograd_spatial_weights_nk(), h, w)
+            else:
+                m = wino_spatial_conv_cuda(slabs.stacked, self._winograd_spatial_weights(), h, w)
             return [pairs_to_images(m[k], h, w) for k in range(4)]
         g = self._winograd_weights()
         pad = (self.padding[1], self.padding[2])
@@ -1057,6 +1087,9 @@ class BlazeResidualBlock(nn.Module):
         residual = self.conv_shortcut(x_in)
         spatial = self.options.winograd_spatial if self.options.use_winograd_spatial else "off"
         self.conv1.winograd_spatial = self.conv2.winograd_spatial = spatial
+        self.conv1.winograd_spatial_kernel = self.conv2.winograd_spatial_kernel = (
+            self.options.winograd_spatial_kernel
+        )
         m1 = self.conv1.forward_winograd(slabs)
 
         idx = feat_idx[0]

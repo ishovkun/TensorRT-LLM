@@ -1042,10 +1042,11 @@ def wino_persistent_kernel(
                                 vals.append(sel)
                             vv = (vals[0], vals[1], vals[2], vals[3])
                             grow = quarter * 32 + src_lane
-                            d0 = (recv_ptr + (rbase + grow * 32 + unit * 8)).align(16)
-                            d1 = (recv_ptr + (rbase + P_SLOT_ELEMS + grow * 32 + unit * 8)).align(
-                                16
-                            )
+                            sw = unit ^ (
+                                grow % 4
+                            )  # 16-byte units swizzled by row: conflict-free reads below
+                            d0 = (recv_ptr + (rbase + grow * 32 + sw * 8)).align(16)
+                            d1 = (recv_ptr + (rbase + P_SLOT_ELEMS + grow * 32 + sw * 8)).align(16)
                             if pas == 0:
                                 if x_row == 0:
                                     cute.arch.store_async_dsmem(d0, vv, recv_b, 1 * P_PAIR + v_half)
@@ -1063,18 +1064,20 @@ def wino_persistent_kernel(
                                 else:
                                     cute.arch.store_async_dsmem(d1, vv, recv_b, 0 * P_PAIR + v_half)
                 cute.arch.mbarrier_wait(recv_b, cc)
-                sa = (
-                    cute.make_tensor((recv_ptr + (rbase + row_m * 32)).align(16), seg32)
-                    .load()
-                    .to(ACC_DTYPE)
-                )
-                sb = (
-                    cute.make_tensor(
-                        (recv_ptr + (rbase + P_SLOT_ELEMS + row_m * 32)).align(16), seg32
+                ra = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                rb = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                for u in cutlass.range_constexpr(4):
+                    off = rbase + row_m * 32 + ((u ^ (row_m % 4)) * 8)
+                    cute.autovec_copy(
+                        cute.make_tensor((recv_ptr + off).align(16), oct_),
+                        cute.make_tensor(ra.iterator + 8 * u, oct_),
                     )
-                    .load()
-                    .to(ACC_DTYPE)
-                )
+                    cute.autovec_copy(
+                        cute.make_tensor((recv_ptr + (off + P_SLOT_ELEMS)).align(16), oct_),
+                        cute.make_tensor(rb.iterator + 8 * u, oct_),
+                    )
+                sa = ra.load().to(ACC_DTYPE)
+                sb = rb.load().to(ACC_DTYPE)
                 mine = own0.load()
                 if cc == 1:
                     mine = own1.load()
@@ -1247,21 +1250,16 @@ def wino_spatial_conv_persistent(
     height: int,
     width: int,
 ) -> torch.Tensor:
-    """Persistent variant of :func:`wino_spatial_conv_fused` (same contract)."""
+    """Persistent variant of :func:`wino_spatial_conv_fused`; any number of rows (the TMA loads
+    zero-fill past the end and the stores are guarded)."""
     nl, m_pad, k = v.shape
     n = u_nk.shape[1]
     tiles_w = (width + 1) // 2
     ntiles = ((height + 1) // 2) * tiles_w
     m_valid = pairs * ntiles
-    assert (
-        nl == components * 16
-        and m_pad % P_TILER_MNK[0] == 0
-        and m_pad >= m_valid
-        and n % 128 == 0
-        and k % 64 == 0
-    )
+    assert nl == components * 16 and m_pad >= m_valid and n % 128 == 0 and k % 64 == 0
     pixels = components * pairs * height * width
-    num_blocks = (n // 128) * (m_pad // P_TILER_MNK[0]) * components
+    num_blocks = (n // 128) * -(-m_pad // P_TILER_MNK[0]) * components
     num_clusters = min(_max_active_clusters(), num_blocks)
     out_rows = out.view(pixels, n)
     fn = _compiled_persistent((nl, m_pad, n, k, pixels, num_clusters))

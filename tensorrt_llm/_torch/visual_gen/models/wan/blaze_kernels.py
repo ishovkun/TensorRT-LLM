@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -344,6 +346,36 @@ def winograd_spatial_weights(weight: torch.Tensor) -> torch.Tensor:
 
 def cuda_wino_spatial_available() -> bool:
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_spatial_in")
+
+
+@functools.lru_cache(maxsize=None)
+def cute_wino_available() -> bool:
+    """The CuTe DSL fused spatial-Winograd kernel: Blackwell (sm100) and ``nvidia-cutlass-dsl`` installed."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return False
+    try:
+        from tensorrt_llm._torch.visual_gen.models.wan import wino_cute  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def wino_spatial_conv_cute(
+    d: torch.Tensor, u_nk: torch.Tensor, height: int, width: int
+) -> torch.Tensor:
+    """Same contract as :func:`wino_spatial_conv_cuda` with ``u_nk [64, Cout, Cin]``: input transform
+    by the CUDA kernel, then the persistent CuTe DSL kernel does the 64 GEMMs and the output
+    transform on chip (no round trip of the products)."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_cute import wino_spatial_conv_persistent
+
+    comps, pairs, positions, cin = d.shape
+    cout = u_nk.shape[1]
+    frames = d.view(comps * pairs, height, width, cin)
+    tile_rows = (height + 1) // 2
+    v = torch.ops.trtllm.vae_wino_spatial_in(frames, comps, 0, tile_rows)
+    out = torch.empty((comps * pairs, height, width, cout), dtype=d.dtype, device=d.device)
+    wino_spatial_conv_persistent(v, u_nk, out, comps, pairs, height, width)
+    return out.view(comps, pairs, positions, cout)
 
 
 def wino_spatial_conv_cuda(

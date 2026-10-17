@@ -650,3 +650,27 @@ def test_spatial_winograd_conv_matches_conv2d(
         ref = ref.permute(0, 2, 3, 1).reshape(pairs, h * w, cout)
         rel = ((got[k].float() - ref).norm() / ref.norm()).item()
         assert rel < 1e-2, f"component {k}: rel_l2={rel:.2e}"
+
+
+@spatial_op
+@pytest.mark.parametrize("cin_cout_hw", [(64, 128, 6, 10), (128, 256, 9, 13)])
+def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, int, int]) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        cute_wino_available,
+        wino_spatial_conv_cuda,
+        wino_spatial_conv_cute,
+        winograd_spatial_weights,
+    )
+
+    if not cute_wino_available():
+        pytest.skip("CuTe DSL spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    torch.manual_seed(2)
+    cin, cout, h, w = cin_cout_hw
+    pairs = 3
+    weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
+    d = torch.randn(4, pairs, h * w, cin, device="cuda").to(torch.bfloat16)
+    u = winograd_spatial_weights(weight)
+    ref = wino_spatial_conv_cuda(d, u, h, w).float()
+    got = wino_spatial_conv_cute(d, u.transpose(1, 2).contiguous(), h, w).float()
+    rel = ((got - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"rel_l2={rel:.2e}"
