@@ -64,10 +64,14 @@ __device__ __forceinline__ float addR(float a, float b)
 // Resident blocks per SM the register budget is sized for. Per-thread state is bounded
 // independently of K: the row being normalized (K vectors) plus two vector slices of
 // inputs in flight; the frame history lives in shared memory.
-template <int K>
+template <int K, bool IN_WINO>
 constexpr int blocksPerSm()
 {
-    return K >= 4 ? 2 : 3; // wide layouts need ~110 registers; they get bytes in flight from a deeper slice pipeline
+    if (K >= 4)
+    {
+        return 2;                        // ~110 registers; bytes in flight come from the deeper slice pipeline
+    }
+    return (!IN_WINO && K <= 2) ? 4 : 3; // producers hold one input per slice and are latency-bound: more warps
 }
 
 // Vector slices of one frame kept in flight ahead of the one being normalized.
@@ -94,7 +98,8 @@ __device__ __forceinline__ int ringSlot(int frame)
 // Winograd slabs are formed while normalizing (even frame: D0..D2 from the two history
 // slots; odd frame: D3).
 template <typename T, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS, bool HAS_RESIDUAL, bool IN_WINO>
-__global__ void __launch_bounds__(kThreads, blocksPerSm<K>()) vaeWinoNormSiluKernel(Ptrs<T> ptrs, VaeWinoNormParams p)
+__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
+    vaeWinoNormSiluKernel(Ptrs<T> ptrs, VaeWinoNormParams p)
 {
     using Vec = PackedAligned<T, V>;
     using VecF = PackedAligned<float, V>;
@@ -512,7 +517,7 @@ void launchConfig(Ptrs<T> const& ptrs, VaeWinoNormParams const& p, cudaStream_t 
     int sms = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
     int64_t const steps = (p.positions + kPosPerBlock - 1) / kPosPerBlock;
-    int64_t const persistent = static_cast<int64_t>(sms) * blocksPerSm<K>();
+    int64_t const persistent = static_cast<int64_t>(sms) * blocksPerSm<K, IN_WINO>();
     unsigned const blocks = static_cast<unsigned>(steps < persistent ? steps : persistent);
     kernel<<<blocks, kThreads, smem, stream>>>(ptrs, p);
 }
