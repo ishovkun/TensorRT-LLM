@@ -88,12 +88,13 @@ def _plot(
                 pts[(r["shape"], r["op"])] = r
         if pts:
             series.append((backend, pts))
-    # Only the most recent blaze run is drawn; the full history stays in ladder.json.
-    blaze_rows = [r for r in rows if r["backend"] == "blaze"]
+    # Per panel the most recent blaze measurement is drawn (a run may cover only some
+    # shapes); the series is named after the newest of them. The history stays in ladder.json.
+    blaze_rows = sorted((r for r in rows if r["backend"] == "blaze"), key=lambda r: r["timestamp"])
     if blaze_rows:
-        latest_label = max(blaze_rows, key=lambda r: r["timestamp"])["label"]
-        latest_ts = max(r["timestamp"] for r in blaze_rows if r["label"] == latest_label)
-        pts = {(r["shape"], r["op"]): r for r in blaze_rows if r["timestamp"] == latest_ts}
+        pts = {(r["shape"], r["op"]): r for r in blaze_rows}  # later rows overwrite
+        drawn = [r for r in pts.values() if only_shapes is None or r["shape"] in only_shapes]
+        latest_label = max(drawn or blaze_rows, key=lambda r: r["timestamp"])["label"]
         series.append((f"blaze:{latest_label}", pts))
 
     # One panel per (op, shape): rows are ops, columns are shapes, linear y per panel.
