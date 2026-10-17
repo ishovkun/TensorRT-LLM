@@ -312,7 +312,7 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
                     ss = fmaf(v.y, v.y, ss);
                     setPair(yk, i, v);
                 }
-                if constexpr (HAS_RESIDUAL)
+                if (ptrs.sum != nullptr) // the pre-norm row: the next block's residual
                 {
                     storeVec(gRowW(ptrs.sum, static_cast<int64_t>(t) * P + pos), k, yk);
                 }
@@ -605,8 +605,7 @@ void launchVaeWinoNormSilu(VaeWinoNormPointers const& in, VaeWinoNormParams cons
     TLLM_CHECK_WITH_INFO(p.frames >= 2 && p.frames % 2 == 0, "vaeWinoNormSilu: frames must be even and >= 2");
     TLLM_CHECK_WITH_INFO(p.cacheFrames >= 0 && p.cacheFrames <= 2, "vaeWinoNormSilu: cacheFrames must be 0..2");
     TLLM_CHECK_WITH_INFO((in.x == nullptr) != (in.m[0] == nullptr), "vaeWinoNormSilu: exactly one of x and m");
-    TLLM_CHECK_WITH_INFO(
-        (in.residual == nullptr) == (in.sum == nullptr), "vaeWinoNormSilu: residual and sum go together");
+    TLLM_CHECK_WITH_INFO(in.residual == nullptr || in.sum != nullptr, "vaeWinoNormSilu: a residual needs a sum output");
     if (p.positions == 0)
     {
         return;

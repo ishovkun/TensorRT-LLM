@@ -371,3 +371,81 @@ def test_wino_norm_silu_fp32_mode_close(C: int) -> None:
     for a, b in [(tail, tail_ref), *zip(d, d_ref)]:
         rel = ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-6)).item()
         assert rel < 1e-2, rel
+
+
+# ---------------------------------------------------------------------------
+# Frame ops: Winograd combine (+ bias + residual) and the time interleave (+ bias)
+# ---------------------------------------------------------------------------
+
+from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+    cuda_frame_ops_available,
+    interleave_bias_cuda,
+    interleave_bias_reference,
+    wino_combine_cuda,
+    wino_combine_reference,
+)
+
+frame_ops = pytest.mark.skipif(not cuda_frame_ops_available(), reason="trtllm::vae_wino_combine not built")
+
+
+@frame_ops
+@pytest.mark.parametrize("C", [256, 160, 48])
+@pytest.mark.parametrize("source", ["x", "m"])
+@pytest.mark.parametrize("extras", ["none", "bias", "residual", "bias_residual"])
+def test_wino_combine_is_bitwise(C: int, source: str, extras: str) -> None:
+    gen = torch.Generator(device="cuda").manual_seed(C)
+    T, P = 4, 7 * 11
+    bf = torch.bfloat16
+    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
+    x = rnd(T, P, C) if source == "x" else None
+    m = [rnd(T // 2, P, C) for _ in range(4)] if source == "m" else None
+    bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf) if "bias" in extras else None
+    residual = rnd(T, P, C) if "residual" in extras else None
+    ref = x if x is not None else wino_combine_reference(m)
+    if bias is not None:
+        ref = ref + bias.reshape(1, 1, -1)
+    if residual is not None:
+        ref = ref + residual
+    got = wino_combine_cuda(x, m, bias, residual, T, 7, 11)
+    assert torch.equal(got, ref)
+    # zero-padded output (the downsampler's ZeroPad2d((0, 1, 0, 1))) in the same pass
+    padded = wino_combine_cuda(x, m, bias, residual, T, 7, 11, 1, 1).view(T, 8, 12, C)
+    ref_img = F.pad(ref.view(T, 7, 11, C).permute(0, 3, 1, 2), (0, 1, 0, 1)).permute(0, 2, 3, 1)
+    assert torch.equal(padded, ref_img)
+
+
+@frame_ops
+@pytest.mark.parametrize("C", [1024, 640, 48])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_interleave_bias_is_bitwise(C: int, with_bias: bool) -> None:
+    gen = torch.Generator(device="cuda").manual_seed(C)
+    T, P = 3, 9 * 13
+    u = torch.randn(T, P, 2 * C, generator=gen, device="cuda").to(torch.bfloat16)
+    bias = (0.3 * torch.randn(2 * C, generator=gen, device="cuda")).to(torch.bfloat16) if with_bias else None
+    assert torch.equal(interleave_bias_cuda(u, bias), interleave_bias_reference(u, bias))
+
+
+from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import avg_down_add_cuda  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import AvgDown3D  # noqa: E402
+
+
+@frame_ops
+@pytest.mark.parametrize("cin_cout_ft", [(160, 160, 1), (160, 320, 2), (320, 640, 2)])
+@pytest.mark.parametrize("frames", [4, 1])
+def test_avg_down_add_matches_eager(cin_cout_ft: tuple[int, int, int], frames: int) -> None:
+    cin, cout, ft = cin_cout_ft
+    gen = torch.Generator(device="cuda").manual_seed(cin + frames)
+    h, w = 12, 20
+    bf = torch.bfloat16
+    r = torch.randn(1, cin, frames, h, w, generator=gen, device="cuda").to(bf).to(memory_format=torch.channels_last_3d)
+    dup = AvgDown3D(cin, cout, factor_t=ft, factor_s=2)
+    ref_avg = dup(r)
+    x = torch.randn(ref_avg.shape, generator=gen, device="cuda").to(bf).to(memory_format=torch.channels_last_3d)
+    ref = x + ref_avg
+    pad_t = (ft - frames % ft) % ft
+    got = avg_down_add_cuda(
+        r.new_empty(0) if False else x.permute(0, 2, 3, 4, 1).reshape(x.shape[2], h // 2 * (w // 2), cout),
+        r.permute(0, 2, 3, 4, 1).reshape(frames, h * w, cin), h // 2, w // 2, w, ft, 2, dup.group_size, pad_t,
+    )
+    got = got.view(1, x.shape[2], h // 2, w // 2, cout).permute(0, 4, 1, 2, 3)
+    assert torch.equal(got, ref), "group size 4 means the mean is exact: bitwise with eager"

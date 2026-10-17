@@ -41,7 +41,8 @@ namespace kernels
 //          inBias [C] (optional; deferred conv bias, added first); cache
 //          [cacheFrames, P, C] of normalized frames; gamma [C]; bias [C] (optional).
 // Outputs: d[4] each [T/2, P, C]; yTail [2, P, C] (the last two normalized frames,
-//          the next chunk's cache); sum [T, P, C] when a residual is given.
+//          the next chunk's cache); sum [T, P, C]: the pre-norm frames (combine + bias
+//          + residual), written whenever the pointer is set.
 struct VaeWinoNormParams
 {
     int64_t positions;      // P
@@ -62,7 +63,7 @@ struct VaeWinoNormPointers
     void const* cache;       // optional when cacheFrames == 0
     void const* gamma;
     void const* bias;        // optional
-    void* sum;               // required iff residual
+    void* sum;               // optional; required with a residual
     void* yTail;
     void* d[4];
 };

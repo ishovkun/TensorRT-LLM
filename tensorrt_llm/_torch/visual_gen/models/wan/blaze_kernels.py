@@ -311,6 +311,53 @@ def images_to_pairs(m: torch.Tensor) -> torch.Tensor:
     return rows.view(m.shape[0], m.shape[2] * m.shape[3], m.shape[1])
 
 
+def cuda_frame_ops_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_combine")
+
+
+def wino_combine_cuda(
+    x: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    frames: int,
+    height: int,
+    width: int,
+    pad_h: int = 0,
+    pad_w: int = 0,
+) -> torch.Tensor:
+    """``(combine(m) | x) + bias + residual`` in frame layout ``[T, P, C]``, eager rounding order.
+
+    With ``pad_h``/``pad_w`` the result is ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns
+    appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``)."""
+    return torch.ops.trtllm.vae_wino_combine(
+        x, m if m is not None else [], bias.reshape(-1).contiguous() if bias is not None else None, residual,
+        frames, height, width, pad_h, pad_w,
+    )
+
+
+def avg_down_add_cuda(
+    x: torch.Tensor, r: torch.Tensor, out_height: int, out_width: int, in_width: int,
+    factor_t: int, factor_s: int, group_size: int, pad_t: int,
+) -> torch.Tensor:
+    """``x + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``."""
+    return torch.ops.trtllm.vae_avg_down_add(
+        x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t
+    )
+
+
+def interleave_bias_cuda(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    """``u [T, P, 2C]`` -> ``[2T, P, C]``: even frames from channels ``0:C``, odd from ``C:2C``, plus the bias."""
+    return torch.ops.trtllm.vae_interleave_bias(u, bias.reshape(-1).contiguous() if bias is not None else None)
+
+
+def interleave_bias_reference(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    t, p, c2 = u.shape
+    c = c2 // 2
+    ub = u + bias.reshape(1, 1, -1) if bias is not None else u
+    return torch.stack([ub[:, :, :c], ub[:, :, c:]], dim=1).reshape(2 * t, p, c)
+
+
 def wino_norm_silu_cuda(
     x: torch.Tensor | None,
     m: list[torch.Tensor] | None,
@@ -330,7 +377,7 @@ def wino_norm_silu_cuda(
         x, m, residual, in_bias.reshape(-1) if in_bias is not None else None, cache, gamma.reshape(-1),
         bias.reshape(-1) if bias is not None else None, float(scale), reference_rounding, frames,
     )
-    return (s if residual is not None else None), y_tail, list(d)
+    return (s if s.numel() else None), y_tail, list(d)
 
 
 def wino_combine_reference(m: list[torch.Tensor]) -> torch.Tensor:
@@ -354,11 +401,13 @@ def wino_norm_silu_reference(
     if x is None:
         assert m is not None
         x = wino_combine_reference(m)
-    if in_bias is not None:
-        x = x + in_bias.reshape(1, 1, -1)
     s = None
+    if in_bias is not None:
+        x = s = x + in_bias.reshape(1, 1, -1)
     if residual is not None:
         x = s = x + residual
+    if m is not None and s is None:
+        s = x
     t, p, c = x.shape
     y = rms_norm_silu_reference(x.permute(0, 2, 1), gamma.reshape(1, -1, 1), bias, scale).permute(0, 2, 1)
     cache_frames = cache.shape[0] if cache is not None else 0

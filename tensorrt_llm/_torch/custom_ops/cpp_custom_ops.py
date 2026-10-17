@@ -200,6 +200,19 @@ def _register_fake():
         return (src.new_empty(full if residual is not None else (0,)), src.new_empty((2,) + full[1:]),
                 [src.new_empty(pair) for _ in range(4)])
 
+    @torch.library.register_fake("trtllm::vae_wino_combine")
+    def _(x, m, bias, residual, frames, height, width, pad_h, pad_w):
+        src = x if x is not None else m[0]
+        return src.new_empty((frames, (height + pad_h) * (width + pad_w), src.shape[2]))
+
+    @torch.library.register_fake("trtllm::vae_avg_down_add")
+    def _(x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t):
+        return x.new_empty(x.shape)
+
+    @torch.library.register_fake("trtllm::vae_interleave_bias")
+    def _(u, bias):
+        return u.new_empty((2 * u.shape[0], u.shape[1], u.shape[2] // 2))
+
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)

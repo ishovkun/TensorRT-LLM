@@ -42,7 +42,8 @@ void const* optionalPtr(std::optional<torch::Tensor> const& t, c10::IntArrayRef 
 
 // RMSNorm + SiLU with the temporal Winograd transforms (see vaeWinoNormSiluKernel.h).
 // x: [T, P, C] frames, or m: four [T/2, P, C] tensors from the previous Winograd conv.
-// Returns (sum [T, P, C] or empty, y_tail [2, P, C], d: four [T/2, P, C]).
+// Returns (sum [T, P, C] (the pre-norm frames; empty when the input is a plain x with
+// neither bias nor residual), y_tail [2, P, C], d: four [T/2, P, C]).
 std::tuple<torch::Tensor, torch::Tensor, std::vector<torch::Tensor>> vae_wino_norm_silu(
     std::optional<torch::Tensor> const& x, std::optional<std::vector<torch::Tensor>> const& m,
     std::optional<torch::Tensor> const& residual, std::optional<torch::Tensor> const& in_bias,
@@ -101,7 +102,8 @@ std::tuple<torch::Tensor, torch::Tensor, std::vector<torch::Tensor>> vae_wino_no
     }
 
     auto opts = shapeSrc.options();
-    torch::Tensor sum = residual.has_value() ? torch::empty(frameShape, opts) : torch::empty({0}, opts);
+    bool const wantSum = residual.has_value() || in_bias.has_value() || !x.has_value();
+    torch::Tensor sum = wantSum ? torch::empty(frameShape, opts) : torch::empty({0}, opts);
     torch::Tensor yTail = torch::empty({2, P, C}, opts);
     std::vector<torch::Tensor> d;
     for (int k = 0; k < 4; ++k)
@@ -109,7 +111,7 @@ std::tuple<torch::Tensor, torch::Tensor, std::vector<torch::Tensor>> vae_wino_no
         d.push_back(torch::empty(pairShape, opts));
         ptrs.d[k] = d.back().data_ptr();
     }
-    ptrs.sum = residual.has_value() ? sum.data_ptr() : nullptr;
+    ptrs.sum = wantSum ? sum.data_ptr() : nullptr;
     ptrs.yTail = yTail.data_ptr();
 
     auto stream = at::cuda::getCurrentCUDAStream(shapeSrc.get_device());

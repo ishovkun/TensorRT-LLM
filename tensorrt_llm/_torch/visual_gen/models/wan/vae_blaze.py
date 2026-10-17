@@ -38,16 +38,20 @@ from .blaze_kernels import (
     can_fuse_rms_norm_silu,
     can_use_cuda_rms_norm_silu,
     can_use_cuda_upsample_gather,
+    cuda_frame_ops_available,
     cuda_wino_available,
     frames_to_video,
     frames_view,
     images_to_pairs,
+    interleave_bias_cuda,
     pack_upsample_weights,
+    avg_down_add_cuda,
     pairs_to_images,
     rms_norm_silu,
     rms_norm_silu_cuda,
     upsample_gather_cuda,
     upsample_gather_reference,
+    wino_combine_cuda,
     wino_combine_reference,
     wino_norm_silu_cuda,
     winograd_weights,
@@ -181,10 +185,38 @@ class PendingAdd:
         return frames_to_video(wino_combine_reference([images_to_pairs(mk) for mk in self.wino]), h, w)
 
     def materialize(self) -> torch.Tensor:
+        """The frames as a tensor: one fused pass when the op is built, else the eager chain."""
+        src = self.a if self.a is not None else self.wino[0]
+        batch_one = (self.a is None or self.a.shape[0] == 1) and (self.b is None or self.b.shape[0] == 1)
+        if cuda_frame_ops_available() and src.dtype == torch.bfloat16 and src.is_cuda and batch_one:
+            h, w = src.shape[-2:]
+            return frames_to_video(self._combine_cuda(0, 0), h, w)
         s = apply_in_bias(self.combined(), self.bias)
         if self.b is not None:
             s = s + self.b
         return _channels_last_3d_if_needed(s)
+
+    def _combine_cuda(self, pad_h: int, pad_w: int) -> torch.Tensor:
+        src = self.a if self.a is not None else self.wino[0]
+        h, w = src.shape[-2:]
+        x_f = frames_view(_channels_last_3d_if_needed(self.a)) if self.a is not None else None
+        m_f = [images_to_pairs(mk) for mk in self.wino] if self.wino is not None else None
+        r_f = frames_view(_channels_last_3d_if_needed(self.b)) if self.b is not None else None
+        return wino_combine_cuda(x_f, m_f, self.bias, r_f, self.frames, h, w, pad_h, pad_w)
+
+    def can_fuse(self) -> bool:
+        src = self.a if self.a is not None else self.wino[0]
+        batch_one = (self.a is None or self.a.shape[0] == 1) and (self.b is None or self.b.shape[0] == 1)
+        return cuda_frame_ops_available() and src.dtype == torch.bfloat16 and src.is_cuda and batch_one
+
+    def materialize_padded_2d(self) -> torch.Tensor:
+        """The frames with one zero row and column appended, as ``[T, C, H+1, W+1]`` channels-last
+        (the downsampler's input), in one pass."""
+        src = self.a if self.a is not None else self.wino[0]
+        h, w = src.shape[-2:]
+        c = src.shape[1]
+        y = self._combine_cuda(1, 1)  # [T, (H+1)*(W+1), C]
+        return y.view(self.frames, h + 1, w + 1, c).permute(0, 3, 1, 2)
 
 
 @dataclass
@@ -229,7 +261,7 @@ class BlazeRMSNorm(nn.Module):
         """SiLU(norm(x)); one fused pass when enabled and supported, else the eager chain."""
         if isinstance(x, PendingAdd):
             if x.wino is not None:
-                x = PendingAdd(x.combined(), x.b, x.bias)
+                return self._forward_silu(x.materialize(), None)
             if x.b is not None:
                 return self.forward_silu_pending(x)[1]
             return self._forward_silu(x.a, x.bias)
@@ -280,7 +312,8 @@ class BlazeRMSNorm(nn.Module):
         bias = self.bias if isinstance(self.bias, torch.Tensor) else None
         reference = self.options.norm_mode == "reference"
         if pending.wino is not None:
-            pending = PendingAdd(pending.combined(), pending.b, pending.bias)
+            s = pending.materialize()
+            return s, self._forward_silu(s, None)
         if (
             pending.b is not None
             and self.options.fused_norm
@@ -531,6 +564,10 @@ class BlazeResample(nn.Module):
                     )
                 if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
                     cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
+                fuse_interleave = (
+                    cuda_frame_ops_available() and batch_size == 1 and x.dtype == torch.bfloat16 and x.is_cuda
+                )
+                self.time_conv.defer_bias = fuse_interleave
                 if feat_cache[idx] == "Rep":
                     x = self.time_conv(x)
                 else:
@@ -538,9 +575,14 @@ class BlazeResample(nn.Module):
                 feat_cache[idx] = cache_x
                 feat_idx[0] += 1
 
-                x = x.reshape(batch_size, 2, channels, frames, height, width)
-                x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
-                x = x.reshape(batch_size, channels, frames * 2, height, width)
+                if fuse_interleave:
+                    # Interleave the two channel halves along time and add the time conv's bias.
+                    u = frames_view(_channels_last_3d_if_needed(x))
+                    x = frames_to_video(interleave_bias_cuda(u, self.time_conv.bias), height, width)
+                else:
+                    x = x.reshape(batch_size, 2, channels, frames, height, width)
+                    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
+                    x = x.reshape(batch_size, channels, frames * 2, height, width)
 
         frames = x.shape[2]
         x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
@@ -548,6 +590,30 @@ class BlazeResample(nn.Module):
         if self.options.fused_upsample and self.mode.startswith("upsample"):
             return self._fused_upsample(x, batch_size, frames, shortcut)
         x = self.resample(x)
+        return self._after_resample(x, batch_size, frames, feat_cache, feat_idx)
+
+    def forward_prepadded(
+        self,
+        x_4d: torch.Tensor,
+        frames: int,
+        feat_cache: list[torch.Tensor | str | None] | None = None,
+        feat_idx: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Downsample path on an input that already carries the zero row/column the
+        ``ZeroPad2d`` would add; ``x_4d`` is ``[T, C, H+1, W+1]`` channels-last, batch 1."""
+        if not self.mode.startswith("downsample"):
+            raise ValueError("forward_prepadded is for the downsample modes")
+        x = self.resample[1](_channels_last_2d_if_needed(x_4d))
+        return self._after_resample(x, 1, frames, feat_cache, feat_idx)
+
+    def _after_resample(
+        self,
+        x: torch.Tensor,
+        batch_size: int,
+        frames: int,
+        feat_cache: list[torch.Tensor | str | None] | None,
+        feat_idx: list[int] | None,
+    ) -> torch.Tensor:
         x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
         x = _channels_last_3d_if_needed(x_5d)
 
@@ -675,7 +741,7 @@ class BlazeResidualBlock(nn.Module):
         feat_cache[idx] = cache1
         feat_idx[0] += 1
         if isinstance(x, PendingAdd):
-            if s is None:  # bias-only or Winograd input without residual: materialize for the shortcut
+            if s is None:  # plain input without bias or residual
                 s = x.materialize()
             x_in = s
         else:
@@ -794,10 +860,35 @@ class BlazeResidualDownBlock(nn.Module):
     ) -> torch.Tensor:
         # The last block feeds the downsampler or the shortcut add, never a norm.
         x, residual = _run_resnets(self.resnets, x, feat_cache, feat_idx, defer_last_bias=False)
-        x = _tensor(x)
         if self.downsampler is not None:
-            x = self.downsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
-        return _channels_last_3d_if_needed(x + self.avg_shortcut(residual))
+            if isinstance(x, PendingAdd) and x.can_fuse():
+                # One pass writes the downsampler's zero-padded input directly.
+                x = self.downsampler.forward_prepadded(
+                    x.materialize_padded_2d(), x.frames, feat_cache=feat_cache, feat_idx=feat_idx
+                )
+            else:
+                x = self.downsampler(_tensor(x), feat_cache=feat_cache, feat_idx=feat_idx)
+        else:
+            x = _tensor(x)
+        x = _channels_last_3d_if_needed(x)
+        dup = self.avg_shortcut
+        if (
+            cuda_frame_ops_available()
+            and x.shape[0] == 1
+            and x.dtype == torch.bfloat16
+            and x.is_cuda
+            and residual.dtype == torch.bfloat16
+        ):
+            residual = _channels_last_3d_if_needed(residual)
+            t_in = residual.shape[2]
+            pad_t = (dup.factor_t - t_in % dup.factor_t) % dup.factor_t
+            h_out, w_out = x.shape[-2:]
+            y = avg_down_add_cuda(
+                frames_view(x), frames_view(residual), h_out, w_out, residual.shape[-1],
+                dup.factor_t, dup.factor_s, dup.group_size, pad_t,
+            )
+            return frames_to_video(y, h_out, w_out)
+        return _channels_last_3d_if_needed(x + dup(residual))
 
 
 class BlazeEncoder3d(nn.Module):
@@ -816,6 +907,7 @@ class BlazeEncoder3d(nn.Module):
         options: VaeBlazeOptions | None = None,
     ):
         super().__init__()
+        self.options = options or VaeBlazeOptions()
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         attn_scales = [] if attn_scales is None else attn_scales
         temperal_downsample = (
@@ -869,10 +961,13 @@ class BlazeEncoder3d(nn.Module):
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
 
+        self.conv_in.defer_bias = self.options.defer_conv_bias
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_in, x, feat_cache, feat_idx)
         else:
             x = self.conv_in(x)
+        if self.conv_in.defer_bias:
+            x = PendingAdd(x, None, self.conv_in.bias)
 
         for layer in self.down_blocks:
             if not isinstance(layer, (BlazeResidualBlock, BlazeResidualDownBlock)):
@@ -1007,6 +1102,7 @@ class BlazeDecoder3d(nn.Module):
         options: VaeBlazeOptions | None = None,
     ):
         super().__init__()
+        self.options = options or VaeBlazeOptions()
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         del attn_scales
         temperal_upsample = [False, True, True] if temperal_upsample is None else temperal_upsample
@@ -1063,10 +1159,13 @@ class BlazeDecoder3d(nn.Module):
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
 
+        self.conv_in.defer_bias = self.options.defer_conv_bias
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_in, x, feat_cache, feat_idx)
         else:
             x = self.conv_in(x)
+        if self.conv_in.defer_bias:
+            x = PendingAdd(x, None, self.conv_in.bias)
 
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
         for up_block in self.up_blocks:
