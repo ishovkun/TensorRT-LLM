@@ -225,8 +225,8 @@ def gemm_host(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, stream: cuda.CUstr
     b_tma_atom, b_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
         tma_op, b, b_one, MMA_TILER_MNK, tiled_mma
     )
-    m, n, l = c.layout.shape
-    grid = (cute.ceil_div(m, MMA_TILER_MNK[0]), cute.ceil_div(n, MMA_TILER_MNK[1]), l)
+    m, n, nl = c.layout.shape
+    grid = (cute.ceil_div(m, MMA_TILER_MNK[0]), cute.ceil_div(n, MMA_TILER_MNK[1]), nl)
     gemm_kernel(
         tiled_mma,
         a_tma_atom,
@@ -287,7 +287,8 @@ def wino_fused_kernel(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     bidx, bidy, bidz = cute.arch.block_idx()
     x_row = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-    m_tile = bidx // F_COORDS
+    n_block = bidx // F_COORDS
+    m_tile = bidy
     comp = bidz
 
     smem = utils.SmemAllocator()
@@ -362,7 +363,7 @@ def wino_fused_kernel(
 
     num_k_tiles = cute.size(gA, mode=[3])
     l_base = comp * 16 + x_row * F_COORDS
-    prefetch_k_tiles = cutlass.min(F_STAGES - 2, num_k_tiles)
+    prefetch_k_tiles = cutlass.min(F_STAGES - 1, num_k_tiles)
     if warp_idx == 0:
         acc_empty = acc_producer.acquire_and_advance()
         for k_tile in cutlass.range(prefetch_k_tiles, unroll=1):
@@ -377,7 +378,7 @@ def wino_fused_kernel(
                 )
                 cute.copy(
                     tma_atom_b,
-                    tBgB[(None, bidy, k_tile, l_base + y)],
+                    tBgB[(None, n_block, k_tile, l_base + y)],
                     tBsB[(None, slot)],
                     tma_bar_ptr=ab_empty.barrier,
                 )
@@ -396,7 +397,7 @@ def wino_fused_kernel(
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB[(None, bidy, ab_empty.count, l_base + y)],
+                        tBgB[(None, n_block, ab_empty.count, l_base + y)],
                         tBsB[(None, slot)],
                         tma_bar_ptr=ab_empty.barrier,
                     )
@@ -450,8 +451,13 @@ def wino_fused_kernel(
     ]
     row_m = tidx
     keep = x_row % 2
-    seg = cute.make_layout(32)
     quad = cute.make_layout(4)
+    # Exchange-slot addressing: the 16-byte units of a row are XOR-swizzled by (row & 7), so a warp
+    # writing one unit of 32 consecutive rows and a warp reading 32 units of one row are both
+    # conflict-free.
+    swz = row_m % 8
+    rowbase = row_m * 128
+
     for i in cutlass.range_constexpr(subtiles):
         cute.copy(tmem_tiled_copy, tDtAcc[0][None, None, i], r0)
         cute.copy(tmem_tiled_copy, tDtAcc[1][None, None, i], r1)
@@ -459,21 +465,24 @@ def wino_fused_kernel(
         cute.copy(tmem_tiled_copy, tDtAcc[3][None, None, i], r3)
         t0.store((r0.load() + r1.load()) + r2.load())
         t1.store((r1.load() - r2.load()) - r3.load())
-        chunk = row_m * 128 + i * 32
-        # Own partial sum into slot 0.
-        own = cute.make_tensor((sX.iterator + chunk).align(16), seg)
-        if keep == 0:
-            cute.autovec_copy(t0, own)
-        else:
-            cute.autovec_copy(t1, own)
-        # Pushes: (t, peer, slot) by row x (see the sends table in the design note).
         for g in cutlass.range_constexpr(8):
-            q0 = cute.make_tensor(t0.iterator + 4 * g, quad).load().bitcast(cutlass.Int32)
-            q1 = cute.make_tensor(t1.iterator + 4 * g, quad).load().bitcast(cutlass.Int32)
+            unit = i * 8 + g
+            own = cute.make_tensor(
+                (sX.iterator + (0 * (128 * 128) + rowbase + ((unit ^ swz) * 4))).align(16), quad
+            )
+            g0 = cute.make_tensor(t0.iterator + 4 * g, quad)
+            g1 = cute.make_tensor(t1.iterator + 4 * g, quad)
+            if keep == 0:
+                cute.autovec_copy(g0, own)
+            else:
+                cute.autovec_copy(g1, own)
+            # Pushes: (t, peer, slot) by row x.
+            q0 = g0.load().bitcast(cutlass.Int32)
+            q1 = g1.load().bitcast(cutlass.Int32)
             v0 = (q0[0], q0[1], q0[2], q0[3])
             v1 = (q1[0], q1[1], q1[2], q1[3])
-            dst1 = (sX.iterator + (1 * 128 * 128 + chunk + 4 * g)).align(16)
-            dst2 = (sX.iterator + (2 * 128 * 128 + chunk + 4 * g)).align(16)
+            dst1 = (sX.iterator + (1 * (128 * 128) + rowbase + ((unit ^ swz) * 4))).align(16)
+            dst2 = (sX.iterator + (2 * (128 * 128) + rowbase + ((unit ^ swz) * 4))).align(16)
             if x_row == 0:
                 cute.arch.store_async_dsmem(dst1, v1, recv_bar, 1)
             elif x_row == 1:
@@ -504,20 +513,24 @@ def wino_fused_kernel(
         if prow < height and pcol < width:
             frame = comp * pairs + pair
             pixel = (frame * height + prow) * width + pcol
-            n0 = bidy * F_TILER_MNK[1]
-            for i in cutlass.range_constexpr(subtiles):
-                chunk = row_m * 128 + i * 32
-                va = cute.make_tensor((sX.iterator + chunk).align(16), seg).load()
-                vb = cute.make_tensor((sX.iterator + (128 * 128 + chunk)).align(16), seg).load()
-                vc = cute.make_tensor((sX.iterator + (2 * 128 * 128 + chunk)).align(16), seg).load()
+            n0 = n_block * F_TILER_MNK[1]
+            ybase = pixel * cute.size(mY, mode=[1]) + n0
+            for unit in cutlass.range_constexpr(32):
+                va = cute.make_tensor(
+                    (sX.iterator + (0 * (128 * 128) + rowbase + ((unit ^ swz) * 4))).align(16), quad
+                ).load()
+                vb = cute.make_tensor(
+                    (sX.iterator + (1 * (128 * 128) + rowbase + ((unit ^ swz) * 4))).align(16), quad
+                ).load()
+                vc = cute.make_tensor(
+                    (sX.iterator + (2 * (128 * 128) + rowbase + ((unit ^ swz) * 4))).align(16), quad
+                ).load()
                 acc = (va + vb) + vc
                 if r1_sel == 1:
                     acc = (vb - va) - vc
-                out = cute.make_rmem_tensor(seg.shape, IO_DTYPE)
+                out = cute.make_rmem_tensor(quad.shape, IO_DTYPE)
                 out.store(acc.to(IO_DTYPE))
-                dst = cute.make_tensor(
-                    (mY.iterator + (pixel * cute.size(mY, mode=[1]) + n0 + i * 32)).align(16), seg
-                )
+                dst = cute.make_tensor((mY.iterator + (ybase + unit * 4)).align(8), quad)
                 cute.autovec_copy(out, dst)
     cute.arch.cluster_arrive()
     cute.arch.cluster_wait()
@@ -569,9 +582,11 @@ def wino_fused_host(
     )
     m_pad, _, _ = a.layout.shape
     n, _, _ = b.layout.shape
+    # Coordinate row fastest (the cluster), then output-channel blocks of the same tile block so
+    # their shared activation tiles hit in L2, then tile blocks, then temporal components.
     grid = (
-        F_COORDS * cute.ceil_div(m_pad, F_TILER_MNK[0]),
-        cute.ceil_div(n, F_TILER_MNK[1]),
+        F_COORDS * cute.ceil_div(n, F_TILER_MNK[1]),
+        cute.ceil_div(m_pad, F_TILER_MNK[0]),
         components,
     )
     wino_fused_kernel(
@@ -594,9 +609,9 @@ def wino_fused_host(
 
 @functools.lru_cache(maxsize=None)
 def _compiled_fused(key: tuple[int, ...]):
-    l, m_pad, n, k, pixels = key
-    v = torch.empty(l, m_pad, k, dtype=torch.bfloat16, device="cuda")
-    u = torch.empty(l, n, k, dtype=torch.bfloat16, device="cuda")
+    nl, m_pad, n, k, pixels = key
+    v = torch.empty(nl, m_pad, k, dtype=torch.bfloat16, device="cuda")
+    u = torch.empty(nl, n, k, dtype=torch.bfloat16, device="cuda")
     y = torch.empty(pixels, n, dtype=torch.bfloat16, device="cuda")
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     return cute.compile(
@@ -610,7 +625,7 @@ def _compiled_fused(key: tuple[int, ...]):
         cutlass.Int32(1),
         cutlass.Int32(1),
         cutlass.Int32(1),
-        l // 16,
+        nl // 16,
         stream,
     )
 
@@ -634,13 +649,13 @@ def wino_spatial_conv_fused(
 ) -> torch.Tensor:
     """Fused-output spatial Winograd: ``v [components*16, M_pad, Cin]`` (M = pairs * ceil(H/2) * ceil(W/2)
     rows, padded to a multiple of 128), ``u_nk [components*16, Cout, Cin]``, ``out [components*pairs, H, W, Cout]``."""
-    l, m_pad, k = v.shape
+    nl, m_pad, k = v.shape
     n = u_nk.shape[1]
     tiles_w = (width + 1) // 2
     ntiles = ((height + 1) // 2) * tiles_w
     m_valid = pairs * ntiles
     assert (
-        l == components * 16
+        nl == components * 16
         and m_pad % 128 == 0
         and m_pad >= m_valid
         and n % 128 == 0
@@ -648,7 +663,7 @@ def wino_spatial_conv_fused(
     )
     pixels = components * pairs * height * width
     out_rows = out.view(pixels, n)
-    fn = _compiled_fused((l, m_pad, n, k, pixels))
+    fn = _compiled_fused((nl, m_pad, n, k, pixels))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
         _as_mkl(v, 1),
@@ -676,10 +691,10 @@ def _as_mkl(t: torch.Tensor, leading_dim: int) -> cute.Tensor:
 
 @functools.lru_cache(maxsize=None)
 def _compiled(shape_key: tuple[int, ...]):
-    l, m, n, k = shape_key
-    v = torch.empty(l, m, k, dtype=torch.bfloat16, device="cuda")
-    u = torch.empty(l, n, k, dtype=torch.bfloat16, device="cuda")
-    out = torch.empty(l, m, n, dtype=torch.bfloat16, device="cuda")
+    nl, m, n, k = shape_key
+    v = torch.empty(nl, m, k, dtype=torch.bfloat16, device="cuda")
+    u = torch.empty(nl, n, k, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(nl, m, n, dtype=torch.bfloat16, device="cuda")
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     return cute.compile(gemm_host, _as_mkl(v, 1), _as_mkl(u, 1), _as_mkl(out, 1), stream)
 
@@ -688,12 +703,12 @@ def wino_gemm_cute(
     v: torch.Tensor, u_nk: torch.Tensor, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """``out[l] = v[l] @ u_nk[l].T``: v [L, M, K], u_nk [L, N, K], out [L, M, N] (bf16)."""
-    l, m, k = v.shape
+    nl, m, k = v.shape
     n = u_nk.shape[1]
     assert m % 128 == 0 and n % 128 == 0 and k % 64 == 0, (m, n, k)
     if out is None:
-        out = torch.empty(l, m, n, dtype=v.dtype, device=v.device)
-    fn = _compiled((l, m, n, k))
+        out = torch.empty(nl, m, n, dtype=v.dtype, device=v.device)
+    fn = _compiled((nl, m, n, k))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(_as_mkl(v, 1), _as_mkl(u_nk, 1), _as_mkl(out, 1), stream)
     return out
@@ -809,10 +824,10 @@ def _main() -> None:
         return _main_fused(args)
     if not args.probe:
         atexit.register(lambda: __import__("cupti.cupti", fromlist=["cupti"]).finalize())
-    l, m, n, k = (int(x) for x in args.lmnk.split(","))
+    nl, m, n, k = (int(x) for x in args.lmnk.split(","))
     gen = torch.Generator(device="cuda").manual_seed(0)
-    v = torch.randn(l, m, k, generator=gen, device="cuda").to(torch.bfloat16)
-    u = (0.05 * torch.randn(l, n, k, generator=gen, device="cuda")).to(torch.bfloat16)
+    v = torch.randn(nl, m, k, generator=gen, device="cuda").to(torch.bfloat16)
+    u = (0.05 * torch.randn(nl, n, k, generator=gen, device="cuda")).to(torch.bfloat16)
     out = wino_gemm_cute(v, u)
     torch.cuda.synchronize()
     if args.probe:
@@ -834,7 +849,7 @@ def _main() -> None:
     ref = torch.bmm(v, u.transpose(1, 2))
     rel = ((out.float() - ref.float()).norm() / ref.float().norm()).item()
     print(f"rel-L2 vs torch.bmm: {rel:.3e}")
-    flops = 2.0 * l * m * n * k
+    flops = 2.0 * nl * m * n * k
     t_cute = _time_cupti(lambda: wino_gemm_cute(v, u, out), 3, args.iters, use_graph=True)["span"][
         "median_us"
     ]
