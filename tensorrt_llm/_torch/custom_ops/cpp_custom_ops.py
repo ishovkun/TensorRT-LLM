@@ -180,33 +180,45 @@ def _register_fake():
         return [torch.empty_like(q), torch.empty_like(k)]
 
     @torch.library.register_fake("trtllm::vae_rms_norm_silu")
-    def _(x, gamma, bias, scale, reference_rounding, in_bias=None):
+    def _(x, gamma, bias, scale, reference_rounding, in_bias=None, out=None):
         return x.new_empty(x.shape)
 
     @torch.library.register_fake("trtllm::vae_add_rms_norm_silu")
-    def _(x, residual, gamma, bias, scale, reference_rounding, in_bias=None):
+    def _(x,
+          residual,
+          gamma,
+          bias,
+          scale,
+          reference_rounding,
+          in_bias=None,
+          out=None):
         return x.new_empty(x.shape), x.new_empty(x.shape)
 
     @torch.library.register_fake("trtllm::vae_upsample_gather")
     def _(temp, shortcut, batch, frames, factor_t, repeats, crop, bias=None):
         cout = temp.shape[1] // 4
-        return temp.new_empty((batch, cout, frames, 2 * (temp.shape[2] - 1), 2 * (temp.shape[3] - 1)))
+        return temp.new_empty((batch, cout, frames, 2 * (temp.shape[2] - 1),
+                               2 * (temp.shape[3] - 1)))
 
     @torch.library.register_fake("trtllm::vae_wino_norm_silu")
-    def _(x, m, residual, in_bias, cache, gamma, bias, scale, reference_rounding, frames):
+    def _(x, m, residual, in_bias, cache, gamma, bias, scale,
+          reference_rounding, frames):
         src = x if x is not None else m[0]
         pair = (frames // 2, src.shape[1], src.shape[2])
         full = (frames, src.shape[1], src.shape[2])
-        return (src.new_empty(full if residual is not None else (0,)), src.new_empty((2,) + full[1:]),
+        return (src.new_empty(full if residual is not None else (0, )),
+                src.new_empty((2, ) + full[1:]),
                 [src.new_empty(pair) for _ in range(4)])
 
     @torch.library.register_fake("trtllm::vae_wino_combine")
     def _(x, m, bias, residual, frames, height, width, pad_h, pad_w):
         src = x if x is not None else m[0]
-        return src.new_empty((frames, (height + pad_h) * (width + pad_w), src.shape[2]))
+        return src.new_empty(
+            (frames, (height + pad_h) * (width + pad_w), src.shape[2]))
 
     @torch.library.register_fake("trtllm::vae_avg_down_add")
-    def _(x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t):
+    def _(x, r, out_height, out_width, in_width, factor_t, factor_s, group_size,
+          pad_t):
         return x.new_empty(x.shape)
 
     @torch.library.register_fake("trtllm::vae_interleave_bias")

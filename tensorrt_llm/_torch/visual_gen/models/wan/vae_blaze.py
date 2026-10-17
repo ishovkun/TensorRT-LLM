@@ -35,17 +35,18 @@ from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDis
 from .blaze_kernels import (
     add_rms_norm_silu_cuda,
     apply_in_bias,
+    avg_down_add_cuda,
     can_fuse_rms_norm_silu,
     can_use_cuda_rms_norm_silu,
     can_use_cuda_upsample_gather,
     cuda_frame_ops_available,
+    cuda_op_available,
     cuda_wino_available,
     frames_to_video,
     frames_view,
     images_to_pairs,
     interleave_bias_cuda,
     pack_upsample_weights,
-    avg_down_add_cuda,
     pairs_to_images,
     rms_norm_silu,
     rms_norm_silu_cuda,
@@ -119,6 +120,10 @@ class VaeBlazeOptions:
     # frame slabs, the conv runs as four 3x3 conv2d calls, and the next norm kernel
     # combines the four results while reading. Needs fused_norm with the CUDA op.
     winograd_temporal: bool = False
+    # Checklist item 9: the convs that still run as 3D with a causal cache (one frame per
+    # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
+    # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
+    conv_slabs: bool = False
 
     def __post_init__(self) -> None:
         if self.norm_mode not in ("fp32", "reference"):
@@ -126,7 +131,9 @@ class VaeBlazeOptions:
         if self.norm_kernel not in ("cuda", "triton"):
             raise ValueError(f"norm_kernel must be 'cuda' or 'triton', got {self.norm_kernel!r}")
         if self.cudnn_benchmark not in ("off", "on", "auto"):
-            raise ValueError(f"cudnn_benchmark must be 'off', 'on' or 'auto', got {self.cudnn_benchmark!r}")
+            raise ValueError(
+                f"cudnn_benchmark must be 'off', 'on' or 'auto', got {self.cudnn_benchmark!r}"
+            )
         if self.conv_out_frame_split < 0 or self.conv_out_frame_split in (1, 2):
             raise ValueError("conv_out_frame_split must be 0 (off) or at least 3 input frames")
 
@@ -139,12 +146,31 @@ class VaeBlazeOptions:
         return cls(**values)
 
     @property
+    def use_slabs(self) -> bool:
+        return (
+            self.conv_slabs
+            and self.fused_norm
+            and self.norm_kernel == "cuda"
+            and cuda_op_available()
+        )
+
+    @property
     def use_winograd(self) -> bool:
-        return self.winograd_temporal and self.fused_norm and self.norm_kernel == "cuda" and cuda_wino_available()
+        return (
+            self.winograd_temporal
+            and self.fused_norm
+            and self.norm_kernel == "cuda"
+            and cuda_wino_available()
+        )
 
     @property
     def defer_conv_bias(self) -> bool:
-        return self.fused_bias and self.fused_norm and self.fused_residual and self.norm_kernel == "cuda"
+        return (
+            self.fused_bias
+            and self.fused_norm
+            and self.fused_residual
+            and self.norm_kernel == "cuda"
+        )
 
     def enabled(self) -> list[str]:
         return [field.name for field in fields(self) if getattr(self, field.name) is True]
@@ -182,12 +208,16 @@ class PendingAdd:
             return self.a
         assert self.wino is not None
         h, w = self.wino[0].shape[-2:]
-        return frames_to_video(wino_combine_reference([images_to_pairs(mk) for mk in self.wino]), h, w)
+        return frames_to_video(
+            wino_combine_reference([images_to_pairs(mk) for mk in self.wino]), h, w
+        )
 
     def materialize(self) -> torch.Tensor:
         """The frames as a tensor: one fused pass when the op is built, else the eager chain."""
         src = self.a if self.a is not None else self.wino[0]
-        batch_one = (self.a is None or self.a.shape[0] == 1) and (self.b is None or self.b.shape[0] == 1)
+        batch_one = (self.a is None or self.a.shape[0] == 1) and (
+            self.b is None or self.b.shape[0] == 1
+        )
         if cuda_frame_ops_available() and src.dtype == torch.bfloat16 and src.is_cuda and batch_one:
             h, w = src.shape[-2:]
             return frames_to_video(self._combine_cuda(0, 0), h, w)
@@ -206,8 +236,12 @@ class PendingAdd:
 
     def can_fuse(self) -> bool:
         src = self.a if self.a is not None else self.wino[0]
-        batch_one = (self.a is None or self.a.shape[0] == 1) and (self.b is None or self.b.shape[0] == 1)
-        return cuda_frame_ops_available() and src.dtype == torch.bfloat16 and src.is_cuda and batch_one
+        batch_one = (self.a is None or self.a.shape[0] == 1) and (
+            self.b is None or self.b.shape[0] == 1
+        )
+        return (
+            cuda_frame_ops_available() and src.dtype == torch.bfloat16 and src.is_cuda and batch_one
+        )
 
     def materialize_padded_2d(self) -> torch.Tensor:
         """The frames with one zero row and column appended, as ``[T, C, H+1, W+1]`` channels-last
@@ -224,6 +258,23 @@ class WinoSlabs:
     """The four transformed input slabs ``D0..D3`` of a Winograd conv, each ``[pairs, C, H, W]`` channels-last."""
 
     d: list[torch.Tensor]
+
+
+def _pending_like(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
+    """A tensor with the frames' batch/channel/spatial shape, without materializing."""
+    if not isinstance(x, PendingAdd):
+        return x
+    if x.a is not None:
+        return x.a
+    return x.b if x.b is not None else x.wino[0]
+
+
+def _into(out: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
+    """Copy ``value`` into ``out`` when a destination was requested."""
+    if out is None:
+        return value
+    out.copy_(value)
+    return out
 
 
 def _tensor(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
@@ -257,15 +308,18 @@ class BlazeRMSNorm(nn.Module):
         normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=norm_dim).to(x.dtype)
         return normalized * self.scale * self.gamma + self.bias
 
-    def forward_silu(self, x: "torch.Tensor | PendingAdd") -> torch.Tensor:
-        """SiLU(norm(x)); one fused pass when enabled and supported, else the eager chain."""
+    def forward_silu(
+        self, x: "torch.Tensor | PendingAdd", out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """SiLU(norm(x)); one fused pass when enabled and supported, else the eager chain.
+        ``out``: optional channels-last destination (a conv frame-buffer window)."""
         if isinstance(x, PendingAdd):
             if x.wino is not None:
-                return self._forward_silu(x.materialize(), None)
+                return self._forward_silu(x.materialize(), None, out)
             if x.b is not None:
-                return self.forward_silu_pending(x)[1]
-            return self._forward_silu(x.a, x.bias)
-        return self._forward_silu(x, None)
+                return self.forward_silu_pending(x, out)[1]
+            return self._forward_silu(x.a, x.bias, out)
+        return self._forward_silu(x, None, out)
 
     def forward_silu_wino(
         self, x: "torch.Tensor | PendingAdd", cache: torch.Tensor | None, frames: int
@@ -291,29 +345,45 @@ class BlazeRMSNorm(nn.Module):
             reference_rounding=self.options.norm_mode == "reference",
         )
         slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d])
-        return (frames_to_video(s, h, w) if s is not None else None), frames_to_video(y_tail, h, w), slabs
+        return (
+            (frames_to_video(s, h, w) if s is not None else None),
+            frames_to_video(y_tail, h, w),
+            slabs,
+        )
 
-    def _forward_silu(self, x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor:
+    def _forward_silu(
+        self, x: torch.Tensor, in_bias: torch.Tensor | None, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         if not (self.options.fused_norm and self.channel_first):
-            return F.silu(self.forward(apply_in_bias(x, in_bias)))
+            return _into(out, F.silu(self.forward(apply_in_bias(x, in_bias))))
         bias = self.bias if isinstance(self.bias, torch.Tensor) else None
         reference = self.options.norm_mode == "reference"
         if self.options.norm_kernel == "cuda" and can_use_cuda_rms_norm_silu(x):
             return rms_norm_silu_cuda(
-                x, self.gamma, bias, self.scale, reference_rounding=reference, in_bias=in_bias
+                x,
+                self.gamma,
+                bias,
+                self.scale,
+                reference_rounding=reference,
+                in_bias=in_bias,
+                out=out,
             )
         x = apply_in_bias(x, in_bias)
         if can_fuse_rms_norm_silu(x):
-            return rms_norm_silu(x, self.gamma, bias, self.scale, reference_rounding=reference)
-        return F.silu(self.forward(x))
+            return _into(
+                out, rms_norm_silu(x, self.gamma, bias, self.scale, reference_rounding=reference)
+            )
+        return _into(out, F.silu(self.forward(x)))
 
-    def forward_silu_pending(self, pending: PendingAdd) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward_silu_pending(
+        self, pending: PendingAdd, out: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(s, SiLU(norm(s)))`` with ``s = (a + bias) + b``, added inside the kernel when possible."""
         bias = self.bias if isinstance(self.bias, torch.Tensor) else None
         reference = self.options.norm_mode == "reference"
         if pending.wino is not None:
             s = pending.materialize()
-            return s, self._forward_silu(s, None)
+            return s, self._forward_silu(s, None, out)
         if (
             pending.b is not None
             and self.options.fused_norm
@@ -330,9 +400,10 @@ class BlazeRMSNorm(nn.Module):
                 self.scale,
                 reference_rounding=reference,
                 in_bias=pending.bias,
+                out=out,
             )
         s = pending.materialize()
-        return s, self.forward_silu(s)
+        return s, self.forward_silu(s, out)
 
 
 class BlazeCausalConv3d(nn.Conv3d):
@@ -363,6 +434,104 @@ class BlazeCausalConv3d(nn.Conv3d):
         self.first_frame_conv2d = False
         self._weight_2d: tuple[int, int, torch.Tensor] | None = None
         self._wino_w: tuple[int, int, list[torch.Tensor]] | None = None
+
+    # ---- frame buffer ("slab") for the causal history -------------------------------
+    # The buffer holds [1, C, S, H, W] channels-last frames; frames [pos-2, pos) are the
+    # causal history (zeros before the first chunk), the producer writes the chunk's T
+    # frames at [pos, pos+T), the conv reads the window [pos-2, pos+T) with no copy. When
+    # the window would run off the end, the two history frames move to the front.
+    kSlabChunks = 4
+
+    def slab_reset(self) -> None:
+        self._slab = None
+        self._slab_pos = 0
+
+    def slab_begin(self, cache_entry, frames: int, like: torch.Tensor) -> torch.Tensor:
+        """Start a chunk: reset on the first chunk, adopt a cache tensor left by the eager
+        first-chunk path (the frame history), and return the writable window."""
+        adopt = cache_entry if isinstance(cache_entry, torch.Tensor) else None
+        if cache_entry is None or adopt is not None:
+            self.slab_reset()
+        window = self.slab_window(frames, like)
+        if adopt is not None:
+            n = adopt.shape[2]
+            self._slab[:, :, 2 - n : 2].copy_(adopt)
+        return window
+
+    def slab_window(self, frames: int, like: torch.Tensor) -> torch.Tensor:
+        """A writable channels-last ``[1, C, frames, H, W]`` view for the chunk's frames."""
+        c = self.in_channels
+        h, w = like.shape[-2:]
+        slab = getattr(self, "_slab", None)
+
+        def allocate() -> torch.Tensor:
+            return torch.empty(
+                1,
+                c,
+                2 + self.kSlabChunks * frames,
+                h,
+                w,
+                dtype=like.dtype,
+                device=like.device,
+                memory_format=torch.channels_last_3d,
+            )
+
+        if (
+            slab is None
+            or slab.shape[1] != c
+            or tuple(slab.shape[3:]) != (h, w)
+            or slab.dtype != like.dtype
+        ):
+            slab = allocate()
+            slab[:, :, :2].zero_()
+            self._slab, self._slab_pos = slab, 2
+        elif self._slab_pos + frames > slab.shape[2]:
+            # Wrap: the two history frames move to the front (through a copy, the ranges
+            # may overlap); grow the buffer if this chunk is longer than the ones before.
+            hist = slab[:, :, self._slab_pos - 2 : self._slab_pos].clone()
+            if slab.shape[2] < 2 + frames:
+                slab = allocate()
+                self._slab = slab
+            slab[:, :, :2].copy_(hist)
+            self._slab_pos = 2
+        return slab[:, :, self._slab_pos : self._slab_pos + frames]
+
+    def slab_conv(self, frames: int) -> torch.Tensor:
+        """Run the conv on ``[pos-2, pos+frames)`` and advance; the next two history frames stay in place."""
+        slab = self._slab
+        pos = self._slab_pos
+        bias = None if self.defer_bias else self.bias
+        if self.max_in_frames is not None and frames + 2 > self.max_in_frames:
+            per_call = self.max_in_frames - 2
+            parts = [
+                F.conv3d(
+                    slab[:, :, pos - 2 + t : pos + min(t + per_call, frames)],
+                    self.weight,
+                    bias,
+                    self.stride,
+                    self.padding,
+                    self.dilation,
+                    self.groups,
+                )
+                for t in range(0, frames, per_call)
+            ]
+            y = torch.cat(parts, dim=2)
+        else:
+            window = slab[:, :, pos - 2 : pos + frames]
+            y = F.conv3d(
+                window, self.weight, bias, self.stride, self.padding, self.dilation, self.groups
+            )
+        self._slab_pos = pos + frames
+        return _channels_last_3d_if_needed(y)
+
+    def slab_eligible(self, x_like: torch.Tensor) -> bool:
+        return (
+            x_like.shape[0] == 1
+            and self.kernel_size[0] == 3
+            and self.stride == (1, 1, 1)
+            and self.dilation == (1, 1, 1)
+            and self.groups == 1
+        )
 
     def _winograd_weights(self) -> list[torch.Tensor]:
         key = (self.weight.data_ptr(), self.weight._version)
@@ -413,8 +582,13 @@ class BlazeCausalConv3d(nn.Conv3d):
         ):
             # Zero history: only the current-frame taps contribute.
             y = F.conv2d(
-                x[:, :, 0], self._current_frame_weight(), bias, self.stride[1:], self.padding[1:],
-                self.dilation[1:], self.groups,
+                x[:, :, 0],
+                self._current_frame_weight(),
+                bias,
+                self.stride[1:],
+                self.padding[1:],
+                self.dilation[1:],
+                self.groups,
             )
             return _channels_last_3d_if_needed(y.unsqueeze(2))
         padding = list(self._padding)
@@ -436,7 +610,15 @@ class BlazeCausalConv3d(nn.Conv3d):
             per_call = self.max_in_frames - kt + 1
             total = x.shape[2] - kt + 1
             parts = [
-                F.conv3d(x[:, :, t : t + per_call + kt - 1], self.weight, bias, self.stride, padding, self.dilation, self.groups)
+                F.conv3d(
+                    x[:, :, t : t + per_call + kt - 1],
+                    self.weight,
+                    bias,
+                    self.stride,
+                    padding,
+                    self.dilation,
+                    self.groups,
+                )
                 for t in range(0, total, per_call)
             ]
             return _channels_last_3d_if_needed(torch.cat(parts, dim=2))
@@ -518,7 +700,14 @@ class BlazeResample(nn.Module):
             residual = _channels_last_3d_if_needed(residual)
             crop = dup.factor_t - 1 if first_chunk else 0
             return upsample_gather_cuda(
-                temp, residual, batch_size, frames, dup.factor_t, dup.repeats, crop, bias=gather_bias
+                temp,
+                residual,
+                batch_size,
+                frames,
+                dup.factor_t,
+                dup.repeats,
+                crop,
+                bias=gather_bias,
             )
         expanded = None
         if shortcut is not None:
@@ -538,7 +727,9 @@ class BlazeResample(nn.Module):
         batch_size, channels, frames, height, width = x.size()
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
-        if shortcut is not None and not (self.options.fused_upsample and self.mode.startswith("upsample")):
+        if shortcut is not None and not (
+            self.options.fused_upsample and self.mode.startswith("upsample")
+        ):
             raise ValueError("shortcut is only consumed by the fused upsample path")
 
         if self.mode == "upsample3d" and feat_cache is not None and feat_idx is not None:
@@ -565,7 +756,10 @@ class BlazeResample(nn.Module):
                 if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
                     cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
                 fuse_interleave = (
-                    cuda_frame_ops_available() and batch_size == 1 and x.dtype == torch.bfloat16 and x.is_cuda
+                    cuda_frame_ops_available()
+                    and batch_size == 1
+                    and x.dtype == torch.bfloat16
+                    and x.is_cuda
                 )
                 self.time_conv.defer_bias = fuse_interleave
                 if feat_cache[idx] == "Rep":
@@ -695,6 +889,20 @@ class BlazeResidualBlock(nn.Module):
         ):
             return self._forward_winograd(x, feat_cache, feat_idx, frames, return_input)
 
+        if (
+            self.options.use_slabs
+            and feat_cache is not None
+            and feat_idx is not None
+            and self.conv1.slab_eligible(_pending_like(x))
+            and self.conv2.slab_eligible(_pending_like(x))
+            and not (
+                self.conv1.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
+            )
+        ):
+            return self._forward_slabs(
+                x, feat_cache, feat_idx, frames, defer, defer_out, return_input
+            )
+
         if isinstance(x, PendingAdd):
             x, h = self.norm1.forward_silu_pending(x)
         else:
@@ -718,6 +926,47 @@ class BlazeResidualBlock(nn.Module):
             h = _causal_conv_with_cache(self.conv2, h, feat_cache, feat_idx)
         else:
             h = self.conv2(h)
+        if self.options.fused_residual:
+            out = PendingAdd(h, residual, self._output_bias(defer_shortcut) if defer_out else None)
+        else:
+            out = _channels_last_3d_if_needed(h + residual)
+        return (out, x) if return_input else out
+
+    def _forward_slabs(
+        self,
+        x: "torch.Tensor | PendingAdd",
+        feat_cache: list[torch.Tensor | str | None],
+        feat_idx: list[int],
+        frames: int,
+        defer: bool,
+        defer_out: bool,
+        return_input: bool,
+    ) -> "torch.Tensor | PendingAdd | tuple[torch.Tensor | PendingAdd, torch.Tensor]":
+        """Plain 3D convs reading their frame buffers; the norm kernels write into them."""
+        like = _pending_like(x)
+        idx1 = feat_idx[0]
+        win1 = self.conv1.slab_begin(feat_cache[idx1], frames, like)
+        feat_cache[idx1] = self.conv1
+        feat_idx[0] += 1
+        if isinstance(x, PendingAdd):
+            x, _ = self.norm1.forward_silu_pending(x, out=win1)
+        else:
+            self.norm1.forward_silu(x, out=win1)
+        has_shortcut_conv = isinstance(self.conv_shortcut, BlazeCausalConv3d)
+        defer_shortcut = defer_out and has_shortcut_conv and self.options.norm_mode != "reference"
+        if has_shortcut_conv:
+            self.conv_shortcut.defer_bias = defer_shortcut
+        residual = self.conv_shortcut(x)
+        self.conv1.defer_bias = defer
+        h = self.conv1.slab_conv(frames)
+
+        idx2 = feat_idx[0]
+        win2 = self.conv2.slab_begin(feat_cache[idx2], frames, h)
+        feat_cache[idx2] = self.conv2
+        feat_idx[0] += 1
+        self.norm2.forward_silu(PendingAdd(h, None, self.conv1.bias) if defer else h, out=win2)
+        self.conv2.defer_bias = defer_out
+        h = self.conv2.slab_conv(frames)
         if self.options.fused_residual:
             out = PendingAdd(h, residual, self._output_bias(defer_shortcut) if defer_out else None)
         else:
@@ -784,7 +1033,13 @@ def _run_resnets(
     for i, resnet in enumerate(resnets):
         defer = (defer_last_bias if i == last else True) and (defer_first_bias or i > 0)
         if i == 0:
-            x, entry = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx, defer_output_bias=defer, return_input=True)
+            x, entry = resnet(
+                x,
+                feat_cache=feat_cache,
+                feat_idx=feat_idx,
+                defer_output_bias=defer,
+                return_input=True,
+            )
         else:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx, defer_output_bias=defer)
     assert entry is not None
@@ -884,8 +1139,15 @@ class BlazeResidualDownBlock(nn.Module):
             pad_t = (dup.factor_t - t_in % dup.factor_t) % dup.factor_t
             h_out, w_out = x.shape[-2:]
             y = avg_down_add_cuda(
-                frames_view(x), frames_view(residual), h_out, w_out, residual.shape[-1],
-                dup.factor_t, dup.factor_s, dup.group_size, pad_t,
+                frames_view(x),
+                frames_view(residual),
+                h_out,
+                w_out,
+                residual.shape[-1],
+                dup.factor_t,
+                dup.factor_s,
+                dup.group_size,
+                pad_t,
             )
             return frames_to_video(y, h_out, w_out)
         return _channels_last_3d_if_needed(x + dup(residual))
@@ -947,7 +1209,9 @@ class BlazeEncoder3d(nn.Module):
                     self.down_blocks.append(BlazeResample(out_dim, mode=mode, options=options))
                     scale /= 2.0
 
-        self.mid_block = BlazeMidBlock(out_dim, dropout, non_linearity, num_layers=1, options=options)
+        self.mid_block = BlazeMidBlock(
+            out_dim, dropout, non_linearity, num_layers=1, options=options
+        )
         self.norm_out = BlazeRMSNorm(out_dim, images=False, options=options)
         self.conv_out = BlazeCausalConv3d(out_dim, z_dim, 3, padding=1)
         self.gradient_checkpointing = False
@@ -978,6 +1242,24 @@ class BlazeEncoder3d(nn.Module):
                 x = layer(x)
 
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        frames = x.frames if isinstance(x, PendingAdd) else x.shape[2]
+        like = _pending_like(x)
+        if (
+            self.options.use_slabs
+            and feat_cache is not None
+            and feat_idx is not None
+            and like.shape[0] == 1
+            and self.conv_out.slab_eligible(like)
+            and not (
+                self.conv_out.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
+            )
+        ):
+            idx = feat_idx[0]
+            window = self.conv_out.slab_begin(feat_cache[idx], frames, like)
+            feat_cache[idx] = self.conv_out
+            feat_idx[0] += 1
+            self.norm_out.forward_silu(x, out=window)
+            return self.conv_out.slab_conv(frames)
         x = self.norm_out.forward_silu(x)
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
@@ -1017,7 +1299,9 @@ class BlazeResidualUpBlock(nn.Module):
         self.upsampler = None
         if up_flag:
             mode = "upsample3d" if temperal_upsample else "upsample2d"
-            self.upsampler = BlazeResample(out_dim, mode=mode, upsample_out_dim=out_dim, options=options)
+            self.upsampler = BlazeResample(
+                out_dim, mode=mode, upsample_out_dim=out_dim, options=options
+            )
         self.gradient_checkpointing = False
 
     def forward(
@@ -1069,7 +1353,9 @@ class BlazeUpBlock(nn.Module):
         self.resnets = nn.ModuleList(resnets)
         self.upsamplers = None
         if upsample_mode is not None:
-            self.upsamplers = nn.ModuleList([BlazeResample(out_dim, mode=upsample_mode, options=options)])
+            self.upsamplers = nn.ModuleList(
+                [BlazeResample(out_dim, mode=upsample_mode, options=options)]
+            )
         self.gradient_checkpointing = False
 
     def forward(
@@ -1080,7 +1366,9 @@ class BlazeUpBlock(nn.Module):
         first_chunk: bool | None = None,
     ) -> torch.Tensor:
         del first_chunk
-        x, _ = _run_resnets(self.resnets, x, feat_cache, feat_idx, defer_last_bias=self.upsamplers is None)
+        x, _ = _run_resnets(
+            self.resnets, x, feat_cache, feat_idx, defer_last_bias=self.upsamplers is None
+        )
         if self.upsamplers is not None:
             x = self.upsamplers[0](_tensor(x), feat_cache=feat_cache, feat_idx=feat_idx)
         return x if isinstance(x, PendingAdd) else _channels_last_3d_if_needed(x)
@@ -1110,7 +1398,9 @@ class BlazeDecoder3d(nn.Module):
 
         dims = [dim * value for value in [dim_mult[-1]] + dim_mult[::-1]]
         self.conv_in = BlazeCausalConv3d(z_dim, dims[0], 3, padding=1)
-        self.mid_block = BlazeMidBlock(dims[0], dropout, non_linearity, num_layers=1, options=options)
+        self.mid_block = BlazeMidBlock(
+            dims[0], dropout, non_linearity, num_layers=1, options=options
+        )
         self.up_blocks = nn.ModuleList([])
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             if i > 0 and not is_residual:
@@ -1171,6 +1461,24 @@ class BlazeDecoder3d(nn.Module):
         for up_block in self.up_blocks:
             x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
 
+        frames = x.frames if isinstance(x, PendingAdd) else x.shape[2]
+        like = _pending_like(x)
+        if (
+            self.options.use_slabs
+            and feat_cache is not None
+            and feat_idx is not None
+            and like.shape[0] == 1
+            and self.conv_out.slab_eligible(like)
+            and not (
+                self.conv_out.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
+            )
+        ):
+            idx = feat_idx[0]
+            window = self.conv_out.slab_begin(feat_cache[idx], frames, like)
+            feat_cache[idx] = self.conv_out
+            feat_idx[0] += 1
+            self.norm_out.forward_silu(x, out=window)
+            return self.conv_out.slab_conv(frames)
         x = self.norm_out.forward_silu(x)
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
@@ -1259,7 +1567,9 @@ class VaeBlaze(nn.Module):
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         prev_benchmark = torch.backends.cudnn.benchmark
-        torch.backends.cudnn.benchmark = self.options.benchmark_convs(encoder=True, frames=x.shape[2])
+        torch.backends.cudnn.benchmark = self.options.benchmark_convs(
+            encoder=True, frames=x.shape[2]
+        )
         try:
             return self._encode_impl(x)
         finally:
@@ -1322,7 +1632,9 @@ class VaeBlaze(nn.Module):
         self.clear_cache()
         self.decoder.conv_out.max_in_frames = self.options.conv_out_frame_split or None
         prev_benchmark = torch.backends.cudnn.benchmark
-        torch.backends.cudnn.benchmark = self.options.benchmark_convs(encoder=False, frames=num_frame)
+        torch.backends.cudnn.benchmark = self.options.benchmark_convs(
+            encoder=False, frames=num_frame
+        )
         try:
             return self._decode_impl(z, return_dict, temporal_chunk_size)
         finally:

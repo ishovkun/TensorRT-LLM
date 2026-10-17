@@ -18,8 +18,23 @@ def cuda_op_available() -> bool:
 
 
 # (lanes per row, 16-byte vectors per lane) layouts instantiated in vaeRmsNormSiluKernel.cu.
-_CUDA_LAYOUTS = {(32, 1), (32, 2), (32, 4), (4, 5), (8, 5), (16, 5), (2, 3), (4, 3),
-                 (1, 1), (2, 1), (4, 1), (8, 1), (16, 1), (1, 3), (32, 3)}
+_CUDA_LAYOUTS = {
+    (32, 1),
+    (32, 2),
+    (32, 4),
+    (4, 5),
+    (8, 5),
+    (16, 5),
+    (2, 3),
+    (4, 3),
+    (1, 1),
+    (2, 1),
+    (4, 1),
+    (8, 1),
+    (16, 1),
+    (1, 3),
+    (32, 3),
+}
 
 
 def _cuda_layout(channels: int) -> tuple[int, int] | None:
@@ -122,14 +137,22 @@ def rms_norm_silu_cuda(
     *,
     reference_rounding: bool = False,
     in_bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The CUDA op (``trtllm::vae_rms_norm_silu``); same contract as ``rms_norm_silu``.
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
+    ``out`` is an optional channels-last destination of ``x``'s shape (a frame-buffer
+    window); the result is written there and returned.
     """
     rows = _channel_rows(x)
     if rows is None:
         raise ValueError("rms_norm_silu_cuda needs a channels-last CUDA tensor")
+    dst = None
+    if out is not None:
+        dst = _channel_rows(out)
+        if dst is None:
+            raise ValueError("out must be a channels-last CUDA tensor")
     out_rows = torch.ops.trtllm.vae_rms_norm_silu(
         rows,
         gamma.reshape(-1),
@@ -137,7 +160,10 @@ def rms_norm_silu_cuda(
         float(scale),
         reference_rounding,
         in_bias.reshape(-1) if in_bias is not None else None,
+        dst,
     )
+    if out is not None:
+        return out
     # The op returns [rows, C]; view it back as the channels-last 4D/5D tensor.
     if x.dim() == 5:
         n, c, t, h, w = x.shape
@@ -164,12 +190,17 @@ def add_rms_norm_silu_cuda(
     *,
     reference_rounding: bool = False,
     in_bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns ``(s, act)``."""
+    """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns ``(s, act)``.
+    ``out``: optional channels-last destination for the activation."""
     rows = _channel_rows(x)
     rrows = _channel_rows(residual)
     if rows is None or rrows is None:
         raise ValueError("add_rms_norm_silu_cuda needs channels-last CUDA tensors")
+    dst = _channel_rows(out) if out is not None else None
+    if out is not None and dst is None:
+        raise ValueError("out must be a channels-last CUDA tensor")
     s_rows, a_rows = torch.ops.trtllm.vae_add_rms_norm_silu(
         rows,
         rrows,
@@ -178,8 +209,9 @@ def add_rms_norm_silu_cuda(
         float(scale),
         reference_rounding,
         in_bias.reshape(-1) if in_bias is not None else None,
+        dst,
     )
-    return _rows_to_like(s_rows, x), _rows_to_like(a_rows, x)
+    return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
 
 
 def apply_in_bias(x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor:
@@ -331,14 +363,28 @@ def wino_combine_cuda(
     With ``pad_h``/``pad_w`` the result is ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns
     appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``)."""
     return torch.ops.trtllm.vae_wino_combine(
-        x, m if m is not None else [], bias.reshape(-1).contiguous() if bias is not None else None, residual,
-        frames, height, width, pad_h, pad_w,
+        x,
+        m if m is not None else [],
+        bias.reshape(-1).contiguous() if bias is not None else None,
+        residual,
+        frames,
+        height,
+        width,
+        pad_h,
+        pad_w,
     )
 
 
 def avg_down_add_cuda(
-    x: torch.Tensor, r: torch.Tensor, out_height: int, out_width: int, in_width: int,
-    factor_t: int, factor_s: int, group_size: int, pad_t: int,
+    x: torch.Tensor,
+    r: torch.Tensor,
+    out_height: int,
+    out_width: int,
+    in_width: int,
+    factor_t: int,
+    factor_s: int,
+    group_size: int,
+    pad_t: int,
 ) -> torch.Tensor:
     """``x + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``."""
     return torch.ops.trtllm.vae_avg_down_add(
@@ -348,7 +394,9 @@ def avg_down_add_cuda(
 
 def interleave_bias_cuda(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """``u [T, P, 2C]`` -> ``[2T, P, C]``: even frames from channels ``0:C``, odd from ``C:2C``, plus the bias."""
-    return torch.ops.trtllm.vae_interleave_bias(u, bias.reshape(-1).contiguous() if bias is not None else None)
+    return torch.ops.trtllm.vae_interleave_bias(
+        u, bias.reshape(-1).contiguous() if bias is not None else None
+    )
 
 
 def interleave_bias_reference(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
@@ -374,8 +422,16 @@ def wino_norm_silu_cuda(
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/2, P, C]``, cache ``[0..2, P, C]``).
     Returns ``(sum or None, y_tail [2, P, C], [D0, D1, D2, D3])``."""
     s, y_tail, d = torch.ops.trtllm.vae_wino_norm_silu(
-        x, m, residual, in_bias.reshape(-1) if in_bias is not None else None, cache, gamma.reshape(-1),
-        bias.reshape(-1) if bias is not None else None, float(scale), reference_rounding, frames,
+        x,
+        m,
+        residual,
+        in_bias.reshape(-1) if in_bias is not None else None,
+        cache,
+        gamma.reshape(-1),
+        bias.reshape(-1) if bias is not None else None,
+        float(scale),
+        reference_rounding,
+        frames,
     )
     return (s if s.numel() else None), y_tail, list(d)
 
@@ -409,7 +465,9 @@ def wino_norm_silu_reference(
     if m is not None and s is None:
         s = x
     t, p, c = x.shape
-    y = rms_norm_silu_reference(x.permute(0, 2, 1), gamma.reshape(1, -1, 1), bias, scale).permute(0, 2, 1)
+    y = rms_norm_silu_reference(x.permute(0, 2, 1), gamma.reshape(1, -1, 1), bias, scale).permute(
+        0, 2, 1
+    )
     cache_frames = cache.shape[0] if cache is not None else 0
     pad = torch.zeros(2 - cache_frames, p, c, dtype=x.dtype, device=x.device)
     hist = torch.cat([pad, cache], 0) if cache is not None and cache_frames else pad
@@ -442,7 +500,9 @@ def can_use_cuda_upsample_gather(cout: int, factor_t: int, repeats: int) -> bool
     )
 
 
-def pack_upsample_weights(weight: torch.Tensor, bias: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor | None]:
+def pack_upsample_weights(
+    weight: torch.Tensor, bias: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Fold nearest-2x upsampling into a 3x3 conv's weights.
 
     ``weight`` is ``[Cout, Cin, 3, 3]``. Returns ``[4*Cout, Cin, 2, 2]`` with output
@@ -501,5 +561,12 @@ def upsample_gather_cuda(
 ) -> torch.Tensor:
     """CUDA phase gather with the conv bias and the DupUp3D shortcut add folded in."""
     return torch.ops.trtllm.vae_upsample_gather(
-        temp, shortcut, batch, frames, factor_t, repeats, crop, bias.contiguous() if bias is not None else None
+        temp,
+        shortcut,
+        batch,
+        frames,
+        factor_t,
+        repeats,
+        crop,
+        bias.contiguous() if bias is not None else None,
     )

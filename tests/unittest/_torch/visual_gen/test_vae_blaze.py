@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.wan.vae_blaze import VaeBlazeOptions, VaeBlaze
+from tensorrt_llm._torch.visual_gen.models.wan.vae_blaze import VaeBlaze, VaeBlazeOptions
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 
 # Cosmos3-shaped (residual blocks, patch 2, 12 in/out channels) but tiny.
@@ -44,7 +44,9 @@ def _pair(options: VaeBlazeOptions | None = None) -> tuple[WanVAE, VaeBlaze]:
 def _inputs(frames: int) -> tuple[torch.Tensor, torch.Tensor]:
     gen = torch.Generator().manual_seed(1)
     pixels = (torch.rand(1, 3, frames, 64, 96, generator=gen) * 2 - 1).to(DEVICE, DTYPE)
-    latents = torch.randn(1, SMALL_CONFIG["z_dim"], (frames - 1) // 4 + 1, 4, 6, generator=gen).to(DEVICE, DTYPE)
+    latents = torch.randn(1, SMALL_CONFIG["z_dim"], (frames - 1) // 4 + 1, 4, 6, generator=gen).to(
+        DEVICE, DTYPE
+    )
     return pixels, latents
 
 
@@ -86,25 +88,78 @@ OPTION_SETS = [
     {"conv_out_frame_split": 3},
     {"first_frame_conv2d": True},
     {"fused_norm": True, "winograd_temporal": True},
-    {"fused_norm": True, "fused_residual": True, "fused_bias": True, "winograd_temporal": True, "norm_mode": "reference"},
-    {"fused_norm": True, "fused_residual": True, "fused_upsample": True, "fused_bias": True, "first_frame_conv2d": True, "winograd_temporal": True},
-    {"fused_norm": True, "fused_residual": True, "fused_upsample": True, "fused_bias": True, "first_frame_conv2d": True},
+    {"fused_norm": True, "conv_slabs": True},
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_bias": True,
+        "conv_slabs": True,
+        "first_frame_conv2d": True,
+    },
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_upsample": True,
+        "fused_bias": True,
+        "first_frame_conv2d": True,
+        "winograd_temporal": True,
+        "conv_slabs": True,
+        "cudnn_benchmark": "auto",
+        "conv_out_frame_split": 3,
+    },
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_bias": True,
+        "winograd_temporal": True,
+        "norm_mode": "reference",
+    },
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_upsample": True,
+        "fused_bias": True,
+        "first_frame_conv2d": True,
+        "winograd_temporal": True,
+    },
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_upsample": True,
+        "fused_bias": True,
+        "first_frame_conv2d": True,
+    },
     {"cudnn_benchmark": "auto"},
-    {"fused_norm": True, "fused_residual": True, "fused_upsample": True, "fused_bias": True, "conv_out_frame_split": 3, "cudnn_benchmark": "auto"},
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_upsample": True,
+        "fused_bias": True,
+        "conv_out_frame_split": 3,
+        "cudnn_benchmark": "auto",
+    },
 ]
 
 
-@pytest.mark.parametrize("option", OPTION_SETS, ids=lambda o: ",".join(f"{k}={v}" for k, v in o.items()))
+@pytest.mark.parametrize(
+    "option", OPTION_SETS, ids=lambda o: ",".join(f"{k}={v}" for k, v in o.items())
+)
 @pytest.mark.parametrize("frames", [1, 9])
 def test_each_option_stays_close_to_native(option: dict, frames: int) -> None:
     native, fast = _pair(VaeBlazeOptions(**option))
     pixels, latents = _inputs(frames)
     with torch.inference_mode():
         for actual, expected in (
-            (fast.encode(pixels, return_dict=False)[0].mode(), native.encode(pixels, return_dict=False)[0].mode()),
-            (fast.decode(latents, return_dict=False)[0], native.decode(latents, return_dict=False)[0]),
+            (
+                fast.encode(pixels, return_dict=False)[0].mode(),
+                native.encode(pixels, return_dict=False)[0].mode(),
+            ),
+            (
+                fast.decode(latents, return_dict=False)[0],
+                native.decode(latents, return_dict=False)[0],
+            ),
         ):
-            diff = (actual.float() - expected.float())
+            diff = actual.float() - expected.float()
             rel_l2 = diff.norm() / expected.float().norm().clamp_min(1e-12)
             assert torch.isfinite(actual.float()).all()
             # Both modes drift from native only through last-bit effects (fp32 mode: fewer

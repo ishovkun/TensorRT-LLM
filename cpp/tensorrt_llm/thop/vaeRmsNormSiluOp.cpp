@@ -45,7 +45,7 @@ void const* channelVectorPtr(std::optional<torch::Tensor> const& t, int64_t chan
 
 torch::Tensor vae_rms_norm_silu(torch::Tensor const& x, torch::Tensor const& gamma,
     std::optional<torch::Tensor> const& bias, double scale, bool reference_rounding,
-    std::optional<torch::Tensor> const& in_bias)
+    std::optional<torch::Tensor> const& in_bias, std::optional<torch::Tensor> const& out)
 {
     TORCH_CHECK(x.dim() == 2, "x must be 2D [rows, channels]");
     CHECK_INPUT(x, torch::kBFloat16);
@@ -58,7 +58,17 @@ torch::Tensor vae_rms_norm_silu(torch::Tensor const& x, torch::Tensor const& gam
         "channels must be a multiple of 8 up to ", tensorrt_llm::kernels::kVaeRmsNormSiluMaxChannels, ", got ",
         channels);
 
-    auto y = torch::empty_like(x);
+    torch::Tensor y;
+    if (out.has_value())
+    {
+        CHECK_INPUT(out.value(), torch::kBFloat16);
+        TORCH_CHECK(out->sizes() == x.sizes(), "out must have x's shape");
+        y = out.value();
+    }
+    else
+    {
+        y = torch::empty_like(x);
+    }
     auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
     tensorrt_llm::kernels::launchVaeRmsNormSilu(x.data_ptr(), y.data_ptr(), gamma.data_ptr(), biasPtr, inBiasPtr,
         nullptr, nullptr, x.size(0), static_cast<int>(channels), static_cast<float>(scale), 1e-12f, reference_rounding,
@@ -70,7 +80,7 @@ torch::Tensor vae_rms_norm_silu(torch::Tensor const& x, torch::Tensor const& gam
 // and also returned, since the next block uses it as its residual.
 std::tuple<torch::Tensor, torch::Tensor> vae_add_rms_norm_silu(torch::Tensor const& x, torch::Tensor const& residual,
     torch::Tensor const& gamma, std::optional<torch::Tensor> const& bias, double scale, bool reference_rounding,
-    std::optional<torch::Tensor> const& in_bias)
+    std::optional<torch::Tensor> const& in_bias, std::optional<torch::Tensor> const& out)
 {
     TORCH_CHECK(x.dim() == 2, "x must be 2D [rows, channels]");
     CHECK_INPUT(x, torch::kBFloat16);
@@ -86,7 +96,17 @@ std::tuple<torch::Tensor, torch::Tensor> vae_add_rms_norm_silu(torch::Tensor con
         channels);
 
     auto sum = torch::empty_like(x);
-    auto y = torch::empty_like(x);
+    torch::Tensor y;
+    if (out.has_value())
+    {
+        CHECK_INPUT(out.value(), torch::kBFloat16);
+        TORCH_CHECK(out->sizes() == x.sizes(), "out must have x's shape");
+        y = out.value();
+    }
+    else
+    {
+        y = torch::empty_like(x);
+    }
     auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
     tensorrt_llm::kernels::launchVaeRmsNormSilu(x.data_ptr(), y.data_ptr(), gamma.data_ptr(), biasPtr, inBiasPtr,
         residual.data_ptr(), sum.data_ptr(), x.size(0), static_cast<int>(channels), static_cast<float>(scale), 1e-12f,
@@ -98,10 +118,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "vae_rms_norm_silu(Tensor x, Tensor gamma, Tensor? bias, float scale, bool reference_rounding, "
-        "Tensor? in_bias=None) -> Tensor");
+        "Tensor? in_bias=None, Tensor? out=None) -> Tensor");
     m.def(
         "vae_add_rms_norm_silu(Tensor x, Tensor residual, Tensor gamma, Tensor? bias, float scale, "
-        "bool reference_rounding, Tensor? in_bias=None) -> (Tensor, Tensor)");
+        "bool reference_rounding, Tensor? in_bias=None, Tensor? out=None) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
