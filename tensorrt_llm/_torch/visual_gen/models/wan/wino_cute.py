@@ -518,7 +518,7 @@ def wino_fused_kernel(
         tj = t_in_frame - ti * tiles_w
         prow = 2 * ti + r1_sel
         pcol = 2 * tj + r2_sel
-        if prow < height and pcol < width:
+        if (prow < height) & (pcol < width):
             frame = comp * pairs + pair
             pixel = (frame * height + prow) * width + pcol
             n0 = n_block * F_TILER_MNK[1]
@@ -681,6 +681,539 @@ def wino_spatial_conv_fused(
     return out
 
 
+# ---------------------------------------------------------------------------------------
+# Stage 2: persistent, warp-specialized version of the fused-output kernel.
+#
+# Warps: 0 = TMA producer, 1 = MMA issuer, 2..9 = epilogue (two groups of four warps; group g
+# owns output columns 64g .. 64g+63 of the 128 rows). Each cluster of four CTAs (the four
+# coordinate rows) walks the tile blocks (n_block fastest, then m_tile, then component) with a
+# stride of the cluster count. The operand ring (3 stages x 32 K) is never aliased, so the TMA
+# warp keeps loading the next block while the epilogue runs; the accumulators are released as
+# soon as their contents are in registers, so the MMA warp starts the next block during the
+# exchange.
+#
+# Exchange, per 32-column chunk (four rounds per block): the partial sum a peer needs is
+# transposed through a per-warp scratch and pushed as bf16 with coalesced st.async into the
+# receiver's two 8 KB slots (completing on the receiver's barrier); the receiver combines it
+# with its own fp32 partial sum from registers and signals "slot free" to its two senders by
+# a remote mbarrier arrive. Only the kernel start and end use cluster-wide barriers.
+# ---------------------------------------------------------------------------------------
+
+P_TILER_MNK = (128, 128, 32)
+P_INST_MNK = (128, 128, 16)
+P_STAGES = 3
+P_COORDS = 4
+P_EPI_WARPS = 8
+P_THREADS = 32 * (2 + P_EPI_WARPS)
+P_TMA_WARP = 0
+P_MMA_WARP = 1
+P_AB_ELEMS = P_STAGES * P_COORDS * (P_TILER_MNK[0] + P_TILER_MNK[1]) * P_TILER_MNK[2]
+P_SLOT_BYTES = 128 * 32 * 2  # one received chunk: 128 rows x 32 cols bf16
+P_SCRATCH_ELEMS = P_EPI_WARPS * 32 * 32  # bf16 per warp: 32 rows x 32 cols
+
+
+@cute.struct
+class PersistentSharedStorage:
+    ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, P_STAGES * 2]
+    acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+    recv_mbar: cutlass.Int64
+    free_mbar: cutlass.Int64
+    tmem_holding_buf: cutlass.Int32
+    recv: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, 2 * 128 * 32], 128]
+    scratch: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_SCRATCH_ELEMS], 128]
+    smem_ab: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_AB_ELEMS], 1024]
+
+
+@cute.kernel
+def wino_persistent_kernel(
+    tiled_mma: cute.TiledMma,
+    tma_atom_a: cute.CopyAtom,
+    mA_mkl: cute.Tensor,
+    tma_atom_b: cute.CopyAtom,
+    mB_nkl: cute.Tensor,
+    mY: cute.Tensor,
+    a_smem_layout: cute.ComposedLayout,
+    b_smem_layout: cute.ComposedLayout,
+    m_valid: cutlass.Int32,
+    ntiles: cutlass.Int32,
+    tiles_w: cutlass.Int32,
+    height: cutlass.Int32,
+    width: cutlass.Int32,
+    pairs: cutlass.Int32,
+    n_blocks: cutlass.Int32,
+    m_tiles: cutlass.Int32,
+    num_blocks: cutlass.Int32,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    bidx, _, _ = cute.arch.block_idx()
+    gdim, _, _ = cute.arch.grid_dim()
+    num_clusters = gdim // P_COORDS
+    cluster_id = bidx // P_COORDS
+    x_row = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+
+    smem = utils.SmemAllocator()
+    storage = smem.allocate(PersistentSharedStorage)
+    a_elems = P_STAGES * P_COORDS * P_TILER_MNK[0] * P_TILER_MNK[2]
+    sA = storage.smem_ab.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+    sB = cute.make_tensor(
+        cute.recast_ptr(storage.smem_ab.data_ptr() + a_elems, swizzle_=b_smem_layout.inner),
+        b_smem_layout.outer,
+    )
+    recv_ptr = storage.recv.data_ptr()
+    scratch_ptr = storage.scratch.data_ptr()
+    recv_bar = storage.recv_mbar.ptr
+    free_bar = storage.free_mbar.ptr
+
+    if warp_idx == P_TMA_WARP:
+        cpasync.prefetch_descriptor(tma_atom_a)
+        cpasync.prefetch_descriptor(tma_atom_b)
+
+    tma_bytes = P_COORDS * (
+        cute.size_in_bytes(IO_DTYPE, cute.select(a_smem_layout, mode=[0, 1, 2]))
+        + cute.size_in_bytes(IO_DTYPE, cute.select(b_smem_layout, mode=[0, 1, 2]))
+    )
+    ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
+        num_stages=P_STAGES,
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+        consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+        tx_count=tma_bytes,
+        barrier_storage=storage.ab_mbar_ptr.data_ptr(),
+        defer_sync=True,
+    ).make_participants()
+    acc_pipeline = pipeline.PipelineUmmaAsync.create(
+        num_stages=1,
+        producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+        consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * P_EPI_WARPS),
+        barrier_storage=storage.acc_mbar_ptr.data_ptr(),
+        defer_sync=True,
+    )
+    # Receivers this CTA pushes to per round: rows 1 and 2 feed three owners, rows 0 and 3 one.
+    push_own = (x_row == 1) | (x_row == 2)
+    n_receivers = cutlass.Int32(1)
+    if push_own:
+        n_receivers = cutlass.Int32(3)
+    if tidx == 0:
+        cute.arch.mbarrier_init(recv_bar, 1)
+        cute.arch.mbarrier_init(free_bar, n_receivers)
+    cute.arch.mbarrier_init_fence()
+    cute.arch.cluster_arrive_relaxed()
+
+    tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=32 * (1 + P_EPI_WARPS))
+    tmem = utils.TmemAllocator(
+        storage.tmem_holding_buf.ptr, barrier_for_retrieve=tmem_alloc_barrier, allocator_warp_id=2
+    )
+
+    gA = cute.local_tile(mA_mkl, cute.slice_(P_TILER_MNK, (None, 0, None)), (None, None, None))
+    gB = cute.local_tile(mB_nkl, cute.slice_(P_TILER_MNK, (0, None, None)), (None, None, None))
+    thr_mma = tiled_mma.get_slice(0)
+    tCgA = thr_mma.partition_A(gA)
+    tCgB = thr_mma.partition_B(gB)
+    tCrA = tiled_mma.make_fragment_A(sA)
+    tCrB = tiled_mma.make_fragment_B(sB)
+    acc_shape = tiled_mma.partition_shape_C(P_TILER_MNK[:2])
+    tCtAcc_fake = tiled_mma.make_fragment_C(cute.append(acc_shape, P_COORDS))
+    tAsA, tAgA = cpasync.tma_partition(
+        tma_atom_a, 0, cute.make_layout(1), cute.group_modes(sA, 0, 3), cute.group_modes(tCgA, 0, 3)
+    )
+    tBsB, tBgB = cpasync.tma_partition(
+        tma_atom_b, 0, cute.make_layout(1), cute.group_modes(sB, 0, 3), cute.group_modes(tCgB, 0, 3)
+    )
+    num_k_tiles = cute.size(gA, mode=[3])
+
+    cute.arch.cluster_wait()
+
+    # ---------------- TMA warp ----------------
+    if warp_idx == P_TMA_WARP:
+        blk = cluster_id
+        while blk < num_blocks:
+            n_block = blk % n_blocks
+            m_tile = (blk // n_blocks) % m_tiles
+            comp = blk // (n_blocks * m_tiles)
+            l_base = comp * 16 + x_row * P_COORDS
+            for k_tile in cutlass.range(num_k_tiles):
+                ab_empty = ab_producer.acquire_and_advance()
+                for y in cutlass.range_constexpr(P_COORDS):
+                    slot = ab_empty.index * P_COORDS + y
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA[(None, m_tile, k_tile, l_base + y)],
+                        tAsA[(None, slot)],
+                        tma_bar_ptr=ab_empty.barrier,
+                    )
+                    cute.copy(
+                        tma_atom_b,
+                        tBgB[(None, n_block, k_tile, l_base + y)],
+                        tBsB[(None, slot)],
+                        tma_bar_ptr=ab_empty.barrier,
+                    )
+            blk += num_clusters
+        ab_producer.tail()
+
+    # ---------------- MMA warp ----------------
+    if warp_idx == P_MMA_WARP:
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+        acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
+        blk = cluster_id
+        while blk < num_blocks:
+            acc_pipeline.producer_acquire(acc_state)
+            for k_tile in cutlass.range(num_k_tiles):
+                ab_full = ab_consumer.wait_and_advance()
+                for y in cutlass.range_constexpr(P_COORDS):
+                    slot = ab_full.index * P_COORDS + y
+                    acc_y = tCtAcc[(None, None, None, y)]
+                    tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                    for k_block in cutlass.range(cute.size(tCrA, mode=[2]), unroll_full=True):
+                        coord = (None, None, k_block, slot)
+                        cute.gemm(tiled_mma, acc_y, tCrA[coord], tCrB[coord], acc_y)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                ab_full.release()
+            acc_pipeline.producer_commit(acc_state)
+            acc_state.advance()
+            blk += num_clusters
+        acc_pipeline.producer_tail(acc_state)
+
+    # ---------------- epilogue warps ----------------
+    if warp_idx >= 2:
+        tmem.allocate(512)
+        tmem.wait_for_alloc()
+        tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
+        tCtAcc = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+        epi_warp = warp_idx - 2
+        group = epi_warp // 4  # output columns 64*group .. +63
+        quarter = warp_idx % 4  # tensor-memory lane quarter this warp may access
+        lane = tidx % 32
+        row_m = quarter * 32 + lane
+        acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
+        group_bar = pipeline.NamedBarrier(barrier_id=2 + group, num_threads=128)
+        round_bar = pipeline.NamedBarrier(barrier_id=5, num_threads=32 * P_EPI_WARPS)
+
+        epi_tiler = ((128, 32),)
+        tmem_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32)
+        acc0_epi = cute.zipped_divide(tCtAcc[(None, None, None, 0)], epi_tiler)
+        tmem_tiled_copy = tcgen05.make_tmem_copy(tmem_atom, acc0_epi[None, 0])
+        tmem_thr_copy = tmem_tiled_copy.get_slice(row_m)
+        tDtAcc = [
+            tmem_thr_copy.partition_S(cute.zipped_divide(tCtAcc[(None, None, None, y)], epi_tiler))
+            for y in range(P_COORDS)
+        ]
+        # Register fragment shape: what one thread gets from a 128x32 sub-tile (a C-shaped view is
+        # partitioned only for its shape; the memory is never touched through it).
+        c_view = cute.make_tensor(
+            cute.recast_ptr(recv_ptr, dtype=cutlass.Float32),
+            cute.make_layout((128, 128), stride=(128, 1)),
+        )
+        c_epi = cute.zipped_divide(thr_mma.partition_C(c_view), epi_tiler)
+        frag_shape = tmem_thr_copy.partition_D(c_epi)[None, None, 0].shape
+        fl = cute.make_layout(frag_shape)
+        r0 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        r1 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        r2 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        r3 = cute.make_rmem_tensor(frag_shape, ACC_DTYPE)
+        seg32 = fl
+        oct_ = cute.make_layout(8)
+        # Own partial sums (fp32) and the other ones (bf16) for this group's two chunks.
+        own0 = cute.make_rmem_tensor(seg32, ACC_DTYPE)
+        own1 = cute.make_rmem_tensor(seg32, ACC_DTYPE)
+        oth0 = cute.make_rmem_tensor(seg32, IO_DTYPE)
+        oth1 = cute.make_rmem_tensor(seg32, IO_DTYPE)
+        keep = x_row % 2
+        r1_sel = x_row // 2
+        r2_sel = x_row % 2
+        leader = (lane == 0) & (quarter == 0)
+        scratch_w = scratch_ptr + epi_warp * (32 * 32)  # this warp's 32x32 bf16 scratch
+        blk = cluster_id
+        while blk < num_blocks:
+            n_block = blk % n_blocks
+            m_tile = (blk // n_blocks) % m_tiles
+            comp = blk // (n_blocks * m_tiles)
+            acc_pipeline.consumer_wait(acc_state)
+            for cc in cutlass.range_constexpr(2):
+                chunk = 2 * group + cc
+                cute.copy(tmem_tiled_copy, tDtAcc[0][None, None, chunk], r0)
+                cute.copy(tmem_tiled_copy, tDtAcc[1][None, None, chunk], r1)
+                cute.copy(tmem_tiled_copy, tDtAcc[2][None, None, chunk], r2)
+                cute.copy(tmem_tiled_copy, tDtAcc[3][None, None, chunk], r3)
+                t0 = (r0.load() + r1.load()) + r2.load()
+                t1 = (r1.load() - r2.load()) - r3.load()
+                tk = t0
+                to = t1
+                if keep == 1:
+                    tk = t1
+                    to = t0
+                if cc == 0:
+                    own0.store(tk)
+                    oth0.store(to.to(IO_DTYPE))
+                else:
+                    own1.store(tk)
+                    oth1.store(to.to(IO_DTYPE))
+            acc_pipeline.consumer_release(acc_state)
+            acc_state.advance()
+
+            # Pixel coordinates of this thread's tile row.
+            m_global = m_tile * 128 + row_m
+            pair = m_global // ntiles
+            t_in_frame = m_global - pair * ntiles
+            ti = t_in_frame // tiles_w
+            tj = t_in_frame - ti * tiles_w
+            prow = 2 * ti + r1_sel
+            pcol = 2 * tj + r2_sel
+            valid = (m_global < m_valid) & (prow < height) & (pcol < width)
+            frame = comp * pairs + pair
+            pixel = (frame * height + prow) * width + pcol
+            ybase = pixel * cute.size(mY, mode=[1]) + n_block * P_TILER_MNK[1]
+
+            for c in cutlass.range_constexpr(4):
+                # Round c (parity c % 2): the group owning chunk c pushes and receives it; the other idles.
+                if group == c // 2:
+                    # Wait until every receiver has consumed the previous round's slot contents.
+                    cute.arch.mbarrier_wait(free_bar, (c % 2) ^ 1)
+                    if leader:
+                        cute.arch.mbarrier_arrive_and_expect_tx(recv_bar, 2 * P_SLOT_BYTES)
+                    # Pass 0 pushes the other partial sum, pass 1 (rows 1 and 2 only) the own one.
+                    for pas in cutlass.range_constexpr(2):
+                        do_pass = cutlass.Boolean(True) if pas == 0 else push_own
+                        if do_pass:
+                            # Transpose through scratch: thread = row (32 bf16 = 64 B) -> lane = (row, 8-col segment).
+                            src = cute.make_tensor(scratch_w + lane * 32, seg32)
+                            tmp = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                            if pas == 0:
+                                if c % 2 == 0:
+                                    cute.autovec_copy(oth0, tmp)
+                                else:
+                                    cute.autovec_copy(oth1, tmp)
+                            else:
+                                if c % 2 == 0:
+                                    tmp.store(own0.load().to(IO_DTYPE))
+                                else:
+                                    tmp.store(own1.load().to(IO_DTYPE))
+                            cute.autovec_copy(tmp, src)
+                            cute.arch.sync_warp()
+                            for k in cutlass.range_constexpr(4):
+                                srow = 8 * k + lane // 4
+                                seg = lane % 4
+                                v = cute.make_tensor(
+                                    (scratch_w + (srow * 32 + seg * 8)).align(16), oct_
+                                ).load()
+                                vi = v.bitcast(cutlass.Int32)
+                                vv = (vi[0], vi[1], vi[2], vi[3])
+                                grow = quarter * 32 + srow
+                                d0 = (recv_ptr + (grow * 32 + seg * 8)).align(16)
+                                d1 = (recv_ptr + (128 * 32 + grow * 32 + seg * 8)).align(16)
+                                if pas == 0:
+                                    if x_row == 0:
+                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 1)
+                                    elif x_row == 1:
+                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 0)
+                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 2)
+                                    elif x_row == 2:
+                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 1)
+                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 3)
+                                    else:
+                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 2)
+                                else:
+                                    if x_row == 1:
+                                        cute.arch.store_async_dsmem(d0, vv, recv_bar, 3)
+                                    else:
+                                        cute.arch.store_async_dsmem(d1, vv, recv_bar, 0)
+                            cute.arch.sync_warp()
+                    # Receive the two peers' partial sums and combine with the own one.
+                    cute.arch.mbarrier_wait(recv_bar, c % 2)
+                    sa = (
+                        cute.make_tensor((recv_ptr + row_m * 32).align(16), seg32)
+                        .load()
+                        .to(ACC_DTYPE)
+                    )
+                    sb = (
+                        cute.make_tensor((recv_ptr + (128 * 32 + row_m * 32)).align(16), seg32)
+                        .load()
+                        .to(ACC_DTYPE)
+                    )
+                    mine = own0.load()
+                    if c % 2 == 1:
+                        mine = own1.load()
+                    res = (mine + sa) + sb  # r1 = 0: t0 + t1 + t2 (own + lower + higher)
+                    if r1_sel == 1:
+                        res = (sa - mine) - sb  # r1 = 1: t1 - t2 - t3 (lower - own - higher)
+                    out = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                    out.store(res.to(IO_DTYPE))
+                    if valid:
+                        gdst = cute.make_tensor((mY.iterator + (ybase + c * 32)).align(16), seg32)
+                        cute.autovec_copy(out, gdst)
+                    # All 128 threads of the group are done reading the slots: tell the two senders.
+                    group_bar.arrive_and_wait()
+                    if leader:
+                        if x_row == 0:
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=1)
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=2)
+                        elif x_row == 1:
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=0)
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=2)
+                        elif x_row == 2:
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=1)
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=3)
+                        else:
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=1)
+                            cute.arch.mbarrier_arrive(free_bar, peer_cta_rank_in_cluster=2)
+                # Both groups step through the rounds in lockstep: one receive barrier, one slot pair.
+                round_bar.arrive_and_wait()
+            blk += num_clusters
+        # Dealloc tensor memory once every epilogue warp is done.
+        pipeline.NamedBarrier(barrier_id=4, num_threads=32 * P_EPI_WARPS).arrive_and_wait()
+        tmem.relinquish_alloc_permit()
+        tmem.free(tmem_ptr)
+
+    # No CTA may leave while peers can still arrive on its barriers.
+    cute.arch.cluster_arrive()
+    cute.arch.cluster_wait()
+
+
+@cute.jit
+def wino_persistent_host(
+    a: cute.Tensor,
+    b: cute.Tensor,
+    y: cute.Tensor,
+    m_valid: cutlass.Int32,
+    ntiles: cutlass.Int32,
+    tiles_w: cutlass.Int32,
+    height: cutlass.Int32,
+    width: cutlass.Int32,
+    pairs: cutlass.Int32,
+    components: cutlass.Constexpr[int],
+    num_clusters: cutlass.Constexpr[int],
+    stream: cuda.CUstream,
+):
+    op = tcgen05.MmaF16BF16Op(
+        IO_DTYPE,
+        ACC_DTYPE,
+        P_INST_MNK,
+        tcgen05.CtaGroup.ONE,
+        tcgen05.OperandSource.SMEM,
+        tcgen05.OperandMajorMode.K,
+        tcgen05.OperandMajorMode.K,
+    )
+    tiled_mma = cute.make_tiled_mma(op)
+    a_smem_layout = sm100_utils.make_smem_layout_a(
+        tiled_mma, P_TILER_MNK, IO_DTYPE, P_STAGES * P_COORDS
+    )
+    b_smem_layout = sm100_utils.make_smem_layout_b(
+        tiled_mma, P_TILER_MNK, IO_DTYPE, P_STAGES * P_COORDS
+    )
+    a_one = cute.select(a_smem_layout, mode=[0, 1, 2])
+    b_one = cute.select(b_smem_layout, mode=[0, 1, 2])
+    tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
+    a_tma_atom, a_tma_tensor = cute.nvgpu.make_tiled_tma_atom_A(
+        tma_op, a, a_one, P_TILER_MNK, tiled_mma
+    )
+    b_tma_atom, b_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
+        tma_op, b, b_one, P_TILER_MNK, tiled_mma
+    )
+    m_pad, _, _ = a.layout.shape
+    n, _, _ = b.layout.shape
+    n_blocks = cute.ceil_div(n, P_TILER_MNK[1])
+    m_tiles = cute.ceil_div(m_pad, P_TILER_MNK[0])
+    num_blocks = n_blocks * m_tiles * components
+    wino_persistent_kernel(
+        tiled_mma,
+        a_tma_atom,
+        a_tma_tensor,
+        b_tma_atom,
+        b_tma_tensor,
+        y,
+        a_smem_layout,
+        b_smem_layout,
+        m_valid,
+        ntiles,
+        tiles_w,
+        height,
+        width,
+        pairs,
+        n_blocks,
+        m_tiles,
+        num_blocks,
+    ).launch(
+        grid=(P_COORDS * num_clusters, 1, 1),
+        block=(P_THREADS, 1, 1),
+        cluster=(P_COORDS, 1, 1),
+        stream=stream,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _max_active_clusters() -> int:
+    return int(utils.HardwareInfo().get_max_active_clusters(P_COORDS))
+
+
+@functools.lru_cache(maxsize=None)
+def _compiled_persistent(key: tuple[int, ...]):
+    nl, m_pad, n, k, pixels, num_clusters = key
+    v = torch.empty(nl, m_pad, k, dtype=torch.bfloat16, device="cuda")
+    u = torch.empty(nl, n, k, dtype=torch.bfloat16, device="cuda")
+    y = torch.empty(pixels, n, dtype=torch.bfloat16, device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    one = cutlass.Int32(1)
+    return cute.compile(
+        wino_persistent_host,
+        _as_mkl(v, 1),
+        _as_mkl(u, 1),
+        _as_rows(y),
+        one,
+        one,
+        one,
+        one,
+        one,
+        one,
+        nl // 16,
+        num_clusters,
+        stream,
+    )
+
+
+def wino_spatial_conv_persistent(
+    v: torch.Tensor,
+    u_nk: torch.Tensor,
+    out: torch.Tensor,
+    components: int,
+    pairs: int,
+    height: int,
+    width: int,
+) -> torch.Tensor:
+    """Persistent variant of :func:`wino_spatial_conv_fused` (same contract)."""
+    nl, m_pad, k = v.shape
+    n = u_nk.shape[1]
+    tiles_w = (width + 1) // 2
+    ntiles = ((height + 1) // 2) * tiles_w
+    m_valid = pairs * ntiles
+    assert (
+        nl == components * 16
+        and m_pad % 128 == 0
+        and m_pad >= m_valid
+        and n % 128 == 0
+        and k % 32 == 0
+    )
+    pixels = components * pairs * height * width
+    num_blocks = (n // 128) * (m_pad // 128) * components
+    num_clusters = min(_max_active_clusters(), num_blocks)
+    out_rows = out.view(pixels, n)
+    fn = _compiled_persistent((nl, m_pad, n, k, pixels, num_clusters))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn(
+        _as_mkl(v, 1),
+        _as_mkl(u_nk, 1),
+        _as_rows(out_rows),
+        cutlass.Int32(m_valid),
+        cutlass.Int32(ntiles),
+        cutlass.Int32(tiles_w),
+        cutlass.Int32(height),
+        cutlass.Int32(width),
+        cutlass.Int32(pairs),
+        stream,
+    )
+    return out
+
+
 def _as_mkl(t: torch.Tensor, leading_dim: int) -> cute.Tensor:
     """torch ``[L, R, C]`` (C contiguous) -> cute tensor ``(R, C, L)`` with the C mode contiguous."""
     return (
@@ -750,7 +1283,8 @@ def _main_fused(args) -> None:
     v[:, :m_valid] = v_exact
     u_nk = winograd_spatial_weights(weight).transpose(1, 2).contiguous()  # [64, cout, cin]
     out = torch.empty(components * pairs, h, w, cout, dtype=torch.bfloat16, device="cuda")
-    wino_spatial_conv_fused(v, u_nk, out, components, pairs, h, w)
+    run = wino_spatial_conv_persistent if args.persistent else wino_spatial_conv_fused
+    run(v, u_nk, out, components, pairs, h, w)
     torch.cuda.synchronize()
     g = winograd_weights(weight)
     ref = torch.cat(
@@ -769,13 +1303,13 @@ def _main_fused(args) -> None:
     print(f"fused rel-L2 vs fp32 conv2d of the component filters: {rel:.3e}")
     if args.probe:
         for _ in range(3):
-            wino_spatial_conv_fused(v, u_nk, out, components, pairs, h, w)
+            run(v, u_nk, out, components, pairs, h, w)
         torch.cuda.synchronize()
         return
     conv_flops = 2.0 * components * pairs * h * w * cin * cout * 9
     wino_flops = 2.0 * 64 * m_valid * cin * cout
     t_fused = _time_cupti(
-        lambda: wino_spatial_conv_fused(v, u_nk, out, components, pairs, h, w),
+        lambda: run(v, u_nk, out, components, pairs, h, w),
         3,
         args.iters,
         use_graph=True,
@@ -820,6 +1354,9 @@ def _main() -> None:
         "--fused", action="store_true", help="test/bench the fused-output kernel instead"
     )
     parser.add_argument("--case", default="1024,1024,90,160", help="cin,cout,H,W for --fused")
+    parser.add_argument(
+        "--persistent", action="store_true", help="with --fused: the persistent kernel"
+    )
     args = parser.parse_args()
     if args.fused:
         return _main_fused(args)
