@@ -180,7 +180,14 @@ def _register_fake():
         return [torch.empty_like(q), torch.empty_like(k)]
 
     @torch.library.register_fake("trtllm::vae_rms_norm_silu")
-    def _(x, gamma, bias, scale, reference_rounding, in_bias=None, out=None):
+    def _(x,
+          gamma,
+          bias,
+          scale,
+          reference_rounding,
+          in_bias=None,
+          out=None,
+          silu=True):
         return x.new_empty(x.shape)
 
     @torch.library.register_fake("trtllm::vae_add_rms_norm_silu")

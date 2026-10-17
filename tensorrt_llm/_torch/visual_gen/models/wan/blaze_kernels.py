@@ -138,8 +138,10 @@ def rms_norm_silu_cuda(
     reference_rounding: bool = False,
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    silu: bool = True,
 ) -> torch.Tensor:
     """The CUDA op (``trtllm::vae_rms_norm_silu``); same contract as ``rms_norm_silu``.
+    ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
     ``out`` is an optional channels-last destination of ``x``'s shape (a frame-buffer
@@ -161,6 +163,7 @@ def rms_norm_silu_cuda(
         reference_rounding,
         in_bias.reshape(-1) if in_bias is not None else None,
         dst,
+        silu,
     )
     if out is not None:
         return out
@@ -281,6 +284,13 @@ def rms_norm_silu(
         enable_fp_fusion=(not reference_rounding) if enable_fp_fusion is None else enable_fp_fusion,
     )
     return out
+
+
+def rms_norm_reference(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.Tensor:
+    """The eager WanRMSNorm.forward alone (no activation, no bias)."""
+    needs_fp32 = x.dtype in (torch.float16, torch.bfloat16)
+    normalized = F.normalize(x.float() if needs_fp32 else x, dim=1).to(x.dtype)
+    return normalized * scale * gamma
 
 
 def rms_norm_silu_reference(

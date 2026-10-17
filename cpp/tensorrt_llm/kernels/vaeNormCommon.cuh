@@ -116,9 +116,10 @@ inline RowLayout makeRowLayout(int channels)
     return RowLayout{lanes, nvec / lanes};
 }
 
-// One normalized + activated element. REF reproduces the eager rounding sequence;
-// otherwise gamma arrives pre-multiplied by 0.5 * scale and SiLU is h * (1 + tanh(h)).
-template <typename TIn, bool REF, bool HAS_BIAS>
+// One normalized (+ activated, when ACT) element. REF reproduces the eager rounding
+// sequence; otherwise gamma arrives pre-multiplied by scale (by 0.5 * scale with ACT, so
+// SiLU is h * (1 + tanh(h)) with h = r / 2).
+template <typename TIn, bool REF, bool HAS_BIAS, bool ACT = true>
 __device__ __forceinline__ float normElement(float x, float denom, float invDenom, float scale, float gamma, float bias)
 {
     if constexpr (REF)
@@ -130,11 +131,23 @@ __device__ __forceinline__ float normElement(float x, float denom, float invDeno
         {
             r = roundTo<TIn>(r + bias);
         }
+        if constexpr (!ACT)
+        {
+            return r;
+        }
         return r / (1.0f + expf(-r));
     }
     else
     {
         float h = x * invDenom * gamma;
+        if constexpr (!ACT)
+        {
+            if constexpr (HAS_BIAS)
+            {
+                h += bias;
+            }
+            return h;
+        }
         if constexpr (HAS_BIAS)
         {
             h += 0.5f * bias;

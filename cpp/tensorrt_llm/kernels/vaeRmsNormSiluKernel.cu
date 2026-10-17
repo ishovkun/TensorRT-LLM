@@ -14,11 +14,11 @@
  * limitations under the License.
  */
 
-#include "vaeRmsNormSiluKernel.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/packedVector.cuh"
 #include "vaeNormCommon.cuh"
+#include "vaeRmsNormSiluKernel.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -63,11 +63,10 @@ constexpr int rowsInFlight()
 // ``sumOut`` because the next block needs it as its own residual. The rounding
 // matches an eager bf16 add, so the sum is bit-identical to ``x + residual``.
 template <typename TIn, typename TOut, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL>
+    bool HAS_RESIDUAL, bool ACT = true>
 __global__ void __launch_bounds__(kThreads, kBlocksPerSm) vaeRmsNormSiluKernel(TIn const* __restrict__ x,
-    TOut* __restrict__ y, TIn const* __restrict__ gamma, TIn const* __restrict__ bias,
-    TIn const* __restrict__ inBias, TIn const* __restrict__ residual, TIn* __restrict__ sumOut, int64_t numRows,
-    int channels, float scale, float eps)
+    TOut* __restrict__ y, TIn const* __restrict__ gamma, TIn const* __restrict__ bias, TIn const* __restrict__ inBias,
+    TIn const* __restrict__ residual, TIn* __restrict__ sumOut, int64_t numRows, int channels, float scale, float eps)
 {
     using VecIn = PackedAligned<TIn, V>;
     using VecOut = PackedAligned<TOut, V>;
@@ -91,7 +90,7 @@ __global__ void __launch_bounds__(kThreads, kBlocksPerSm) vaeRmsNormSiluKernel(T
     for (int c = tid; c < channels; c += kThreads)
     {
         float const g = Elem<TIn>::toFloat(gamma[c]);
-        sGamma[c] = REF ? g : g * (0.5f * scale);
+        sGamma[c] = REF ? g : g * (ACT ? 0.5f * scale : scale);
         sBias[c] = HAS_BIAS ? Elem<TIn>::toFloat(bias[c]) : 0.0f;
         sInBias[c] = HAS_IN_BIAS ? Elem<TIn>::toFloat(inBias[c]) : 0.0f;
     }
@@ -289,8 +288,8 @@ __global__ void __launch_bounds__(kThreads, kBlocksPerSm) vaeRmsNormSiluKernel(T
                 {
                     float2 const f = pairAt(v[u][k], i);
                     float2 r;
-                    r.x = normElement<TIn, REF, HAS_BIAS>(f.x, denom, invDenom, scale, g.val[2 * i], b.val[2 * i]);
-                    r.y = normElement<TIn, REF, HAS_BIAS>(
+                    r.x = normElement<TIn, REF, HAS_BIAS, ACT>(f.x, denom, invDenom, scale, g.val[2 * i], b.val[2 * i]);
+                    r.y = normElement<TIn, REF, HAS_BIAS, ACT>(
                         f.y, denom, invDenom, scale, g.val[2 * i + 1], b.val[2 * i + 1]);
                     setPair(o, i, r);
                 }
@@ -315,11 +314,11 @@ __global__ void __launch_bounds__(kThreads, kBlocksPerSm) vaeRmsNormSiluKernel(T
 }
 
 template <typename TIn, typename TOut, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL>
+    bool HAS_RESIDUAL, bool ACT = true>
 void launchConfig(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn const* inBias, TIn const* residual,
     TIn* sumOut, int64_t numRows, int channels, float scale, float eps, cudaStream_t stream)
 {
-    auto* kernel = vaeRmsNormSiluKernel<TIn, TOut, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL>;
+    auto* kernel = vaeRmsNormSiluKernel<TIn, TOut, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, ACT>;
     constexpr int kRowsPerBlock = (32 / L) * rowsInFlight<K, HAS_RESIDUAL>() * kWarps;
     int const smem = 3 * channels * static_cast<int>(sizeof(float));
     int device = 0;
@@ -334,8 +333,8 @@ void launchConfig(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn 
 }
 
 template <typename TIn, typename TOut, int V, int L_, int K_, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS>
-void launchResidual(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn const* inBias,
-    TIn const* residual, TIn* sumOut, int64_t numRows, int channels, float scale, float eps, cudaStream_t stream)
+void launchResidual(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn const* inBias, TIn const* residual,
+    TIn* sumOut, int64_t numRows, int channels, float scale, float eps, cudaStream_t stream)
 {
     if (residual != nullptr)
         launchConfig<TIn, TOut, V, L_, K_, REF, HAS_BIAS, HAS_IN_BIAS, true>(
@@ -357,10 +356,31 @@ void launchInBias(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn 
             x, y, gamma, bias, inBias, residual, sumOut, numRows, channels, scale, eps, stream);
 }
 
+// Norm without the activation: only the plain form (no post-norm bias, deferred bias or
+// residual) is instantiated, which is what the attention block's RMSNorm needs.
+template <typename TIn, typename TOut, int V, int L_, int K_>
+void launchNoAct(TIn const* x, TOut* y, TIn const* gamma, int64_t numRows, int channels, float scale, float eps,
+    bool ref, cudaStream_t stream)
+{
+    if (ref)
+        launchConfig<TIn, TOut, V, L_, K_, true, false, false, false, false>(
+            x, y, gamma, nullptr, nullptr, nullptr, nullptr, numRows, channels, scale, eps, stream);
+    else
+        launchConfig<TIn, TOut, V, L_, K_, false, false, false, false, false>(
+            x, y, gamma, nullptr, nullptr, nullptr, nullptr, numRows, channels, scale, eps, stream);
+}
+
 template <typename TIn, typename TOut, int V, int L_, int K_>
 void launchModes(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn const* inBias, TIn const* residual,
-    TIn* sumOut, int64_t numRows, int channels, float scale, float eps, bool ref, cudaStream_t stream)
+    TIn* sumOut, int64_t numRows, int channels, float scale, float eps, bool ref, bool act, cudaStream_t stream)
 {
+    if (!act)
+    {
+        TLLM_CHECK_WITH_INFO(bias == nullptr && inBias == nullptr && residual == nullptr,
+            "vaeRmsNormSilu: the no-activation form takes no bias, deferred bias or residual");
+        launchNoAct<TIn, TOut, V, L_, K_>(x, y, gamma, numRows, channels, scale, eps, ref, stream);
+        return;
+    }
     bool const hasBias = bias != nullptr;
     if (hasBias && ref)
         launchInBias<TIn, TOut, V, L_, K_, true, true>(
@@ -380,14 +400,14 @@ void launchModes(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn c
 // anything else runs the generic kernel with the layout read at runtime.
 template <typename TIn, typename TOut, int V>
 void launchLayout(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn const* inBias, TIn const* residual,
-    TIn* sumOut, int64_t numRows, int channels, float scale, float eps, bool ref, cudaStream_t stream)
+    TIn* sumOut, int64_t numRows, int channels, float scale, float eps, bool ref, bool act, cudaStream_t stream)
 {
     RowLayout const l = makeRowLayout<V>(channels);
-#define TRY_LAYOUT(LL, KK)                                                                                            \
+#define TRY_LAYOUT(LL, KK)                                                                                             \
     if (l.lanesPerRow == (LL) && l.vecsPerLane == (KK))                                                                \
     {                                                                                                                  \
         launchModes<TIn, TOut, V, LL, KK>(                                                                             \
-            x, y, gamma, bias, inBias, residual, sumOut, numRows, channels, scale, eps, ref, stream);                 \
+            x, y, gamma, bias, inBias, residual, sumOut, numRows, channels, scale, eps, ref, act, stream);             \
         return;                                                                                                        \
     }
     VAE_NORM_FOR_EACH_LAYOUT(TRY_LAYOUT)
@@ -399,7 +419,8 @@ void launchLayout(TIn const* x, TOut* y, TIn const* gamma, TIn const* bias, TIn 
 } // namespace
 
 void launchVaeRmsNormSilu(void const* xv, void* yv, void const* gv, void const* bv, void const* ibv, void const* rv,
-    void* sv, int64_t numRows, int channels, float scale, float eps, bool referenceRounding, cudaStream_t stream)
+    void* sv, int64_t numRows, int channels, float scale, float eps, bool referenceRounding, cudaStream_t stream,
+    bool activation)
 {
     TLLM_CHECK_WITH_INFO((rv == nullptr) == (sv == nullptr), "vaeRmsNormSilu: residual and sum output go together");
     // One lane vector is a 16-byte load, so a row is a whole number of vectors.
@@ -414,8 +435,8 @@ void launchVaeRmsNormSilu(void const* xv, void* yv, void const* gv, void const* 
     launchLayout<__nv_bfloat16, __nv_bfloat16, kVecBf16>(reinterpret_cast<__nv_bfloat16 const*>(xv),
         reinterpret_cast<__nv_bfloat16*>(yv), reinterpret_cast<__nv_bfloat16 const*>(gv),
         reinterpret_cast<__nv_bfloat16 const*>(bv), reinterpret_cast<__nv_bfloat16 const*>(ibv),
-        reinterpret_cast<__nv_bfloat16 const*>(rv), reinterpret_cast<__nv_bfloat16*>(sv), numRows, channels, scale,
-        eps, referenceRounding, stream);
+        reinterpret_cast<__nv_bfloat16 const*>(rv), reinterpret_cast<__nv_bfloat16*>(sv), numRows, channels, scale, eps,
+        referenceRounding, activation, stream);
     sync_check_cuda_error(stream);
 }
 

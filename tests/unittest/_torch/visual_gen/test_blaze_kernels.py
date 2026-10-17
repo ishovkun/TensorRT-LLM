@@ -17,7 +17,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kern
 CHANNELS = [48, 96, 160, 256, 320, 512, 640, 1024, 12, 7, 16, 24, 32]
 
 
-def _inputs(C: int, frames: int = 3, hw: tuple[int, int] = (6, 10), dtype=torch.bfloat16, bias: bool = False):
+def _inputs(
+    C: int, frames: int = 3, hw: tuple[int, int] = (6, 10), dtype=torch.bfloat16, bias: bool = False
+):
     gen = torch.Generator(device="cuda").manual_seed(C)
     x = torch.randn(2, C, frames, *hw, generator=gen, device="cuda").to(dtype)
     x = x.to(memory_format=torch.channels_last_3d)
@@ -79,7 +81,11 @@ def test_fallback_conditions() -> None:
 def test_4d_images_layout() -> None:
     C = 96
     gen = torch.Generator(device="cuda").manual_seed(0)
-    x = torch.randn(3, C, 8, 8, generator=gen, device="cuda").to(torch.bfloat16).to(memory_format=torch.channels_last)
+    x = (
+        torch.randn(3, C, 8, 8, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last)
+    )
     gamma = torch.ones(C, 1, 1, device="cuda", dtype=torch.bfloat16)
     expected = rms_norm_silu_reference(x, gamma, 0.0, C**0.5)
     actual = rms_norm_silu(x, gamma, None, C**0.5, reference_rounding=True)
@@ -137,7 +143,11 @@ def test_cuda_tail_rows_and_zero_rows() -> None:
     C = 256
     gen = torch.Generator(device="cuda").manual_seed(7)
     # 1 batch x 3 frames x 7 x 11 = 231 rows: not a multiple of any block size.
-    x = torch.randn(1, C, 3, 7, 11, generator=gen, device="cuda").to(torch.bfloat16).to(memory_format=torch.channels_last_3d)
+    x = (
+        torch.randn(1, C, 3, 7, 11, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last_3d)
+    )
     x[0, :, 0, 0, 0] = 0
     gamma = torch.ones(C, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
     for reference in (False, True):
@@ -153,7 +163,11 @@ def test_cuda_tail_rows_and_zero_rows() -> None:
 def test_cuda_large_tensor_matches_triton(C: int) -> None:
     # ~300k rows: every persistent block streams many shared-memory stages.
     gen = torch.Generator(device="cuda").manual_seed(C + 1)
-    x = torch.randn(1, C, 3, 320, 320, generator=gen, device="cuda").to(torch.bfloat16).to(memory_format=torch.channels_last_3d)
+    x = (
+        torch.randn(1, C, 3, 320, 320, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last_3d)
+    )
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
     scale = C**0.5
     cuda = rms_norm_silu_cuda(x, gamma, None, scale)
@@ -170,8 +184,16 @@ def test_cuda_large_tensor_matches_triton(C: int) -> None:
 @pytest.mark.parametrize("reference", [True, False])
 def test_cuda_residual_variant(C: int, reference: bool) -> None:
     gen = torch.Generator(device="cuda").manual_seed(C + 7)
-    x = torch.randn(1, C, 3, 160, 160, generator=gen, device="cuda").to(torch.bfloat16).to(memory_format=torch.channels_last_3d)
-    r = torch.randn(1, C, 3, 160, 160, generator=gen, device="cuda").to(torch.bfloat16).to(memory_format=torch.channels_last_3d)
+    x = (
+        torch.randn(1, C, 3, 160, 160, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last_3d)
+    )
+    r = (
+        torch.randn(1, C, 3, 160, 160, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last_3d)
+    )
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
     scale = C**0.5
     s_ref, a_ref = add_rms_norm_silu_reference(x, r, gamma, 0.0, scale)
@@ -195,14 +217,24 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
     """A deferred conv bias is added first as a bf16 add; the sum stays bit-identical to eager."""
     gen = torch.Generator(device="cuda").manual_seed(C + 11)
     shape = (1, C, 2, 40, 40)
-    x = torch.randn(*shape, generator=gen, device="cuda").to(torch.bfloat16).to(memory_format=torch.channels_last_3d)
-    r = torch.randn(*shape, generator=gen, device="cuda").to(torch.bfloat16).to(memory_format=torch.channels_last_3d)
+    x = (
+        torch.randn(*shape, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last_3d)
+    )
+    r = (
+        torch.randn(*shape, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last_3d)
+    )
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
     in_bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(torch.bfloat16)
     scale = C**0.5
     if with_residual:
         s_ref, a_ref = add_rms_norm_silu_reference(x, r, gamma, 0.0, scale, in_bias=in_bias)
-        s, a = add_rms_norm_silu_cuda(x, r, gamma, None, scale, reference_rounding=reference, in_bias=in_bias)
+        s, a = add_rms_norm_silu_cuda(
+            x, r, gamma, None, scale, reference_rounding=reference, in_bias=in_bias
+        )
         assert torch.equal(s, s_ref)
     else:
         a_ref = rms_norm_silu_reference(x, gamma, 0.0, scale, in_bias=in_bias)
@@ -233,7 +265,9 @@ from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E
 )
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D  # noqa: E402
 
-upsample_op = pytest.mark.skipif(not cuda_upsample_available(), reason="trtllm::vae_upsample_gather not built")
+upsample_op = pytest.mark.skipif(
+    not cuda_upsample_available(), reason="trtllm::vae_upsample_gather not built"
+)
 
 
 def _eager_upsample(x4: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -269,7 +303,9 @@ def test_packed_upsample_algebra_fp32(shape: tuple[int, int, int, int]) -> None:
 # repeats = cout*factor/cin: equal to the factor (64->64), below it (64->32, strided
 # span), above it (16->64 and 32->64, several output channels per source channel).
 @pytest.mark.parametrize("cin_out", [(64, 64), (64, 32), (16, 64), (32, 64)])
-def test_cuda_upsample_gather_with_shortcut(factor_t: int, first_chunk: bool, cin_out: tuple[int, int]) -> None:
+def test_cuda_upsample_gather_with_shortcut(
+    factor_t: int, first_chunk: bool, cin_out: tuple[int, int]
+) -> None:
     cin, cout = cin_out
     b, tr, h, w = 1, 3, 9, 13
     frames = tr * factor_t - (factor_t - 1 if first_chunk else 0)
@@ -282,20 +318,30 @@ def test_cuda_upsample_gather_with_shortcut(factor_t: int, first_chunk: bool, ci
     residual = residual.to(memory_format=torch.channels_last_3d)
     dup = DupUp3D(cin, cout, factor_t=factor_t, factor_s=2)
 
-    x4 = x5.permute(0, 2, 1, 3, 4).reshape(b * frames, cin, h, w).contiguous(memory_format=torch.channels_last)
+    x4 = (
+        x5.permute(0, 2, 1, 3, 4)
+        .reshape(b * frames, cin, h, w)
+        .contiguous(memory_format=torch.channels_last)
+    )
     eager = _eager_upsample(x4, weight, bias)
     eager = eager.view(b, frames, cout, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
-    eager = (eager + dup(residual, first_chunk=first_chunk)).contiguous(memory_format=torch.channels_last_3d)
+    eager = (eager + dup(residual, first_chunk=first_chunk)).contiguous(
+        memory_format=torch.channels_last_3d
+    )
 
     packed, packed_bias = pack_upsample_weights(weight, bias)
-    temp = F.conv2d(x4, packed, packed_bias, padding=1).contiguous(memory_format=torch.channels_last)
+    temp = F.conv2d(x4, packed, packed_bias, padding=1).contiguous(
+        memory_format=torch.channels_last
+    )
     crop = factor_t - 1 if first_chunk else 0
     got = upsample_gather_cuda(temp, residual, b, frames, factor_t, dup.repeats, crop)
     assert got.shape == eager.shape and got.is_contiguous(memory_format=torch.channels_last_3d)
 
     # The kernel's gather + shortcut add must be bit-identical to the reference gather
     # followed by the eager DupUp3D add (same bf16 inputs, one bf16 rounding).
-    via_reference = upsample_gather_reference(temp, b, frames, dup(residual, first_chunk=first_chunk))
+    via_reference = upsample_gather_reference(
+        temp, b, frames, dup(residual, first_chunk=first_chunk)
+    )
     assert torch.equal(got, via_reference)
     plain = upsample_gather_cuda(temp, None, b, frames)
     assert torch.equal(plain, upsample_gather_reference(temp, b, frames))
@@ -303,15 +349,24 @@ def test_cuda_upsample_gather_with_shortcut(factor_t: int, first_chunk: bool, ci
     # Deferred conv bias: the gather adds it before the shortcut, bit-identical to the
     # reference gather of the unbiased conv output followed by the eager bias add.
     temp_nb = F.conv2d(x4, packed, None, padding=1).contiguous(memory_format=torch.channels_last)
-    got_nb = upsample_gather_cuda(temp_nb, residual, b, frames, factor_t, dup.repeats, crop, bias=bias)
-    ref_nb = upsample_gather_reference(temp_nb, b, frames, dup(residual, first_chunk=first_chunk), bias=bias)
+    got_nb = upsample_gather_cuda(
+        temp_nb, residual, b, frames, factor_t, dup.repeats, crop, bias=bias
+    )
+    ref_nb = upsample_gather_reference(
+        temp_nb, b, frames, dup(residual, first_chunk=first_chunk), bias=bias
+    )
     assert torch.equal(got_nb, ref_nb)
-    assert torch.equal(upsample_gather_cuda(temp_nb, None, b, frames, bias=bias), upsample_gather_reference(temp_nb, b, frames, bias=bias))
+    assert torch.equal(
+        upsample_gather_cuda(temp_nb, None, b, frames, bias=bias),
+        upsample_gather_reference(temp_nb, b, frames, bias=bias),
+    )
 
     # Against the original upsample + 3x3 conv the only difference is the packed weights
     # rounding the summed taps once more: last-bit noise, never a mapping-sized error.
     diff = (got.float() - eager.float()).abs()
-    assert (diff.norm() / eager.float().norm()).item() < 5e-3  # one extra bf16 rounding of the summed taps
+    assert (
+        diff.norm() / eager.float().norm()
+    ).item() < 5e-3  # one extra bf16 rounding of the summed taps
     assert diff.max().item() <= 2**-6 * eager.float().abs().max().item()
 
 
@@ -325,7 +380,9 @@ from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E
     wino_norm_silu_reference,
 )
 
-wino_op = pytest.mark.skipif(not cuda_wino_available(), reason="trtllm::vae_wino_norm_silu not built")
+wino_op = pytest.mark.skipif(
+    not cuda_wino_available(), reason="trtllm::vae_wino_norm_silu not built"
+)
 
 
 @wino_op
@@ -333,7 +390,9 @@ wino_op = pytest.mark.skipif(not cuda_wino_available(), reason="trtllm::vae_wino
 @pytest.mark.parametrize("cache_frames", [0, 1, 2])
 @pytest.mark.parametrize("source", ["x", "m"])
 @pytest.mark.parametrize("extras", ["plain", "residual_bias"])
-def test_wino_norm_silu_reference_mode_is_bitwise(C: int, cache_frames: int, source: str, extras: str) -> None:
+def test_wino_norm_silu_reference_mode_is_bitwise(
+    C: int, cache_frames: int, source: str, extras: str
+) -> None:
     gen = torch.Generator(device="cuda").manual_seed(C + cache_frames)
     T, P = 4, 9 * 13
     bf = torch.bfloat16
@@ -341,12 +400,20 @@ def test_wino_norm_silu_reference_mode_is_bitwise(C: int, cache_frames: int, sou
     x = rnd(T, P, C) if source == "x" else None
     m = [rnd(T // 2, P, C) for _ in range(4)] if source == "m" else None
     residual = rnd(T, P, C) if extras == "residual_bias" else None
-    in_bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf) if extras == "residual_bias" else None
+    in_bias = (
+        (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+        if extras == "residual_bias"
+        else None
+    )
     cache = rnd(cache_frames, P, C) if cache_frames else None
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
     scale = C**0.5
-    s_ref, tail_ref, d_ref = wino_norm_silu_reference(x, m, residual, in_bias, cache, gamma, 0.0, scale)
-    s, tail, d = wino_norm_silu_cuda(x, m, residual, in_bias, cache, gamma, None, scale, T, reference_rounding=True)
+    s_ref, tail_ref, d_ref = wino_norm_silu_reference(
+        x, m, residual, in_bias, cache, gamma, 0.0, scale
+    )
+    s, tail, d = wino_norm_silu_cuda(
+        x, m, residual, in_bias, cache, gamma, None, scale, T, reference_rounding=True
+    )
     if residual is not None:
         assert torch.equal(s, s_ref), "sum must be bit-identical to the eager adds"
     # The normalized frames (cache) and the slabs match eager up to the fp32 reduction
@@ -385,7 +452,9 @@ from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E
     wino_combine_reference,
 )
 
-frame_ops = pytest.mark.skipif(not cuda_frame_ops_available(), reason="trtllm::vae_wino_combine not built")
+frame_ops = pytest.mark.skipif(
+    not cuda_frame_ops_available(), reason="trtllm::vae_wino_combine not built"
+)
 
 
 @frame_ops
@@ -421,7 +490,11 @@ def test_interleave_bias_is_bitwise(C: int, with_bias: bool) -> None:
     gen = torch.Generator(device="cuda").manual_seed(C)
     T, P = 3, 9 * 13
     u = torch.randn(T, P, 2 * C, generator=gen, device="cuda").to(torch.bfloat16)
-    bias = (0.3 * torch.randn(2 * C, generator=gen, device="cuda")).to(torch.bfloat16) if with_bias else None
+    bias = (
+        (0.3 * torch.randn(2 * C, generator=gen, device="cuda")).to(torch.bfloat16)
+        if with_bias
+        else None
+    )
     assert torch.equal(interleave_bias_cuda(u, bias), interleave_bias_reference(u, bias))
 
 
@@ -437,15 +510,47 @@ def test_avg_down_add_matches_eager(cin_cout_ft: tuple[int, int, int], frames: i
     gen = torch.Generator(device="cuda").manual_seed(cin + frames)
     h, w = 12, 20
     bf = torch.bfloat16
-    r = torch.randn(1, cin, frames, h, w, generator=gen, device="cuda").to(bf).to(memory_format=torch.channels_last_3d)
+    r = (
+        torch.randn(1, cin, frames, h, w, generator=gen, device="cuda")
+        .to(bf)
+        .to(memory_format=torch.channels_last_3d)
+    )
     dup = AvgDown3D(cin, cout, factor_t=ft, factor_s=2)
     ref_avg = dup(r)
-    x = torch.randn(ref_avg.shape, generator=gen, device="cuda").to(bf).to(memory_format=torch.channels_last_3d)
+    x = (
+        torch.randn(ref_avg.shape, generator=gen, device="cuda")
+        .to(bf)
+        .to(memory_format=torch.channels_last_3d)
+    )
     ref = x + ref_avg
     pad_t = (ft - frames % ft) % ft
     got = avg_down_add_cuda(
-        r.new_empty(0) if False else x.permute(0, 2, 3, 4, 1).reshape(x.shape[2], h // 2 * (w // 2), cout),
-        r.permute(0, 2, 3, 4, 1).reshape(frames, h * w, cin), h // 2, w // 2, w, ft, 2, dup.group_size, pad_t,
+        r.new_empty(0)
+        if False
+        else x.permute(0, 2, 3, 4, 1).reshape(x.shape[2], h // 2 * (w // 2), cout),
+        r.permute(0, 2, 3, 4, 1).reshape(frames, h * w, cin),
+        h // 2,
+        w // 2,
+        w,
+        ft,
+        2,
+        dup.group_size,
+        pad_t,
     )
     got = got.view(1, x.shape[2], h // 2, w // 2, cout).permute(0, 4, 1, 2, 3)
     assert torch.equal(got, ref), "group size 4 means the mean is exact: bitwise with eager"
+
+
+from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import rms_norm_reference  # noqa: E402
+
+
+@cuda_op
+@pytest.mark.parametrize("C", [1024, 640, 256])
+@pytest.mark.parametrize("reference", [True, False])
+def test_cuda_norm_without_activation(C: int, reference: bool) -> None:
+    x, gamma, _ = _inputs(C, frames=2, hw=(9, 13))
+    expected = rms_norm_reference(x, gamma, C**0.5)
+    actual = rms_norm_silu_cuda(x, gamma, None, C**0.5, reference_rounding=reference, silu=False)
+    ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
+    mismatched = ((actual.float() - expected.float()).abs() > ulp).float().mean().item()
+    assert mismatched < (1e-3 if reference else 5e-2)

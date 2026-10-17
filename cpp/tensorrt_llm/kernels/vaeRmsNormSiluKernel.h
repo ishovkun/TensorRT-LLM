@@ -17,8 +17,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -39,9 +39,10 @@ constexpr int kVaeRmsNormSiluMaxChannels = 2048;
 //              added first as round_bf16(x + inBias), identical to the eager bias add.
 // residual/sum: optional (both null or both set). With them, the normalized row is
 // s = round_bf16(x + residual) and s is written to ``sum`` for the next block.
+// activation=false: RMSNorm only (y = x / max(||x||, eps) * scale * gamma); plain form only.
 void launchVaeRmsNormSilu(void const* x, void* y, void const* gamma, void const* bias, void const* inBias,
     void const* residual, void* sum, int64_t numRows, int channels, float scale, float eps, bool referenceRounding,
-    cudaStream_t stream);
+    cudaStream_t stream, bool activation = true);
 
 } // namespace kernels
 

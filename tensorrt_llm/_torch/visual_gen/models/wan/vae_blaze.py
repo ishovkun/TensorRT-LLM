@@ -124,6 +124,10 @@ class VaeBlazeOptions:
     # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
     # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
     conv_slabs: bool = False
+    # Attention block: fused RMSNorm (no activation), the two 1x1 convs as GEMMs with the
+    # bias in the epilogue on the row view (no permute/contiguous copy), and the residual
+    # add handed to the next block's norm as a PendingAdd.
+    fused_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.norm_mode not in ("fp32", "reference"):
@@ -144,6 +148,15 @@ class VaeBlazeOptions:
         if unknown:
             raise ValueError(f"Unknown VaeBlazeOptions: {sorted(unknown)}; valid: {sorted(valid)}")
         return cls(**values)
+
+    @property
+    def use_attention(self) -> bool:
+        return (
+            self.fused_attention
+            and self.fused_norm
+            and self.norm_kernel == "cuda"
+            and cuda_op_available()
+        )
 
     @property
     def use_slabs(self) -> bool:
@@ -1013,6 +1026,49 @@ class BlazeResidualBlock(nn.Module):
         return (out, x_in) if return_input else out
 
 
+class BlazeAttentionBlock(WanAttentionBlock):
+    """The mid-block attention with the norm, projections and residual add fused."""
+
+    def __init__(self, dim: int, options: VaeBlazeOptions | None = None) -> None:
+        super().__init__(dim)
+        self.options = options or VaeBlazeOptions()
+
+    def forward(self, x: "torch.Tensor | PendingAdd") -> "torch.Tensor | PendingAdd":  # type: ignore[override]
+        x = _tensor(x)
+        if not (
+            self.options.use_attention
+            and x.shape[0] == 1
+            and x.dtype == torch.bfloat16
+            and x.is_cuda
+            and can_use_cuda_rms_norm_silu(x)
+        ):
+            return super().forward(x)
+        residual = _channels_last_3d_if_needed(x)
+        _, channels, frames, height, width = residual.shape
+        positions = height * width
+        # The GEMMs run on the channels-last row view [T*H*W, C], which is also SDPA's layout.
+        normed = rms_norm_silu_cuda(
+            residual,
+            self.norm.gamma,
+            None,
+            self.norm.scale,
+            reference_rounding=self.options.norm_mode == "reference",
+            silu=False,
+        )
+        normed_rows = frames_view(normed).reshape(frames * positions, channels)
+        w_qkv = self.to_qkv.weight.reshape(3 * channels, channels)
+        qkv = torch.addmm(self.to_qkv.bias, normed_rows, w_qkv.t())  # bias in the GEMM epilogue
+        qkv = qkv.view(frames, 1, positions, 3 * channels)
+        q, k, v = qkv.chunk(3, dim=-1)
+        attn = F.scaled_dot_product_attention(q, k, v)  # [T, 1, HW, C]
+        attn_rows = attn.reshape(frames * positions, channels)
+        w_proj = self.proj.weight.reshape(channels, channels)
+        proj_rows = torch.mm(attn_rows, w_proj.t())
+        proj = frames_to_video(proj_rows.view(frames, positions, channels), height, width)
+        # x + residual (+ the proj bias) is added by the consumer's norm kernel.
+        return PendingAdd(proj, residual, self.proj.bias)
+
+
 def _run_resnets(
     resnets: nn.ModuleList,
     x: "torch.Tensor | PendingAdd",
@@ -1059,7 +1115,7 @@ class BlazeMidBlock(nn.Module):
         resnets = [BlazeResidualBlock(dim, dim, dropout, non_linearity, options)]
         attentions = []
         for _ in range(num_layers):
-            attentions.append(WanAttentionBlock(dim))
+            attentions.append(BlazeAttentionBlock(dim, options))
             resnets.append(BlazeResidualBlock(dim, dim, dropout, non_linearity, options))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -1071,10 +1127,11 @@ class BlazeMidBlock(nn.Module):
         feat_cache: list[torch.Tensor | str | None] | None = None,
         feat_idx: list[int] | None = None,
     ) -> torch.Tensor:
-        # Attention consumes a plain tensor, so only the last block's bias is deferred.
+        # The fused attention block returns its residual add as a PendingAdd for the next
+        # norm; the plain one needs a materialized tensor.
         x = self.resnets[0](x, feat_cache=feat_cache, feat_idx=feat_idx, defer_output_bias=False)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
-            x = attn(_tensor(x))
+            x = attn(x)
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx, defer_output_bias=True)
         return x
 

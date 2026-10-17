@@ -89,6 +89,14 @@ OPTION_SETS = [
     {"first_frame_conv2d": True},
     {"fused_norm": True, "winograd_temporal": True},
     {"fused_norm": True, "conv_slabs": True},
+    {"fused_norm": True, "fused_attention": True},
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_bias": True,
+        "fused_attention": True,
+        "norm_mode": "reference",
+    },
     {
         "fused_norm": True,
         "fused_residual": True,
