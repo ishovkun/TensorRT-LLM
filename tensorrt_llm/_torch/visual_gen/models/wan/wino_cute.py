@@ -1020,15 +1020,32 @@ def wino_persistent_kernel(
                                 tmp.store(own0.load().to(IO_DTYPE))
                             else:
                                 tmp.store(own1.load().to(IO_DTYPE))
-                        for u in cutlass.range_constexpr(4):
-                            vi = (
-                                cute.make_tensor(tmp.iterator + 8 * u, oct_)
-                                .load()
-                                .bitcast(cutlass.Int32)
+                        # Register transposition: lane L stores row 8k + L // 4, 16-byte unit L % 4, so
+                        # each warp store covers eight full 64-byte rows (coalesced on the cluster fabric).
+                        words = tmp.load().bitcast(cutlass.Int32)
+                        unit = lane % 4
+                        for k in cutlass.range_constexpr(4):
+                            src_lane = 8 * k + lane // 4
+                            vals = []
+                            for w in cutlass.range_constexpr(4):
+                                c0 = cute.arch.shuffle_sync_op(words[0 * 4 + w], src_lane)
+                                c1 = cute.arch.shuffle_sync_op(words[1 * 4 + w], src_lane)
+                                c2 = cute.arch.shuffle_sync_op(words[2 * 4 + w], src_lane)
+                                c3 = cute.arch.shuffle_sync_op(words[3 * 4 + w], src_lane)
+                                sel = c0
+                                if unit == 1:
+                                    sel = c1
+                                elif unit == 2:
+                                    sel = c2
+                                elif unit == 3:
+                                    sel = c3
+                                vals.append(sel)
+                            vv = (vals[0], vals[1], vals[2], vals[3])
+                            grow = quarter * 32 + src_lane
+                            d0 = (recv_ptr + (rbase + grow * 32 + unit * 8)).align(16)
+                            d1 = (recv_ptr + (rbase + P_SLOT_ELEMS + grow * 32 + unit * 8)).align(
+                                16
                             )
-                            vv = (vi[0], vi[1], vi[2], vi[3])
-                            d0 = (recv_ptr + (rbase + row_m * 32 + u * 8)).align(16)
-                            d1 = (recv_ptr + (rbase + P_SLOT_ELEMS + row_m * 32 + u * 8)).align(16)
                             if pas == 0:
                                 if x_row == 0:
                                     cute.arch.store_async_dsmem(d0, vv, recv_b, 1 * P_PAIR + v_half)
