@@ -15,14 +15,12 @@ import atexit
 import bisect
 import datetime as dt
 import json
-import os
 import platform
 import re
 import statistics
 import subprocess
 import sys
 import time
-from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -58,16 +56,34 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     "t2i_1024": (1, 1024, 1024),
     "t2v_720p_189f": (189, 720, 1280),
     "edge_480p_121f": (121, 480, 832),
+    # Cosmos3-Nano-Sim-Bimanual streaming decode: 901 pixel frames = 226 latent frames,
+    # decoded 2 latent frames (8 pixel frames) per step after a 1-frame cold start.
+    "bimanual_480x832_901f": (901, 480, 832),
 }
+# Decoder temporal chunk size (latent frames per call) a shape is decoded with when the
+# command line does not override it.
+SHAPE_DECODE_CHUNK: dict[str, int] = {"bimanual_480x832_901f": 2}
 
 _L2_FLUSH_BYTES = 128 * 1024 * 1024
 _l2_flush: torch.Tensor | None = None
 
 _CATEGORY_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("attention", re.compile(r"fmha|flash|sdpa|attention", re.I)),
-    ("conv", re.compile(r"cudnn|conv|gemm|cutlass|implicit|xmma|nhwc|nchw|wgrad|dgrad|sm\d+_", re.I)),
-    ("copy", re.compile(r"CatArray|copy|pad|index|gather|scatter|transpose|permute|contiguous", re.I)),
-    ("norm_act", re.compile(r"reduce|norm|silu|sigmoid|Mul|Add|Div|Sub|elementwise|unrolled|vectorized|clamp|exp|upsample|nearest", re.I)),
+    (
+        "conv",
+        re.compile(r"cudnn|conv|gemm|cutlass|implicit|xmma|nhwc|nchw|wgrad|dgrad|sm\d+_", re.I),
+    ),
+    (
+        "copy",
+        re.compile(r"CatArray|copy|pad|index|gather|scatter|transpose|permute|contiguous", re.I),
+    ),
+    (
+        "norm_act",
+        re.compile(
+            r"reduce|norm|silu|sigmoid|Mul|Add|Div|Sub|elementwise|unrolled|vectorized|clamp|exp|upsample|nearest",
+            re.I,
+        ),
+    ),
 ]
 
 
@@ -82,7 +98,9 @@ def _classify(name: str | None) -> str:
 
 def _git_sha(repo: Path) -> str:
     try:
-        return subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--short=12", "HEAD"], text=True).strip()
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--short=12", "HEAD"], text=True
+        ).strip()
     except Exception:
         return "unknown"
 
@@ -122,7 +140,12 @@ def _reference_state_dict(seed: int) -> dict[str, torch.Tensor]:
     return {k: v.detach().clone() for k, v in model.state_dict().items()}
 
 
-def _build(backend: str, state_dict: dict[str, torch.Tensor], dtype: torch.dtype, blaze_opts: dict[str, Any]) -> torch.nn.Module:
+def _build(
+    backend: str,
+    state_dict: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+    blaze_opts: dict[str, Any],
+) -> torch.nn.Module:
     if backend == "diffusers" or backend in VLLM_BACKENDS:
         from diffusers import AutoencoderKLWan
 
@@ -142,7 +165,10 @@ def _build(backend: str, state_dict: dict[str, torch.Tensor], dtype: torch.dtype
     if backend in VLLM_BACKENDS:
         # Vendored vLLM-Omni fast path (benchmarks/visual_gen/third_party); rebinds
         # the Diffusers module forwards in place, so decode()/encode() stay the same.
-        from vllm_omni_wan_fastpath import install_wan_vae_encoder_fastpath, install_wan_vae_fastpath
+        from vllm_omni_wan_fastpath import (
+            install_wan_vae_encoder_fastpath,
+            install_wan_vae_fastpath,
+        )
 
         level = VLLM_BACKENDS[backend]
         dec = install_wan_vae_fastpath(model, level=level)
@@ -153,11 +179,16 @@ def _build(backend: str, state_dict: dict[str, torch.Tensor], dtype: torch.dtype
         }
         for part, rep_ in model._bench_fastpath.items():
             if not rep_["installed"]:
-                print(f"    [vllm-omni] {part} fast path NOT installed: {rep_['reason']}", file=sys.stderr)
+                print(
+                    f"    [vllm-omni] {part} fast path NOT installed: {rep_['reason']}",
+                    file=sys.stderr,
+                )
     return model
 
 
-def _make_op(model: torch.nn.Module, backend: str, op: str, inp: torch.Tensor, decode_chunk: int) -> Callable[[], torch.Tensor]:
+def _make_op(
+    model: torch.nn.Module, backend: str, op: str, inp: torch.Tensor, decode_chunk: int
+) -> Callable[[], torch.Tensor]:
     if op == "decode":
         if backend == "diffusers" or backend in VLLM_BACKENDS:
             return lambda: model.decode(inp, return_dict=False)[0]
@@ -181,11 +212,16 @@ def _try_capture(run_fn: Callable[[], torch.Tensor]) -> torch.cuda.CUDAGraph | N
         return graph
     except Exception as exc:  # capture-incompatible backend: fall back to eager replay
         torch.cuda.synchronize()
-        print(f"    [graph] capture failed, timing eager: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"    [graph] capture failed, timing eager: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return None
 
 
-def _time_cupti(run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: bool) -> dict[str, Any]:
+def _time_cupti(
+    run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: bool
+) -> dict[str, Any]:
     from cupti import cupti
 
     with torch.inference_mode():
@@ -209,7 +245,11 @@ def _time_cupti(run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: b
 
     def _buf_completed(activities):
         for a in activities:
-            if a.kind in (cupti.ActivityKind.CONCURRENT_KERNEL, cupti.ActivityKind.MEMCPY, cupti.ActivityKind.MEMSET):
+            if a.kind in (
+                cupti.ActivityKind.CONCURRENT_KERNEL,
+                cupti.ActivityKind.MEMCPY,
+                cupti.ActivityKind.MEMSET,
+            ):
                 name = a.name if a.kind == cupti.ActivityKind.CONCURRENT_KERNEL else None
                 kernels.append((a.start, a.end, a.correlation_id, name))
             elif a.kind in (cupti.ActivityKind.RUNTIME, cupti.ActivityKind.DRIVER):
@@ -244,8 +284,8 @@ def _time_cupti(run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: b
     corr_to_kernels: dict[int, list[tuple[int, int, int, str | None]]] = {}
     for k in kernels:
         corr_to_kernels.setdefault(k[2], []).append(k)
-    sorted_launches = sorted(launches, key=lambda l: l[0])
-    launch_starts = [l[0] for l in sorted_launches]
+    sorted_launches = sorted(launches, key=lambda e: e[0])
+    launch_starts = [e[0] for e in sorted_launches]
     kernels_by_start = sorted(kernels, key=lambda k: k[0])
     kernel_starts = [k[0] for k in kernels_by_start]
 
@@ -284,7 +324,12 @@ def _time_cupti(run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: b
     def _stats(values: list[float]) -> dict[str, float]:
         ordered = sorted(values)
         p90 = ordered[min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))]
-        return {"median_us": statistics.median(values), "p90_us": p90, "min_us": ordered[0], "max_us": ordered[-1]}
+        return {
+            "median_us": statistics.median(values),
+            "p90_us": p90,
+            "min_us": ordered[0],
+            "max_us": ordered[-1],
+        }
 
     top = sorted(kernel_ns.items(), key=lambda kv: -kv[1])[:15]
     return {
@@ -337,16 +382,39 @@ def _parse_blaze_opts(text: str) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--label", required=True, help="ladder step name, e.g. baseline, fused_norm")
-    parser.add_argument("--backends", default="native,blaze,diffusers,vllm_lossless,vllm_channels_last",
-                        help="native runs first so every other backend gets a vs_native accuracy row")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--label", required=True, help="ladder step name, e.g. baseline, fused_norm"
+    )
+    parser.add_argument(
+        "--backends",
+        default="native,blaze,diffusers,vllm_lossless,vllm_channels_last",
+        help="native runs first so every other backend gets a vs_native accuracy row",
+    )
     parser.add_argument("--shapes", default=",".join(SHAPES))
     parser.add_argument("--ops", default="decode,encode")
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
-    parser.add_argument("--ref-dtype", default="float32", choices=["float32", "none"], help="Diffusers accuracy reference dtype; none skips")
+    parser.add_argument(
+        "--ref-dtype",
+        default="float32",
+        choices=["float32", "none"],
+        help="Diffusers accuracy reference dtype; none skips",
+    )
     parser.add_argument("--blaze-opts", default="", help="comma list, e.g. fused_norm=1")
-    parser.add_argument("--decode-chunk", type=int, default=1, help="temporal_chunk_size for native/blaze decode")
+    parser.add_argument(
+        "--decode-chunk",
+        type=int,
+        default=0,
+        help="temporal_chunk_size for native/blaze decode (0: per-shape default, 1 unless the shape says otherwise)",
+    )
+    parser.add_argument(
+        "--step-latency",
+        action="store_true",
+        help="also time one steady-state streaming decode step: decode(1 + chunk latent frames) minus "
+        "decode(1), and the cold-start decode(1)",
+    )
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1234)
@@ -393,7 +461,7 @@ def main() -> None:
         "diffusers": diffusers.__version__,
         "dtype": args.dtype,
         "blaze_opts": blaze_opts,
-        "decode_chunk": args.decode_chunk,
+        "decode_chunk": args.decode_chunk or "per-shape",
         "iters": args.iters,
         "warmup": args.warmup,
         "cudnn_benchmark": args.cudnn_benchmark,
@@ -410,31 +478,47 @@ def main() -> None:
         gen = torch.Generator(device="cuda").manual_seed(args.seed)
         inputs = {
             "decode": torch.randn(_latent_shape(T, H, W), generator=gen, device="cuda").to(dtype),
-            "encode": (torch.rand(_pixel_shape(T, H, W), generator=gen, device="cuda") * 2 - 1).to(dtype),
+            "encode": (torch.rand(_pixel_shape(T, H, W), generator=gen, device="cuda") * 2 - 1).to(
+                dtype
+            ),
         }
+        decode_chunk = args.decode_chunk or SHAPE_DECODE_CHUNK.get(shape_name, 1)
         for op in ops:
             if op not in inputs:
                 raise ValueError(op)
             inp = inputs[op]
-            print(f"\n=== {shape_name} {op} input={tuple(inp.shape)} ===", flush=True)
+            print(
+                f"\n=== {shape_name} {op} input={tuple(inp.shape)} chunk={decode_chunk} ===",
+                flush=True,
+            )
 
             reference: torch.Tensor | None = None
             native_out: torch.Tensor | None = None
             if not args.skip_accuracy and args.ref_dtype != "none":
                 model = _build("diffusers", state_dict, torch.float32, {})
                 with torch.inference_mode():
-                    reference = _make_op(model, "diffusers", op, inp.float(), args.decode_chunk)().float().cpu()
+                    reference = (
+                        _make_op(model, "diffusers", op, inp.float(), decode_chunk)().float().cpu()
+                    )
                 del model
                 torch.cuda.empty_cache()
 
             for backend in backends:
                 t_start = time.time()
                 model = _build(backend, state_dict, dtype, blaze_opts if backend == "blaze" else {})
-                run_fn = _make_op(model, backend, op, inp, args.decode_chunk)
+                run_fn = _make_op(model, backend, op, inp, decode_chunk)
 
-                row: dict[str, Any] = {"backend": backend, "shape": shape_name, "op": op, "input_shape": list(inp.shape)}
+                row: dict[str, Any] = {
+                    "backend": backend,
+                    "shape": shape_name,
+                    "op": op,
+                    "input_shape": list(inp.shape),
+                    "decode_chunk": decode_chunk,
+                }
                 if hasattr(model, "_bench_fastpath"):
-                    row["fastpath"] = model._bench_fastpath[{"decode": "decoder", "encode": "encoder"}[op]]
+                    row["fastpath"] = model._bench_fastpath[
+                        {"decode": "decoder", "encode": "encoder"}[op]
+                    ]
                 if not args.skip_accuracy:
                     torch.cuda.reset_peak_memory_stats()
                     with torch.inference_mode():
@@ -451,15 +535,45 @@ def main() -> None:
                         row["vs_native"] = _metrics(out_cpu, native_out)
                     del out
 
-                row["timing"] = _time_cupti(run_fn, args.warmup, args.iters, use_graph=not args.no_graph)
+                row["timing"] = _time_cupti(
+                    run_fn, args.warmup, args.iters, use_graph=not args.no_graph
+                )
+                if args.step_latency and op == "decode" and inp.shape[2] >= 1 + 2 * decode_chunk:
+                    # Streaming step latency: the difference between decoding 1 + k*chunk and
+                    # 1 + (k-1)*chunk latent frames is one steady-state step (the clip-level
+                    # graph hides per-call costs, so this is the number a streaming consumer sees).
+                    def med(n: int, m: torch.nn.Module = model) -> float:
+                        sub = inp[:, :, :n].contiguous(memory_format=torch.channels_last_3d)
+                        fn = _make_op(m, backend, op, sub, decode_chunk)
+                        return (
+                            _time_cupti(fn, args.warmup, args.iters, use_graph=not args.no_graph)[
+                                "span"
+                            ]["median_us"]
+                            / 1e3
+                        )
+
+                    cold = med(1)
+                    one = med(1 + decode_chunk)
+                    two = med(1 + 2 * decode_chunk)
+                    row["step_latency"] = {
+                        "chunk_latent_frames": decode_chunk,
+                        "cold_start_ms": cold,
+                        "step_ms": one - cold,
+                        "step_ms_check": two - one,
+                    }
+                    print(
+                        f"    step latency: cold start {cold:.2f} ms, steady step ({decode_chunk} latent frames) "
+                        f"{one - cold:.2f} ms (check {two - one:.2f} ms)",
+                        flush=True,
+                    )
                 row["setup_s"] = time.time() - t_start
                 results.append(row)
 
                 t = row["timing"]
                 acc = row.get("vs_ref_fp32", {})
                 print(
-                    f"  {backend:9s} graph={str(t['graph']):5s} span med {t['span']['median_us']/1e3:9.2f} ms "
-                    f"p90 {t['span']['p90_us']/1e3:9.2f} ms  wall med {t['wall']['median_us']/1e3:9.2f} ms  "
+                    f"  {backend:9s} graph={str(t['graph']):5s} span med {t['span']['median_us'] / 1e3:9.2f} ms "
+                    f"p90 {t['span']['p90_us'] / 1e3:9.2f} ms  wall med {t['wall']['median_us'] / 1e3:9.2f} ms  "
                     f"kernels/iter {t['kernels_per_iter']:.0f}  "
                     + (f"rel_l2 {acc['rel_l2']:.3e} max_abs {acc['max_abs']:.3e}" if acc else ""),
                     flush=True,
