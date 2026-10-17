@@ -324,6 +324,45 @@ def winograd_weights(weight: torch.Tensor) -> list[torch.Tensor]:
     return [g.to(weight.dtype).contiguous(memory_format=torch.channels_last) for g in gs]
 
 
+# F(2x2, 3x3) spatial transform constants (Lavin & Gray); fp32, moved to the device once.
+_WINO_G = torch.tensor(
+    [[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]], dtype=torch.float32
+)
+
+
+def winograd_spatial_weights(weight: torch.Tensor) -> torch.Tensor:
+    """``[Cout, Cin, 3, 3, 3]`` -> ``U [64, Cin, Cout]``: the four temporal components of
+    :func:`winograd_weights`, each transformed as ``G g G^T`` (fp32, rounded once), ordered
+    ``component * 16 + row * 4 + col`` to match ``trtllm::vae_wino_spatial_in``."""
+    g0, g1, g2 = (weight[:, :, i].detach().float() for i in range(3))
+    comps = torch.stack([g0, (g0 + g1 + g2) / 2, (g0 - g1 + g2) / 2, g2])  # [4, Cout, Cin, 3, 3]
+    gm = _WINO_G.to(weight.device)
+    u = torch.einsum("xa,noiab,yb->nxyoi", gm, comps, gm)  # [4, 4, 4, Cout, Cin]
+    cout, cin = weight.shape[:2]
+    return u.reshape(64, cout, cin).transpose(1, 2).contiguous().to(weight.dtype)
+
+
+def cuda_wino_spatial_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_spatial_in")
+
+
+def wino_spatial_conv_cuda(
+    d: torch.Tensor, u: torch.Tensor, height: int, width: int
+) -> torch.Tensor:
+    """3x3 conv (padding 1) of the four slabs by their four filters as spatial Winograd:
+    ``D [4, pairs, H*W, Cin]`` -> ``M [4, pairs, H*W, Cout]`` (bias-free, fp32 accumulate).
+    Input transform and output transform are CUDA kernels; the 64 GEMMs are one
+    cuBLAS batched call."""
+    comps, pairs, positions, cin = d.shape
+    frames = d.view(comps * pairs, height, width, cin)
+    tile_rows = (height + 1) // 2
+    v = torch.ops.trtllm.vae_wino_spatial_in(frames, comps, 0, tile_rows)
+    m = torch.bmm(v, u)
+    out = torch.empty((comps * pairs, height, width, u.shape[2]), dtype=d.dtype, device=d.device)
+    torch.ops.trtllm.vae_wino_spatial_out(m, out, comps, 0, tile_rows)
+    return out.view(comps, pairs, positions, u.shape[2])
+
+
 def frames_view(x: torch.Tensor) -> torch.Tensor:
     """Batch-1 channels-last ``[1, C, T, H, W]`` -> ``[T, H*W, C]`` view (no copy)."""
     _, c, t, h, w = x.shape
@@ -430,7 +469,7 @@ def wino_norm_silu_cuda(
     reference_rounding: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/2, P, C]``, cache ``[0..2, P, C]``).
-    Returns ``(sum or None, y_tail [2, P, C], [D0, D1, D2, D3])``."""
+    Returns ``(sum or None, y_tail [2, P, C], D [4, T/2, P, C])``; ``D[k]`` is slab k."""
     s, y_tail, d = torch.ops.trtllm.vae_wino_norm_silu(
         x,
         m,
@@ -443,7 +482,7 @@ def wino_norm_silu_cuda(
         reference_rounding,
         frames,
     )
-    return (s if s.numel() else None), y_tail, list(d)
+    return (s if s.numel() else None), y_tail, d
 
 
 def wino_combine_reference(m: list[torch.Tensor]) -> torch.Tensor:

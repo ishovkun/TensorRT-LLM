@@ -621,3 +621,32 @@ def test_spatial_winograd_transforms(C: int, strip: tuple[int, int], hw: tuple[i
     )
     untouched = torch.cat([out[:, : 2 * row0], out[:, 2 * row1 :]], dim=1)
     assert torch.isnan(untouched.float()).all()
+
+
+@spatial_op
+@pytest.mark.parametrize("cin_cout", [(16, 24), (64, 32)])
+@pytest.mark.parametrize("hw", [(6, 10), (5, 9)])
+def test_spatial_winograd_conv_matches_conv2d(
+    cin_cout: tuple[int, int], hw: tuple[int, int]
+) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        wino_spatial_conv_cuda,
+        winograd_spatial_weights,
+        winograd_weights,
+    )
+
+    torch.manual_seed(1)
+    cin, cout = cin_cout
+    h, w = hw
+    pairs = 3
+    weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
+    d = torch.randn(4, pairs, h * w, cin, device="cuda").to(torch.bfloat16)
+    got = wino_spatial_conv_cuda(d, winograd_spatial_weights(weight), h, w)
+    g = winograd_weights(weight)
+    for k in range(4):
+        ref = F.conv2d(
+            d[k].view(pairs, h, w, cin).permute(0, 3, 1, 2).float(), g[k].float(), None, 1, 1
+        )
+        ref = ref.permute(0, 2, 3, 1).reshape(pairs, h * w, cout)
+        rel = ((got[k].float() - ref).norm() / ref.norm()).item()
+        assert rel < 1e-2, f"component {k}: rel_l2={rel:.2e}"

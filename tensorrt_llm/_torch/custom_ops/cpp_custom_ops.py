@@ -214,8 +214,7 @@ def _register_fake():
         pair = (frames // 2, src.shape[1], src.shape[2])
         full = (frames, src.shape[1], src.shape[2])
         return (src.new_empty(full if residual is not None else (0, )),
-                src.new_empty((2, ) + full[1:]),
-                [src.new_empty(pair) for _ in range(4)])
+                src.new_empty((2, ) + full[1:]), src.new_empty((4, ) + pair))
 
     @torch.library.register_fake("trtllm::vae_wino_combine")
     def _(x, m, bias, residual, frames, height, width, pad_h, pad_w):

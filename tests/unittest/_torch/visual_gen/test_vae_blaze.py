@@ -88,6 +88,18 @@ OPTION_SETS = [
     {"conv_out_frame_split": 3},
     {"first_frame_conv2d": True},
     {"fused_norm": True, "winograd_temporal": True},
+    {"fused_norm": True, "winograd_temporal": True, "winograd_spatial": "all"},
+    {
+        "fused_norm": True,
+        "fused_residual": True,
+        "fused_upsample": True,
+        "fused_bias": True,
+        "first_frame_conv2d": True,
+        "winograd_temporal": True,
+        "winograd_spatial": "all",
+        "conv_slabs": True,
+        "fused_attention": True,
+    },
     {"fused_norm": True, "conv_slabs": True},
     {"fused_norm": True, "fused_attention": True},
     {

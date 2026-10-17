@@ -42,6 +42,7 @@ from .blaze_kernels import (
     cuda_frame_ops_available,
     cuda_op_available,
     cuda_wino_available,
+    cuda_wino_spatial_available,
     frames_to_video,
     frames_view,
     images_to_pairs,
@@ -55,6 +56,8 @@ from .blaze_kernels import (
     wino_combine_cuda,
     wino_combine_reference,
     wino_norm_silu_cuda,
+    wino_spatial_conv_cuda,
+    winograd_spatial_weights,
     winograd_weights,
 )
 from .wan_vae import (
@@ -120,6 +123,12 @@ class VaeBlazeOptions:
     # frame slabs, the conv runs as four 3x3 conv2d calls, and the next norm kernel
     # combines the four results while reading. Needs fused_norm with the CUDA op.
     winograd_temporal: bool = False
+    # Checklist item 22: spatial Winograd F(2x2,3x3) on top of the temporal one. The four
+    # 3x3 conv2d calls become an input transform, 64 cuBLAS batched GEMMs and an output
+    # transform. It pays only where cuDNN's implicit GEMM is weak (few output pixels per
+    # channel): "auto" uses it on convs with >= 1024 input channels and at most 90x160
+    # pixels, "all" on every Winograd conv (tests), "off" never. Needs winograd_temporal.
+    winograd_spatial: str = "off"
     # Checklist item 9: the convs that still run as 3D with a causal cache (one frame per
     # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
     # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
@@ -137,6 +146,10 @@ class VaeBlazeOptions:
         if self.cudnn_benchmark not in ("off", "on", "auto"):
             raise ValueError(
                 f"cudnn_benchmark must be 'off', 'on' or 'auto', got {self.cudnn_benchmark!r}"
+            )
+        if self.winograd_spatial not in ("off", "auto", "all"):
+            raise ValueError(
+                f"winograd_spatial must be 'off', 'auto' or 'all', got {self.winograd_spatial!r}"
             )
         if self.conv_out_frame_split < 0 or self.conv_out_frame_split in (1, 2):
             raise ValueError("conv_out_frame_split must be 0 (off) or at least 3 input frames")
@@ -174,6 +187,12 @@ class VaeBlazeOptions:
             and self.fused_norm
             and self.norm_kernel == "cuda"
             and cuda_wino_available()
+        )
+
+    @property
+    def use_winograd_spatial(self) -> bool:
+        return (
+            self.winograd_spatial != "off" and self.use_winograd and cuda_wino_spatial_available()
         )
 
     @property
@@ -268,9 +287,11 @@ class PendingAdd:
 
 @dataclass
 class WinoSlabs:
-    """The four transformed input slabs ``D0..D3`` of a Winograd conv, each ``[pairs, C, H, W]`` channels-last."""
+    """The four transformed input slabs ``D0..D3`` of a Winograd conv, each ``[pairs, C, H, W]``
+    channels-last, plus the buffer they are views of as ``[4, pairs, H*W, C]``."""
 
     d: list[torch.Tensor]
+    stacked: torch.Tensor
 
 
 def _pending_like(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
@@ -357,7 +378,7 @@ class BlazeRMSNorm(nn.Module):
             frames,
             reference_rounding=self.options.norm_mode == "reference",
         )
-        slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d])
+        slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d], d)
         return (
             (frames_to_video(s, h, w) if s is not None else None),
             frames_to_video(y_tail, h, w),
@@ -447,6 +468,9 @@ class BlazeCausalConv3d(nn.Conv3d):
         self.first_frame_conv2d = False
         self._weight_2d: tuple[int, int, torch.Tensor] | None = None
         self._wino_w: tuple[int, int, list[torch.Tensor]] | None = None
+        # Spatial Winograd mode for forward_winograd ("off", "auto", "all"), set by the block.
+        self.winograd_spatial = "off"
+        self._wino_u: tuple[int, int, torch.Tensor] | None = None
 
     # ---- frame buffer ("slab") for the causal history -------------------------------
     # The buffer holds [1, C, S, H, W] channels-last frames; frames [pos-2, pos) are the
@@ -563,8 +587,26 @@ class BlazeCausalConv3d(nn.Conv3d):
             and self.groups == 1
         )
 
+    def _winograd_spatial_weights(self) -> torch.Tensor:
+        key = (self.weight.data_ptr(), self.weight._version)
+        if self._wino_u is None or self._wino_u[:2] != key:
+            self._wino_u = (*key, winograd_spatial_weights(self.weight))
+        return self._wino_u[2]
+
+    def spatial_eligible(self, height: int, width: int) -> bool:
+        if self.winograd_spatial == "off" or self.padding[1:] != (1, 1) or self.in_channels % 8:
+            return False
+        if self.winograd_spatial == "all":
+            return True
+        return self.in_channels >= 1024 and height * width <= 90 * 160
+
     def forward_winograd(self, slabs: WinoSlabs) -> list[torch.Tensor]:
-        """Four 3x3 conv2d calls on the transformed slabs; the bias is left to the consumer."""
+        """The four 3x3 convs of the transformed slabs (bias left to the consumer): cuDNN
+        conv2d per slab, or spatial Winograd on all four at once where that is faster."""
+        _, _, h, w = slabs.d[0].shape
+        if self.spatial_eligible(h, w):
+            m = wino_spatial_conv_cuda(slabs.stacked, self._winograd_spatial_weights(), h, w)
+            return [pairs_to_images(m[k], h, w) for k in range(4)]
         g = self._winograd_weights()
         pad = (self.padding[1], self.padding[2])
         return [F.conv2d(slabs.d[k], g[k], None, 1, pad) for k in range(4)]
@@ -1013,6 +1055,8 @@ class BlazeResidualBlock(nn.Module):
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
         residual = self.conv_shortcut(x_in)
+        spatial = self.options.winograd_spatial if self.options.use_winograd_spatial else "off"
+        self.conv1.winograd_spatial = self.conv2.winograd_spatial = spatial
         m1 = self.conv1.forward_winograd(slabs)
 
         idx = feat_idx[0]

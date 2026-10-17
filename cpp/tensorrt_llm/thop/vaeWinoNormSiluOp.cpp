@@ -44,11 +44,10 @@ void const* optionalPtr(std::optional<torch::Tensor> const& t, c10::IntArrayRef 
 // x: [T, P, C] frames, or m: four [T/2, P, C] tensors from the previous Winograd conv.
 // Returns (sum [T, P, C] (the pre-norm frames; empty when the input is a plain x with
 // neither bias nor residual), y_tail [2, P, C], d: four [T/2, P, C]).
-std::tuple<torch::Tensor, torch::Tensor, std::vector<torch::Tensor>> vae_wino_norm_silu(
-    std::optional<torch::Tensor> const& x, std::optional<std::vector<torch::Tensor>> const& m,
-    std::optional<torch::Tensor> const& residual, std::optional<torch::Tensor> const& in_bias,
-    std::optional<torch::Tensor> const& cache, torch::Tensor const& gamma, std::optional<torch::Tensor> const& bias,
-    double scale, bool reference_rounding, int64_t frames)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> vae_wino_norm_silu(std::optional<torch::Tensor> const& x,
+    std::optional<std::vector<torch::Tensor>> const& m, std::optional<torch::Tensor> const& residual,
+    std::optional<torch::Tensor> const& in_bias, std::optional<torch::Tensor> const& cache, torch::Tensor const& gamma,
+    std::optional<torch::Tensor> const& bias, double scale, bool reference_rounding, int64_t frames)
 {
     TORCH_CHECK(x.has_value() != m.has_value(), "exactly one of x and m");
     TORCH_CHECK(frames >= 2 && frames % 2 == 0, "frames must be even and >= 2");
@@ -105,11 +104,11 @@ std::tuple<torch::Tensor, torch::Tensor, std::vector<torch::Tensor>> vae_wino_no
     bool const wantSum = residual.has_value() || in_bias.has_value() || !x.has_value();
     torch::Tensor sum = wantSum ? torch::empty(frameShape, opts) : torch::empty({0}, opts);
     torch::Tensor yTail = torch::empty({2, P, C}, opts);
-    std::vector<torch::Tensor> d;
+    // The four slabs share one buffer, so a consumer can also read them as [4 * pairs, P, C].
+    torch::Tensor d = torch::empty({4, pairShape[0], pairShape[1], pairShape[2]}, opts);
     for (int k = 0; k < 4; ++k)
     {
-        d.push_back(torch::empty(pairShape, opts));
-        ptrs.d[k] = d.back().data_ptr();
+        ptrs.d[k] = d[k].data_ptr();
     }
     ptrs.sum = wantSum ? sum.data_ptr() : nullptr;
     ptrs.yTail = yTail.data_ptr();
@@ -123,7 +122,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "vae_wino_norm_silu(Tensor? x, Tensor[]? m, Tensor? residual, Tensor? in_bias, Tensor? cache, Tensor gamma, "
-        "Tensor? bias, float scale, bool reference_rounding, int frames) -> (Tensor, Tensor, Tensor[])");
+        "Tensor? bias, float scale, bool reference_rounding, int frames) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
