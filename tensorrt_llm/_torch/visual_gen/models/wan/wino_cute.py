@@ -699,17 +699,18 @@ def wino_spatial_conv_fused(
 # a remote mbarrier arrive. Only the kernel start and end use cluster-wide barriers.
 # ---------------------------------------------------------------------------------------
 
-P_TILER_MNK = (256, 128, 32)  # M spans the CTA pair (2-CTA MMA): 128 rows per CTA
+P_TILER_MNK = (256, 128, 64)  # M spans the CTA pair (2-CTA MMA): 128 rows per CTA
 P_INST_MNK = (256, 128, 16)
 P_STAGES = 4
 P_PAIR = 2
+P_CPS = 2  # coordinates per pipeline stage (a stage = 2 coordinates x 64 K)
 P_COORDS = 4
 P_EPI_WARPS = 8
 P_THREADS = 32 * (2 + P_EPI_WARPS)
 P_TMA_WARP = 0
 P_MMA_WARP = 1
 P_AB_ELEMS = (
-    P_STAGES * P_COORDS * (P_TILER_MNK[0] // P_PAIR + P_TILER_MNK[1] // P_PAIR) * P_TILER_MNK[2]
+    P_STAGES * P_CPS * (P_TILER_MNK[0] // P_PAIR + P_TILER_MNK[1] // P_PAIR) * P_TILER_MNK[2]
 )
 P_SLOT_BYTES = 128 * 32 * 2  # one received chunk: 128 rows x 32 cols bf16
 P_SCRATCH_ELEMS = P_EPI_WARPS * 32 * 32  # bf16 per warp: 32 rows x 32 cols
@@ -763,7 +764,7 @@ def wino_persistent_kernel(
 
     smem = utils.SmemAllocator()
     storage = smem.allocate(PersistentSharedStorage)
-    a_elems = P_STAGES * P_COORDS * (P_TILER_MNK[0] // P_PAIR) * P_TILER_MNK[2]
+    a_elems = P_STAGES * P_CPS * (P_TILER_MNK[0] // P_PAIR) * P_TILER_MNK[2]
     sA = storage.smem_ab.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
     sB = cute.make_tensor(
         cute.recast_ptr(storage.smem_ab.data_ptr() + a_elems, swizzle_=b_smem_layout.inner),
@@ -783,7 +784,7 @@ def wino_persistent_kernel(
     # multicast of size 1), never across coordinate rows, whose operands differ.
     tma_bytes = (
         P_PAIR
-        * P_COORDS
+        * P_CPS
         * (
             cute.size_in_bytes(IO_DTYPE, cute.select(a_smem_layout, mode=[0, 1, 2]))
             + cute.size_in_bytes(IO_DTYPE, cute.select(b_smem_layout, mode=[0, 1, 2]))
@@ -855,21 +856,23 @@ def wino_persistent_kernel(
             comp = blk // (n_blocks * m_tiles)
             l_base = comp * 16 + x_row * P_COORDS
             for k_tile in cutlass.range(num_k_tiles):
-                ab_empty = ab_producer.acquire_and_advance()
-                for y in cutlass.range_constexpr(P_COORDS):
-                    slot = ab_empty.index * P_COORDS + y
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA[(None, m_tile, k_tile, l_base + y)],
-                        tAsA[(None, slot)],
-                        tma_bar_ptr=ab_empty.barrier,
-                    )
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB[(None, n_block, k_tile, l_base + y)],
-                        tBsB[(None, slot)],
-                        tma_bar_ptr=ab_empty.barrier,
-                    )
+                for cp in cutlass.range_constexpr(P_COORDS // P_CPS):
+                    ab_empty = ab_producer.acquire_and_advance()
+                    for yy in cutlass.range_constexpr(P_CPS):
+                        y = cp * P_CPS + yy
+                        slot = ab_empty.index * P_CPS + yy
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA[(None, m_tile, k_tile, l_base + y)],
+                            tAsA[(None, slot)],
+                            tma_bar_ptr=ab_empty.barrier,
+                        )
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB[(None, n_block, k_tile, l_base + y)],
+                            tBsB[(None, slot)],
+                            tma_bar_ptr=ab_empty.barrier,
+                        )
             blk += num_clusters
         ab_producer.tail()
 
@@ -884,16 +887,20 @@ def wino_persistent_kernel(
             while blk < num_blocks:
                 acc_pipeline.producer_acquire(acc_state)
                 for k_tile in cutlass.range(num_k_tiles):
-                    ab_full = ab_consumer.wait_and_advance()
-                    for y in cutlass.range_constexpr(P_COORDS):
-                        slot = ab_full.index * P_COORDS + y
-                        acc_y = tCtAcc[(None, None, None, y)]
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
-                        for k_block in cutlass.range(cute.size(tCrA, mode=[2]), unroll_full=True):
-                            coord = (None, None, k_block, slot)
-                            cute.gemm(tiled_mma, acc_y, tCrA[coord], tCrB[coord], acc_y)
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    ab_full.release()
+                    for cp in cutlass.range_constexpr(P_COORDS // P_CPS):
+                        ab_full = ab_consumer.wait_and_advance()
+                        for yy in cutlass.range_constexpr(P_CPS):
+                            y = cp * P_CPS + yy
+                            slot = ab_full.index * P_CPS + yy
+                            acc_y = tCtAcc[(None, None, None, y)]
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
+                            for k_block in cutlass.range(
+                                cute.size(tCrA, mode=[2]), unroll_full=True
+                            ):
+                                coord = (None, None, k_block, slot)
+                                cute.gemm(tiled_mma, acc_y, tCrA[coord], tCrB[coord], acc_y)
+                                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                        ab_full.release()
                 acc_pipeline.producer_commit(acc_state)
                 acc_state.advance()
                 blk += num_clusters
@@ -1152,10 +1159,10 @@ def wino_persistent_host(
     )
     tiled_mma = cute.make_tiled_mma(op)
     a_smem_layout = sm100_utils.make_smem_layout_a(
-        tiled_mma, P_TILER_MNK, IO_DTYPE, P_STAGES * P_COORDS
+        tiled_mma, P_TILER_MNK, IO_DTYPE, P_STAGES * P_CPS
     )
     b_smem_layout = sm100_utils.make_smem_layout_b(
-        tiled_mma, P_TILER_MNK, IO_DTYPE, P_STAGES * P_COORDS
+        tiled_mma, P_TILER_MNK, IO_DTYPE, P_STAGES * P_CPS
     )
     a_one = cute.select(a_smem_layout, mode=[0, 1, 2])
     b_one = cute.select(b_smem_layout, mode=[0, 1, 2])
@@ -1254,7 +1261,7 @@ def wino_spatial_conv_persistent(
         and m_pad % 256 == 0
         and m_pad >= m_valid
         and n % 128 == 0
-        and k % 32 == 0
+        and k % 64 == 0
     )
     pixels = components * pairs * height * width
     num_blocks = (n // 128) * (m_pad // 256) * components
