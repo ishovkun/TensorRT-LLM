@@ -699,10 +699,11 @@ def wino_spatial_conv_fused(
 # a remote mbarrier arrive. Only the kernel start and end use cluster-wide barriers.
 # ---------------------------------------------------------------------------------------
 
-P_TILER_MNK = (256, 128, 64)  # M spans the CTA pair (2-CTA MMA): 128 rows per CTA
-P_INST_MNK = (256, 128, 16)
-P_STAGES = 4
-P_PAIR = 2
+P_PAIR = 2  # 2: 2-CTA MMA across a CTA pair (256-row tile blocks); 1: single-CTA MMA
+P_TILER_MNK = (128 * P_PAIR, 128, 64)  # 128 rows per CTA
+P_INST_MNK = (128 * P_PAIR, 128, 16)
+P_STAGES = 3 if P_PAIR == 2 else 2
+P_CTA_GROUP = tcgen05.CtaGroup.TWO if P_PAIR == 2 else tcgen05.CtaGroup.ONE
 P_CPS = 2  # coordinates per pipeline stage (a stage = 2 coordinates x 64 K)
 P_COORDS = 4
 P_EPI_WARPS = 8
@@ -713,6 +714,8 @@ P_AB_ELEMS = (
     P_STAGES * P_CPS * (P_TILER_MNK[0] // P_PAIR + P_TILER_MNK[1] // P_PAIR) * P_TILER_MNK[2]
 )
 P_SLOT_BYTES = 128 * 32 * 2  # one received chunk: 128 rows x 32 cols bf16
+P_SLOT_ELEMS = 128 * 32
+P_NBUF = 4  # receive buffers: one per (epilogue group, chunk) so all chunks push back to back
 P_SCRATCH_ELEMS = P_EPI_WARPS * 32 * 32  # bf16 per warp: 32 rows x 32 cols
 
 
@@ -720,11 +723,11 @@ P_SCRATCH_ELEMS = P_EPI_WARPS * 32 * 32  # bf16 per warp: 32 rows x 32 cols
 class PersistentSharedStorage:
     ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, P_STAGES * 2]
     acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-    recv_mbar: cutlass.Int64
-    free_mbar: cutlass.Int64
+    recv_mbar: cute.struct.MemRange[cutlass.Int64, P_NBUF]
+    free_mbar: cute.struct.MemRange[cutlass.Int64, P_NBUF]
     tmem_dealloc_mbar: cutlass.Int64
     tmem_holding_buf: cutlass.Int32
-    recv: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, 2 * 128 * 32], 128]
+    recv: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_NBUF * 2 * P_SLOT_ELEMS], 128]
     scratch: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_SCRATCH_ELEMS], 128]
     smem_ab: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, P_AB_ELEMS], 1024]
 
@@ -772,8 +775,8 @@ def wino_persistent_kernel(
     )
     recv_ptr = storage.recv.data_ptr()
     scratch_ptr = storage.scratch.data_ptr()
-    recv_bar = storage.recv_mbar.ptr
-    free_bar = storage.free_mbar.ptr
+    recv_bars = storage.recv_mbar.data_ptr()
+    free_bars = storage.free_mbar.data_ptr()
 
     if warp_idx == P_TMA_WARP:
         cpasync.prefetch_descriptor(tma_atom_a)
@@ -813,9 +816,9 @@ def wino_persistent_kernel(
     n_receivers = cutlass.Int32(1)
     if push_own:
         n_receivers = cutlass.Int32(3)
-    if tidx == 0:
-        cute.arch.mbarrier_init(recv_bar, 1)
-        cute.arch.mbarrier_init(free_bar, n_receivers)
+    if tidx < P_NBUF:
+        cute.arch.mbarrier_init(recv_bars + tidx, 1)
+        cute.arch.mbarrier_init(free_bars + tidx, n_receivers)
     cute.arch.mbarrier_init_fence()
     cute.arch.cluster_arrive_relaxed()
 
@@ -824,7 +827,7 @@ def wino_persistent_kernel(
         storage.tmem_holding_buf.ptr,
         barrier_for_retrieve=tmem_alloc_barrier,
         allocator_warp_id=2,
-        is_two_cta=True,
+        is_two_cta=P_PAIR == 2,
         two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
     )
 
@@ -919,7 +922,6 @@ def wino_persistent_kernel(
         row_m = quarter * 32 + lane
         acc_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
         group_bar = pipeline.NamedBarrier(barrier_id=2 + group, num_threads=128)
-        round_bar = pipeline.NamedBarrier(barrier_id=5, num_threads=32 * P_EPI_WARPS)
 
         epi_tiler = ((128, 32),)
         tmem_atom = cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition.x32), cutlass.Float32)
@@ -955,6 +957,9 @@ def wino_persistent_kernel(
         r2_sel = x_row % 2
         leader = (lane == 0) & (quarter == 0)
         scratch_w = scratch_ptr + epi_warp * (32 * 32)  # this warp's 32x32 bf16 scratch
+        it_par = cutlass.Int32(
+            0
+        )  # parity of the block iteration (receive buffers alternate phases)
         blk = cluster_id
         while blk < num_blocks:
             n_block = blk % n_blocks
@@ -996,132 +1001,126 @@ def wino_persistent_kernel(
             pixel = (frame * height + prow) * width + pcol
             ybase = pixel * cute.size(mY, mode=[1]) + n_block * P_TILER_MNK[1]
 
-            for c in cutlass.range_constexpr(4):
-                # Round c (parity c % 2): the group owning chunk c pushes and receives it; the other idles.
-                if group == c // 2:
-                    # Wait until every receiver has consumed the previous round's slot contents.
-                    cute.arch.mbarrier_wait(free_bar, (c % 2) ^ 1)
-                    if leader:
-                        cute.arch.mbarrier_arrive_and_expect_tx(recv_bar, 2 * P_SLOT_BYTES)
-                    # Pass 0 pushes the other partial sum, pass 1 (rows 1 and 2 only) the own one.
-                    for pas in cutlass.range_constexpr(2):
-                        do_pass = cutlass.Boolean(True) if pas == 0 else push_own
-                        if do_pass:
-                            # Transpose through scratch: thread = row (32 bf16 = 64 B) -> lane = (row, 8-col segment).
-                            src = cute.make_tensor(scratch_w + lane * 32, seg32)
-                            tmp = cute.make_rmem_tensor(seg32, IO_DTYPE)
-                            if pas == 0:
-                                if c % 2 == 0:
-                                    cute.autovec_copy(oth0, tmp)
-                                else:
-                                    cute.autovec_copy(oth1, tmp)
+            # Push both chunks of this group (buffer = group * 2 + chunk, same index on the receiver).
+            for cc in cutlass.range_constexpr(2):
+                buf = group * 2 + cc
+                recv_b = recv_bars + buf
+                free_b = free_bars + buf
+                # The receivers consumed this buffer's previous contents (one block ago).
+                cute.arch.mbarrier_wait(free_b, it_par ^ 1)
+                if leader:
+                    cute.arch.mbarrier_arrive_and_expect_tx(recv_b, 2 * P_SLOT_BYTES)
+                rbase = buf * (2 * P_SLOT_ELEMS)
+                for pas in cutlass.range_constexpr(2):
+                    do_pass = cutlass.Boolean(True) if pas == 0 else push_own
+                    if do_pass:
+                        src = cute.make_tensor(scratch_w + lane * 32, seg32)
+                        tmp = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                        if pas == 0:
+                            if cc == 0:
+                                cute.autovec_copy(oth0, tmp)
                             else:
-                                if c % 2 == 0:
-                                    tmp.store(own0.load().to(IO_DTYPE))
-                                else:
-                                    tmp.store(own1.load().to(IO_DTYPE))
-                            cute.autovec_copy(tmp, src)
-                            cute.arch.sync_warp()
-                            for k in cutlass.range_constexpr(4):
-                                srow = 8 * k + lane // 4
-                                seg = lane % 4
-                                v = cute.make_tensor(
-                                    (scratch_w + (srow * 32 + seg * 8)).align(16), oct_
-                                ).load()
-                                vi = v.bitcast(cutlass.Int32)
-                                vv = (vi[0], vi[1], vi[2], vi[3])
-                                grow = quarter * 32 + srow
-                                d0 = (recv_ptr + (grow * 32 + seg * 8)).align(16)
-                                d1 = (recv_ptr + (128 * 32 + grow * 32 + seg * 8)).align(16)
-                                if pas == 0:
-                                    if x_row == 0:
-                                        cute.arch.store_async_dsmem(
-                                            d0, vv, recv_bar, 1 * P_PAIR + v_half
-                                        )
-                                    elif x_row == 1:
-                                        cute.arch.store_async_dsmem(
-                                            d0, vv, recv_bar, 0 * P_PAIR + v_half
-                                        )
-                                        cute.arch.store_async_dsmem(
-                                            d0, vv, recv_bar, 2 * P_PAIR + v_half
-                                        )
-                                    elif x_row == 2:
-                                        cute.arch.store_async_dsmem(
-                                            d1, vv, recv_bar, 1 * P_PAIR + v_half
-                                        )
-                                        cute.arch.store_async_dsmem(
-                                            d1, vv, recv_bar, 3 * P_PAIR + v_half
-                                        )
-                                    else:
-                                        cute.arch.store_async_dsmem(
-                                            d1, vv, recv_bar, 2 * P_PAIR + v_half
-                                        )
-                                else:
-                                    if x_row == 1:
-                                        cute.arch.store_async_dsmem(
-                                            d0, vv, recv_bar, 3 * P_PAIR + v_half
-                                        )
-                                    else:
-                                        cute.arch.store_async_dsmem(
-                                            d1, vv, recv_bar, 0 * P_PAIR + v_half
-                                        )
-                            cute.arch.sync_warp()
-                    # Receive the two peers' partial sums and combine with the own one.
-                    cute.arch.mbarrier_wait(recv_bar, c % 2)
-                    sa = (
-                        cute.make_tensor((recv_ptr + row_m * 32).align(16), seg32)
-                        .load()
-                        .to(ACC_DTYPE)
-                    )
-                    sb = (
-                        cute.make_tensor((recv_ptr + (128 * 32 + row_m * 32)).align(16), seg32)
-                        .load()
-                        .to(ACC_DTYPE)
-                    )
-                    mine = own0.load()
-                    if c % 2 == 1:
-                        mine = own1.load()
-                    res = (mine + sa) + sb  # r1 = 0: t0 + t1 + t2 (own + lower + higher)
-                    if r1_sel == 1:
-                        res = (sa - mine) - sb  # r1 = 1: t1 - t2 - t3 (lower - own - higher)
-                    out = cute.make_rmem_tensor(seg32, IO_DTYPE)
-                    out.store(res.to(IO_DTYPE))
-                    if valid:
-                        gdst = cute.make_tensor((mY.iterator + (ybase + c * 32)).align(16), seg32)
-                        cute.autovec_copy(out, gdst)
-                    # All 128 threads of the group are done reading the slots: tell the two senders.
-                    group_bar.arrive_and_wait()
-                    if leader:
-                        if x_row == 0:
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
-                            )
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
-                            )
-                        elif x_row == 1:
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=0 * P_PAIR + v_half
-                            )
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
-                            )
-                        elif x_row == 2:
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
-                            )
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=3 * P_PAIR + v_half
-                            )
+                                cute.autovec_copy(oth1, tmp)
                         else:
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
-                            )
-                            cute.arch.mbarrier_arrive(
-                                free_bar, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
-                            )
-                # Both groups step through the rounds in lockstep: one receive barrier, one slot pair.
-                round_bar.arrive_and_wait()
+                            if cc == 0:
+                                tmp.store(own0.load().to(IO_DTYPE))
+                            else:
+                                tmp.store(own1.load().to(IO_DTYPE))
+                        cute.autovec_copy(tmp, src)
+                        cute.arch.sync_warp()
+                        for k in cutlass.range_constexpr(4):
+                            srow = 8 * k + lane // 4
+                            seg = lane % 4
+                            v = cute.make_tensor(
+                                (scratch_w + (srow * 32 + seg * 8)).align(16), oct_
+                            ).load()
+                            vi = v.bitcast(cutlass.Int32)
+                            vv = (vi[0], vi[1], vi[2], vi[3])
+                            grow = quarter * 32 + srow
+                            d0 = (recv_ptr + (rbase + grow * 32 + seg * 8)).align(16)
+                            d1 = (recv_ptr + (rbase + P_SLOT_ELEMS + grow * 32 + seg * 8)).align(16)
+                            if pas == 0:
+                                if x_row == 0:
+                                    cute.arch.store_async_dsmem(d0, vv, recv_b, 1 * P_PAIR + v_half)
+                                elif x_row == 1:
+                                    cute.arch.store_async_dsmem(d0, vv, recv_b, 0 * P_PAIR + v_half)
+                                    cute.arch.store_async_dsmem(d0, vv, recv_b, 2 * P_PAIR + v_half)
+                                elif x_row == 2:
+                                    cute.arch.store_async_dsmem(d1, vv, recv_b, 1 * P_PAIR + v_half)
+                                    cute.arch.store_async_dsmem(d1, vv, recv_b, 3 * P_PAIR + v_half)
+                                else:
+                                    cute.arch.store_async_dsmem(d1, vv, recv_b, 2 * P_PAIR + v_half)
+                            else:
+                                if x_row == 1:
+                                    cute.arch.store_async_dsmem(d0, vv, recv_b, 3 * P_PAIR + v_half)
+                                else:
+                                    cute.arch.store_async_dsmem(d1, vv, recv_b, 0 * P_PAIR + v_half)
+                        cute.arch.sync_warp()
+
+            # Receive, combine with the own fp32 partial sum, store, and free the buffers.
+            for cc in cutlass.range_constexpr(2):
+                buf = group * 2 + cc
+                recv_b = recv_bars + buf
+                rbase = buf * (2 * P_SLOT_ELEMS)
+                cute.arch.mbarrier_wait(recv_b, it_par)
+                sa = (
+                    cute.make_tensor((recv_ptr + (rbase + row_m * 32)).align(16), seg32)
+                    .load()
+                    .to(ACC_DTYPE)
+                )
+                sb = (
+                    cute.make_tensor(
+                        (recv_ptr + (rbase + P_SLOT_ELEMS + row_m * 32)).align(16), seg32
+                    )
+                    .load()
+                    .to(ACC_DTYPE)
+                )
+                mine = own0.load()
+                if cc == 1:
+                    mine = own1.load()
+                res = (mine + sa) + sb  # r1 = 0: t0 + t1 + t2 (own + lower + higher)
+                if r1_sel == 1:
+                    res = (sa - mine) - sb  # r1 = 1: t1 - t2 - t3 (lower - own - higher)
+                out = cute.make_rmem_tensor(seg32, IO_DTYPE)
+                out.store(res.to(IO_DTYPE))
+                if valid:
+                    gdst = cute.make_tensor(
+                        (mY.iterator + (ybase + (2 * group + cc) * 32)).align(16), seg32
+                    )
+                    cute.autovec_copy(out, gdst)
+                # All 128 threads of the group are done reading this buffer: tell the two senders.
+                group_bar.arrive_and_wait()
+                if leader:
+                    free_b = free_bars + buf
+                    if x_row == 0:
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
+                        )
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
+                        )
+                    elif x_row == 1:
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=0 * P_PAIR + v_half
+                        )
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
+                        )
+                    elif x_row == 2:
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
+                        )
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=3 * P_PAIR + v_half
+                        )
+                    else:
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=1 * P_PAIR + v_half
+                        )
+                        cute.arch.mbarrier_arrive(
+                            free_b, peer_cta_rank_in_cluster=2 * P_PAIR + v_half
+                        )
+            it_par = it_par ^ 1
             blk += num_clusters
         # Dealloc tensor memory once every epilogue warp is done.
         pipeline.NamedBarrier(barrier_id=4, num_threads=32 * P_EPI_WARPS).arrive_and_wait()
@@ -1152,7 +1151,7 @@ def wino_persistent_host(
         IO_DTYPE,
         ACC_DTYPE,
         P_INST_MNK,
-        tcgen05.CtaGroup.TWO,
+        P_CTA_GROUP,
         tcgen05.OperandSource.SMEM,
         tcgen05.OperandMajorMode.K,
         tcgen05.OperandMajorMode.K,
@@ -1172,7 +1171,7 @@ def wino_persistent_host(
     cluster_layout_vmnk = cute.tiled_divide(
         cute.make_layout((P_PAIR, P_COORDS, 1)), (tiled_mma.thr_id,)
     )
-    tma_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
+    tma_op = cpasync.CopyBulkTensorTileG2SOp(P_CTA_GROUP)
     a_tma_atom, a_tma_tensor = cute.nvgpu.make_tiled_tma_atom_A(
         tma_op, a, a_one, P_TILER_MNK, tiled_mma, pair_layout_vmnk.shape
     )
@@ -1258,13 +1257,13 @@ def wino_spatial_conv_persistent(
     m_valid = pairs * ntiles
     assert (
         nl == components * 16
-        and m_pad % 256 == 0
+        and m_pad % P_TILER_MNK[0] == 0
         and m_pad >= m_valid
         and n % 128 == 0
         and k % 64 == 0
     )
     pixels = components * pairs * height * width
-    num_blocks = (n // 128) * (m_pad // 256) * components
+    num_blocks = (n // 128) * (m_pad // P_TILER_MNK[0]) * components
     num_clusters = min(_max_active_clusters(), num_blocks)
     out_rows = out.view(pixels, n)
     fn = _compiled_persistent((nl, m_pad, n, k, pixels, num_clusters))
@@ -1347,7 +1346,7 @@ def _main_fused(args) -> None:
     )
     th, tw = (h + 1) // 2, (w + 1) // 2
     m_valid = pairs * th * tw
-    m_pad = (m_valid + 255) // 256 * 256
+    m_pad = (m_valid + 255) // 256 * 256  # multiple of both kernels' tile heights
     v_exact = torch.ops.trtllm.vae_wino_spatial_in(frames, components, 0, th)  # [64, m_valid, cin]
     v = torch.zeros(components * 16, m_pad, cin, dtype=torch.bfloat16, device="cuda")
     v[:, :m_valid] = v_exact
