@@ -14,14 +14,15 @@
  * limitations under the License.
  */
 
-#include "vaeWinoNormSiluKernel.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/packedVector.cuh"
 #include "vaeNormCommon.cuh"
 #include "vaeRmsNormSiluKernel.h"
+#include "vaeWinoNormSiluKernel.h"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -60,64 +61,54 @@ __device__ __forceinline__ float addR(float a, float b)
     return REF ? roundTo<T>(s) : s;
 }
 
-// Per-layout tuning. ``frames``: frames handled per group, always whole pairs.
-// ``hoist``: issue the whole group's loads (up to four inputs per frame) before
-// normalizing any frame, the kernel's memory-level parallelism; wider layouts would
-// spill, so they load frame by frame. ``blocks``: resident blocks per SM the register
-// budget is sized for (the kernel keeps four normalized frames plus the group's
-// inputs in registers, so one block of 8 warps with up to 255 registers per thread
-// beats two blocks that spill).
-struct WinoTuning
+// Resident blocks per SM the register budget is sized for. Per-thread state is bounded
+// independently of K: the row being normalized (K vectors) plus two vector slices of
+// inputs in flight; the frame history lives in shared memory.
+template <int K>
+constexpr int blocksPerSm()
 {
-    int frames;
-    bool hoist;
-    int blocks;
-};
-
-template <int K, bool IN_WINO, bool HAS_RESIDUAL>
-constexpr WinoTuning winoTuning()
-{
-    // Measured on GB200 (bench_wino_norm_kernel.py): the one-vector layout wants
-    // occupancy over bytes in flight, the two-vector producer gains from hoisting,
-    // the five-vector layouts spill below 255 registers.
-    if constexpr (K == 1)
-    {
-        return WinoTuning{2, false, 3}; // ~90 registers; occupancy is what this layout lacks
-    }
-    else if constexpr (K == 2)
-    {
-        return WinoTuning{2, !IN_WINO, 2};
-    }
-    else if constexpr (K >= 4)
-    {
-        return WinoTuning{2, false, 1}; // spills at 128 registers
-    }
-    else
-    {
-        return WinoTuning{2, false, 2};
-    }
+    return K >= 4 ? 2 : 3; // wide layouts need ~110 registers; they get bytes in flight from a deeper slice pipeline
 }
 
-// One thread group (L lanes, K vectors each) owns one position and walks the frames
-// in groups of G, keeping the two previous normalized frames in registers so the
-// Winograd slabs of every pair can be written as soon as its second frame is done.
+// Vector slices of one frame kept in flight ahead of the one being normalized.
+template <int K>
+constexpr int sliceDepth()
+{
+    return K >= 4 ? 3 : 2;
+}
+
+// History ring slots. A pair's slabs need frames t-2, t-1 (history) and t, t+1; frame
+// t-2 is dead once the even frame's slabs are out, so frame t+1 can take its slot: three
+// slots suffice. slot(frame) = (frame + 2) mod 3, the cached frames -2, -1 start in 0, 1.
+constexpr int kRingSlots = 3;
+
+__device__ __forceinline__ int ringSlot(int frame)
+{
+    return (frame + 2) % kRingSlots;
+}
+
+// One thread group (L lanes, K vectors each) owns one position and walks its frames in
+// order. The one-vector layout prefetches the next frame's inputs; wider layouts stream
+// the row one vector slice at a time with the next slice's loads in flight, so register
+// use does not grow with K. Normalized frames go to the shared-memory ring and the
+// Winograd slabs are formed while normalizing (even frame: D0..D2 from the two history
+// slots; odd frame: D3).
 template <typename T, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS, bool HAS_RESIDUAL, bool IN_WINO>
-__global__ void __launch_bounds__(kThreads, winoTuning<K, IN_WINO, HAS_RESIDUAL>().blocks) vaeWinoNormSiluKernel(
-    Ptrs<T> ptrs, VaeWinoNormParams p)
+__global__ void __launch_bounds__(kThreads, blocksPerSm<K>()) vaeWinoNormSiluKernel(Ptrs<T> ptrs, VaeWinoNormParams p)
 {
     using Vec = PackedAligned<T, V>;
     using VecF = PackedAligned<float, V>;
-    constexpr WinoTuning kTune = winoTuning<K, IN_WINO, HAS_RESIDUAL>();
-    constexpr int G = kTune.frames;
-    constexpr bool HOIST = kTune.hoist;
-    constexpr int NIN = IN_WINO ? 3 : 1;
+    constexpr int NUM_IN = IN_WINO ? 3 : 1;
+    constexpr bool FRAME_PF = (K == 1);   // prefetch whole frames
+    constexpr bool CONST_REGS = (K == 1); // per-channel constants in registers
     constexpr int kPosPerWarp = 32 / L;
     constexpr int kPosPerBlock = kPosPerWarp * kWarps;
 
-    extern __shared__ __align__(16) float smemF[];
-    float* const sGamma = smemF;
-    float* const sBias = smemF + p.channels;
-    float* const sInBias = smemF + 2 * p.channels;
+    extern __shared__ __align__(16) unsigned char smemRaw[];
+    float* const sGamma = reinterpret_cast<float*>(smemRaw);
+    float* const sBias = sGamma + p.channels;
+    float* const sInBias = sGamma + 2 * p.channels;
+    T* const sHist = reinterpret_cast<T*>(sGamma + 3 * p.channels); // [slots][positions in block][C]
 
     int const tid = threadIdx.x;
     int const lane = tid & 31;
@@ -126,6 +117,7 @@ __global__ void __launch_bounds__(kThreads, winoTuning<K, IN_WINO, HAS_RESIDUAL>
     int const laneInGroup = lane - group * L;
     int const C = p.channels;
     int64_t const P = p.positions;
+    int const posInBlock = warp * kPosPerWarp + group;
 
     for (int c = tid; c < C; c += kThreads)
     {
@@ -140,266 +132,387 @@ __global__ void __launch_bounds__(kThreads, winoTuning<K, IN_WINO, HAS_RESIDUAL>
     int64_t const gridPos = static_cast<int64_t>(gridDim.x) * kPosPerBlock;
     int const T_ = p.frames;
 
-    auto loadRow = [&](T const* base, int64_t row, Vec (&out)[K])
+    VecF gReg, bReg, ibReg;
+    if constexpr (CONST_REGS)
     {
-#pragma unroll
-        for (int k = 0; k < K; ++k)
-        {
-            out[k] = *reinterpret_cast<Vec const*>(base + row * C + laneChunkOff + k * L * V);
-        }
-    };
-    auto storeRow = [&](T* base, int64_t row, Vec const (&v)[K])
+        gReg = *reinterpret_cast<VecF const*>(sGamma + laneChunkOff);
+        bReg = *reinterpret_cast<VecF const*>(sBias + laneChunkOff);
+        ibReg = *reinterpret_cast<VecF const*>(sInBias + laneChunkOff);
+    }
+    auto constAt = [&](float const* table, VecF const& reg, int k) -> VecF
     {
-#pragma unroll
-        for (int k = 0; k < K; ++k)
+        if constexpr (CONST_REGS)
         {
-            *reinterpret_cast<Vec*>(base + row * C + laneChunkOff + k * L * V) = v[k];
-        }
-    };
-    auto zeroRow = [&](Vec (&out)[K])
-    {
-#pragma unroll
-        for (int k = 0; k < K; ++k)
-        {
-            out[k] = common::make_zeros<Vec>();
-        }
-    };
-
-    for (int64_t pos = static_cast<int64_t>(blockIdx.x) * kPosPerBlock + warp * kPosPerWarp + group; pos < P;
-         pos += gridPos)
-    {
-        // f0, f1: the two normalized frames before the current one (cache, then history).
-        Vec f0[K], f1[K];
-        if (p.cacheFrames >= 2)
-        {
-            loadRow(ptrs.cache, static_cast<int64_t>(p.cacheFrames - 2) * P + pos, f0);
+            return reg;
         }
         else
         {
-            zeroRow(f0);
+            return *reinterpret_cast<VecF const*>(table + laneChunkOff + k * L * V);
         }
-        if (p.cacheFrames >= 1)
-        {
-            loadRow(ptrs.cache, static_cast<int64_t>(p.cacheFrames - 1) * P + pos, f1);
-        }
-        else
-        {
-            zeroRow(f1);
-        }
+    };
 
-        for (int t0 = 0; t0 < T_; t0 += G)
-        {
-            int const nf = (T_ - t0) < G ? (T_ - t0) : G; // frames in this group (even, >= 2)
+    auto gRow = [&](T const* base, int64_t row) { return base + row * C + laneChunkOff; };
+    auto gRowW = [&](T* base, int64_t row) { return base + row * C + laneChunkOff; };
+    auto slotPtr = [&](int slot) { return sHist + (slot * kPosPerBlock + posInBlock) * C + laneChunkOff; };
+    auto loadVec = [&](T const* rowBase, int k) { return *reinterpret_cast<Vec const*>(rowBase + k * L * V); };
+    auto storeVec = [&](T* rowBase, int k, Vec const& v) { *reinterpret_cast<Vec*>(rowBase + k * L * V) = v; };
 
-            Vec in[HOIST ? G : 1][NIN][K];
-            Vec res[HAS_RESIDUAL ? (HOIST ? G : 1) : 1][K];
-            auto loadFrame = [&](int g, int slot)
+    // Row pointers of one frame's inputs. The m pointers are picked with a branch: the
+    // parameter struct must never be indexed at runtime (that copies it to local memory).
+    struct FrameSrc
+    {
+        T const* in[NUM_IN];
+        T const* res;
+    };
+
+    for (int64_t pos = static_cast<int64_t>(blockIdx.x) * kPosPerBlock + posInBlock; pos < P; pos += gridPos)
+    {
+        // Cached frames -2 and -1 into slots 0 and 1 (zeros where the cache is shorter).
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+        {
+            int const cacheIdx = p.cacheFrames - 2 + h;
+            T* const dst = slotPtr(ringSlot(h - 2));
+            if (cacheIdx >= 0)
             {
-                int const t = t0 + g;
-                if constexpr (IN_WINO)
+                T const* const src = gRow(ptrs.cache, static_cast<int64_t>(cacheIdx) * P + pos);
+#pragma unroll
+                for (int k = 0; k < K; ++k)
                 {
-                    int64_t const mrow = static_cast<int64_t>(t >> 1) * P + pos;
-                    int const base = (t & 1) ? 1 : 0; // even frame: m0,m1,m2; odd frame: m1,m2,m3
-                    loadRow(ptrs.m[base], mrow, in[slot][0]);
-                    loadRow(ptrs.m[base + 1], mrow, in[slot][1]);
-                    loadRow(ptrs.m[base + 2], mrow, in[slot][2]);
+                    storeVec(dst, k, loadVec(src, k));
+                }
+            }
+            else
+            {
+#pragma unroll
+                for (int k = 0; k < K; ++k)
+                {
+                    storeVec(dst, k, common::make_zeros<Vec>());
+                }
+            }
+        }
+
+        auto srcOf = [&](int t) -> FrameSrc
+        {
+            FrameSrc f{};
+            int64_t const frow = static_cast<int64_t>(t) * P + pos;
+            if constexpr (IN_WINO)
+            {
+                int64_t const mrow = static_cast<int64_t>(t >> 1) * P + pos;
+                if (t & 1)
+                {
+                    f.in[0] = gRow(ptrs.m[1], mrow);
+                    f.in[1] = gRow(ptrs.m[2], mrow);
+                    f.in[2] = gRow(ptrs.m[3], mrow);
                 }
                 else
                 {
-                    loadRow(ptrs.x, static_cast<int64_t>(t) * P + pos, in[slot][0]);
+                    f.in[0] = gRow(ptrs.m[0], mrow);
+                    f.in[1] = gRow(ptrs.m[1], mrow);
+                    f.in[2] = gRow(ptrs.m[2], mrow);
+                }
+            }
+            else
+            {
+                f.in[0] = gRow(ptrs.x, frow);
+            }
+            if constexpr (HAS_RESIDUAL)
+            {
+                f.res = gRow(ptrs.residual, frow);
+            }
+            return f;
+        };
+
+        // Two input buffers (named, never indexed, so they stay in registers): two frames
+        // for FRAME_PF, otherwise two vector slices of one frame.
+        Vec inA[NUM_IN], inB[NUM_IN], inC[NUM_IN];
+        Vec resA, resB, resC;
+        auto loadSlice = [&](Vec(&dst)[NUM_IN], Vec& dres, FrameSrc const& f, int k)
+        {
+#pragma unroll
+            for (int j = 0; j < NUM_IN; ++j)
+            {
+                dst[j] = loadVec(f.in[j], k);
+            }
+            if constexpr (HAS_RESIDUAL)
+            {
+                dres = loadVec(f.res, k);
+            }
+        };
+
+        FrameSrc src = srcOf(0);
+        if constexpr (FRAME_PF)
+        {
+            loadSlice(inA, resA, src, 0);
+        }
+
+        // One frame. ``bufTag``: for FRAME_PF the buffer holding this frame's inputs.
+        auto frame = [&](auto bufTag, int t)
+        {
+            constexpr int fb = FRAME_PF ? decltype(bufTag)::value : 0;
+            FrameSrc next{};
+            if constexpr (FRAME_PF)
+            {
+                if (t + 1 < T_)
+                {
+                    next = srcOf(t + 1);
+                    if constexpr (fb == 0)
+                    {
+                        loadSlice(inB, resB, next, 0);
+                    }
+                    else
+                    {
+                        loadSlice(inA, resA, next, 0);
+                    }
+                }
+            }
+            else
+            {
+                loadSlice(inA, resA, src, 0);
+            }
+
+            // Pass 1: combine, deferred bias, residual; the bf16 row stays in registers (y)
+            // and goes to ``sum``; the sum of squares is accumulated on the way. The input
+            // buffer is chosen with a constant branch (never a selected reference) so both
+            // buffers stay in registers.
+            T* const ySlot = slotPtr(ringSlot(t));
+            float const sgn = (t & 1) ? -1.0f : 1.0f;
+            float ss = 0.0f;
+            Vec y[K];
+            auto slice = [&](Vec const(&cin)[NUM_IN], Vec const& cres, Vec& yk, int k)
+            {
+                VecF const ib = constAt(sInBias, ibReg, k);
+#pragma unroll
+                for (int i = 0; i < V / 2; ++i)
+                {
+                    float2 v = pairAt(cin[0], i);
+                    if constexpr (IN_WINO)
+                    {
+                        float2 const fb2 = pairAt(cin[1], i), fc = pairAt(cin[2], i);
+                        v.x = addR<T, REF>(addR<T, REF>(v.x, sgn * fb2.x), sgn * fc.x);
+                        v.y = addR<T, REF>(addR<T, REF>(v.y, sgn * fb2.y), sgn * fc.y);
+                    }
+                    if constexpr (HAS_IN_BIAS)
+                    {
+                        v.x += ib.val[2 * i];
+                        v.y += ib.val[2 * i + 1];
+                    }
+                    v = Elem<T>::toFloat2(Elem<T>::fromFloat2(v)); // the conv output as eager holds it
+                    if constexpr (HAS_RESIDUAL)
+                    {
+                        float2 const r = pairAt(cres, i);
+                        v = Elem<T>::toFloat2(Elem<T>::fromFloat2(make_float2(v.x + r.x, v.y + r.y)));
+                    }
+                    ss = fmaf(v.x, v.x, ss);
+                    ss = fmaf(v.y, v.y, ss);
+                    setPair(yk, i, v);
                 }
                 if constexpr (HAS_RESIDUAL)
                 {
-                    loadRow(ptrs.residual, static_cast<int64_t>(t) * P + pos, res[slot]);
+                    storeVec(gRowW(ptrs.sum, static_cast<int64_t>(t) * P + pos), k, yk);
                 }
             };
-            if constexpr (HOIST)
+            if constexpr (FRAME_PF)
             {
-                // Issue every load of the group before touching any of it.
-#pragma unroll
-                for (int g = 0; g < G; ++g)
+                // K == 1: the frame's single slice sits in the buffer chosen by the frame parity.
+                if constexpr (fb == 0)
                 {
-                    if (g < nf)
-                    {
-                        loadFrame(g, g);
-                    }
-                }
-            }
-
-            // Normalize the group's frames; y[g] holds frame t0 + g.
-            Vec y[G][K];
-#pragma unroll
-            for (int g = 0; g < G; ++g)
-            {
-                if (g >= nf)
-                {
-                    continue;
-                }
-                if constexpr (!HOIST)
-                {
-                    loadFrame(g, 0);
-                }
-                constexpr int S = 0; // register slot when not hoisting
-                int const slot = HOIST ? g : S;
-                int const t = t0 + g;
-                float const sgn = (t & 1) ? -1.0f : 1.0f;
-                VecF acc[K];
-#pragma unroll
-                for (int k = 0; k < K; ++k)
-                {
-#pragma unroll
-                    for (int i = 0; i < V / 2; ++i)
-                    {
-                        float2 const fa = pairAt(in[slot][0][k], i);
-                        if constexpr (IN_WINO)
-                        {
-                            float2 const fb = pairAt(in[slot][1][k], i), fc = pairAt(in[slot][2][k], i);
-                            acc[k].val[2 * i] = addR<T, REF>(addR<T, REF>(fa.x, sgn * fb.x), sgn * fc.x);
-                            acc[k].val[2 * i + 1] = addR<T, REF>(addR<T, REF>(fa.y, sgn * fb.y), sgn * fc.y);
-                        }
-                        else
-                        {
-                            acc[k].val[2 * i] = fa.x;
-                            acc[k].val[2 * i + 1] = fa.y;
-                        }
-                    }
-                }
-                if constexpr (HAS_IN_BIAS)
-                {
-#pragma unroll
-                    for (int k = 0; k < K; ++k)
-                    {
-                        int const c0 = laneChunkOff + k * L * V;
-#pragma unroll
-                        for (int e = 0; e < V; ++e)
-                        {
-                            acc[k].val[e] += sInBias[c0 + e];
-                        }
-                    }
-                }
-                // Round to the activation dtype: the conv output as eager would hold it.
-#pragma unroll
-                for (int k = 0; k < K; ++k)
-                {
-#pragma unroll
-                    for (int i = 0; i < V / 2; ++i)
-                    {
-                        setPair(y[g][k], i, make_float2(acc[k].val[2 * i], acc[k].val[2 * i + 1]));
-                    }
-                }
-                if constexpr (HAS_RESIDUAL)
-                {
-#pragma unroll
-                    for (int k = 0; k < K; ++k)
-                    {
-#pragma unroll
-                        for (int i = 0; i < V / 2; ++i)
-                        {
-                            float2 const a = pairAt(y[g][k], i), b = pairAt(res[slot][k], i);
-                            setPair(y[g][k], i, make_float2(a.x + b.x, a.y + b.y));
-                        }
-                    }
-                    storeRow(ptrs.sum, static_cast<int64_t>(t) * P + pos, y[g]);
-                }
-                float ss = 0.0f;
-#pragma unroll
-                for (int k = 0; k < K; ++k)
-                {
-#pragma unroll
-                    for (int i = 0; i < V / 2; ++i)
-                    {
-                        float2 const f = pairAt(y[g][k], i);
-                        ss = fmaf(f.x, f.x, ss);
-                        ss = fmaf(f.y, f.y, ss);
-                    }
-                }
-#pragma unroll
-                for (int off = L >> 1; off > 0; off >>= 1)
-                {
-                    ss += __shfl_xor_sync(0xffffffffu, ss, off);
-                }
-                float denom = 0.0f, invDenom = 0.0f;
-                if constexpr (REF)
-                {
-                    denom = fmaxf(sqrtf(ss), p.eps);
+                    slice(inA, resA, y[0], 0);
                 }
                 else
                 {
-                    invDenom = rsqrtf(fmaxf(ss, p.eps * p.eps));
+                    slice(inB, resB, y[0], 0);
                 }
+            }
+            else if constexpr (sliceDepth<K>() == 2)
+            {
+                // Slices in pairs: load the next slice into the other buffer, then compute.
 #pragma unroll
-                for (int k = 0; k < K; ++k)
+                for (int k = 0; k < K; k += 2)
                 {
-                    int const c0 = laneChunkOff + k * L * V;
-                    VecF const gm = *reinterpret_cast<VecF const*>(sGamma + c0);
-                    VecF const bs = *reinterpret_cast<VecF const*>(sBias + c0);
-#pragma unroll
-                    for (int i = 0; i < V / 2; ++i)
+                    if (k + 1 < K)
                     {
-                        float2 const f = pairAt(y[g][k], i);
-                        float2 r;
-                        r.x = normElement<T, REF, HAS_BIAS>(
-                            f.x, denom, invDenom, p.scale, gm.val[2 * i], bs.val[2 * i]);
-                        r.y = normElement<T, REF, HAS_BIAS>(
-                            f.y, denom, invDenom, p.scale, gm.val[2 * i + 1], bs.val[2 * i + 1]);
-                        setPair(y[g][k], i, r);
+                        loadSlice(inB, resB, src, k + 1);
+                    }
+                    slice(inA, resA, y[k], k);
+                    if (k + 1 < K)
+                    {
+                        if (k + 2 < K)
+                        {
+                            loadSlice(inA, resA, src, k + 2);
+                        }
+                        slice(inB, resB, y[k + 1], k + 1);
                     }
                 }
+            }
+            else
+            {
+                // Three rotating buffers: two slices in flight while one is normalized.
+                if (1 < K)
+                {
+                    loadSlice(inB, resB, src, 1);
+                }
+#pragma unroll
+                for (int k = 0; k < K; k += 3)
+                {
+                    if (k + 2 < K)
+                    {
+                        loadSlice(inC, resC, src, k + 2);
+                    }
+                    slice(inA, resA, y[k], k);
+                    if (k + 1 < K)
+                    {
+                        if (k + 3 < K)
+                        {
+                            loadSlice(inA, resA, src, k + 3);
+                        }
+                        slice(inB, resB, y[k + 1], k + 1);
+                    }
+                    if (k + 2 < K)
+                    {
+                        if (k + 4 < K)
+                        {
+                            loadSlice(inB, resB, src, k + 4);
+                        }
+                        slice(inC, resC, y[k + 2], k + 2);
+                    }
+                }
+            }
+#pragma unroll
+            for (int off = L >> 1; off > 0; off >>= 1)
+            {
+                ss += __shfl_xor_sync(0xffffffffu, ss, off);
+            }
+            float denom = 0.0f, invDenom = 0.0f;
+            if constexpr (REF)
+            {
+                denom = fmaxf(sqrtf(ss), p.eps);
+            }
+            else
+            {
+                invDenom = rsqrtf(fmaxf(ss, p.eps * p.eps));
             }
 
-            // Winograd input transform for every pair completed in this group.
+            // Pass 2: normalize from registers into the ring slot and emit this frame's
+            // share of the pair's slabs.
+            bool const odd = (t & 1) != 0;
+            T const* const hist0 = slotPtr(ringSlot(t - 2));               // f0 (even frame only)
+            T const* const hist1 = slotPtr(ringSlot(odd ? t - 2 : t - 1)); // the pair's f1
+            int64_t const drow = static_cast<int64_t>(t >> 1) * P + pos;
+            T* const dOut0 = gRowW(ptrs.d[0], drow);
+            T* const dOut1 = gRowW(ptrs.d[1], drow);
+            T* const dOut2 = gRowW(ptrs.d[2], drow);
+            T* const dOut3 = gRowW(ptrs.d[3], drow);
 #pragma unroll
-            for (int g = 0; g + 1 < G; g += 2)
+            for (int k = 0; k < K; ++k)
             {
-                if (g + 1 >= nf)
-                {
-                    continue;
-                }
-                Vec d0[K], d1[K], d2[K], d3[K];
+                VecF const gm = constAt(sGamma, gReg, k);
+                VecF const bs = constAt(sBias, bReg, k);
+                Vec const h1 = loadVec(hist1, k);
+                Vec yk = y[k];
 #pragma unroll
-                for (int k = 0; k < K; ++k)
+                for (int i = 0; i < V / 2; ++i)
                 {
+                    float2 const f = pairAt(yk, i);
+                    float2 r;
+                    r.x = normElement<T, REF, HAS_BIAS>(f.x, denom, invDenom, p.scale, gm.val[2 * i], bs.val[2 * i]);
+                    r.y = normElement<T, REF, HAS_BIAS>(
+                        f.y, denom, invDenom, p.scale, gm.val[2 * i + 1], bs.val[2 * i + 1]);
+                    setPair(yk, i, r);
+                }
+                storeVec(ySlot, k, yk);
+                if (!odd)
+                {
+                    Vec const h0 = loadVec(hist0, k);
+                    Vec o0, o1, o2;
 #pragma unroll
                     for (int i = 0; i < V / 2; ++i)
                     {
-                        float2 const a = pairAt(f0[k], i), b = pairAt(f1[k], i), c = pairAt(y[g][k], i),
-                                     e = pairAt(y[g + 1][k], i);
-                        setPair(d0[k], i, make_float2(a.x - c.x, a.y - c.y));
-                        setPair(d1[k], i, make_float2(b.x + c.x, b.y + c.y));
-                        setPair(d2[k], i, make_float2(c.x - b.x, c.y - b.y));
-                        setPair(d3[k], i, make_float2(b.x - e.x, b.y - e.y));
+                        float2 const c = pairAt(yk, i), a = pairAt(h0, i), b = pairAt(h1, i);
+                        setPair(o0, i, make_float2(a.x - c.x, a.y - c.y));
+                        setPair(o1, i, make_float2(b.x + c.x, b.y + c.y));
+                        setPair(o2, i, make_float2(c.x - b.x, c.y - b.y));
                     }
+                    storeVec(dOut0, k, o0);
+                    storeVec(dOut1, k, o1);
+                    storeVec(dOut2, k, o2);
                 }
-                int64_t const drow = static_cast<int64_t>((t0 + g) >> 1) * P + pos;
-                storeRow(ptrs.d[0], drow, d0);
-                storeRow(ptrs.d[1], drow, d1);
-                storeRow(ptrs.d[2], drow, d2);
-                storeRow(ptrs.d[3], drow, d3);
-#pragma unroll
-                for (int k = 0; k < K; ++k)
+                else
                 {
-                    f0[k] = y[g][k];
-                    f1[k] = y[g + 1][k];
+                    Vec o3;
+#pragma unroll
+                    for (int i = 0; i < V / 2; ++i)
+                    {
+                        float2 const e = pairAt(yk, i), b = pairAt(h1, i);
+                        setPair(o3, i, make_float2(b.x - e.x, b.y - e.y));
+                    }
+                    storeVec(dOut3, k, o3);
                 }
             }
+            if constexpr (FRAME_PF)
+            {
+                src = next;
+            }
+            else
+            {
+                if (t + 1 < T_)
+                {
+                    src = srcOf(t + 1);
+                }
+            }
+        };
+
+        for (int t = 0; t < T_; t += 2)
+        {
+            frame(std::integral_constant<int, 0>{}, t);
+            frame(std::integral_constant<int, 1>{}, t + 1);
         }
-        storeRow(ptrs.yTail, pos, f0);
-        storeRow(ptrs.yTail, P + pos, f1);
+        // The last two normalized frames are the next chunk's cache.
+        {
+            T const* const sa = slotPtr(ringSlot(T_ - 2));
+            T const* const sb = slotPtr(ringSlot(T_ - 1));
+            T* const ta = gRowW(ptrs.yTail, pos);
+            T* const tb = gRowW(ptrs.yTail, P + pos);
+#pragma unroll
+            for (int k = 0; k < K; ++k)
+            {
+                storeVec(ta, k, loadVec(sa, k));
+                storeVec(tb, k, loadVec(sb, k));
+            }
+        }
     }
+}
+
+template <int L>
+constexpr int positionsPerBlock()
+{
+    return (32 / L) * kWarps;
+}
+
+template <int L>
+inline int sharedBytes(int channels)
+{
+    return 3 * channels * static_cast<int>(sizeof(float)) + kRingSlots * positionsPerBlock<L>() * channels * 2;
 }
 
 template <typename T, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS, bool HAS_RESIDUAL, bool IN_WINO>
 void launchConfig(Ptrs<T> const& ptrs, VaeWinoNormParams const& p, cudaStream_t stream)
 {
     auto* kernel = vaeWinoNormSiluKernel<T, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, IN_WINO>;
-    constexpr int kPosPerBlock = (32 / L) * kWarps;
-    int const smem = 3 * p.channels * static_cast<int>(sizeof(float));
+    constexpr int kPosPerBlock = positionsPerBlock<L>();
+    int const smem = sharedBytes<L>(p.channels);
+    static int configuredSmem = 0; // per instantiation; the attribute only needs raising once
+    if (smem > configuredSmem)
+    {
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+        configuredSmem = smem;
+    }
     int device = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
     int sms = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
     int64_t const steps = (p.positions + kPosPerBlock - 1) / kPosPerBlock;
-    int64_t const persistent = static_cast<int64_t>(sms) * winoTuning<K, IN_WINO, HAS_RESIDUAL>().blocks;
+    int64_t const persistent = static_cast<int64_t>(sms) * blocksPerSm<K>();
     unsigned const blocks = static_cast<unsigned>(steps < persistent ? steps : persistent);
     kernel<<<blocks, kThreads, smem, stream>>>(ptrs, p);
 }
@@ -445,11 +558,26 @@ void launchModes(Ptrs<T> const& ptrs, VaeWinoNormParams const& p, cudaStream_t s
         launchInBias<T, V, L, K, false, false>(ptrs, p, stream);
 }
 
+// Lane layout for this kernel: like the plain norm kernel's, but a row is never split
+// one vector per lane when two per lane is possible (the per-row overhead, shuffles and
+// addressing, amortizes over too few elements at K = 1; measured 74% vs 78-90%).
+template <int V>
+RowLayout winoRowLayout(int channels)
+{
+    RowLayout l = makeRowLayout<V>(channels);
+    if (l.vecsPerLane == 1 && l.lanesPerRow > 1)
+    {
+        l.lanesPerRow /= 2;
+        l.vecsPerLane = 2;
+    }
+    return l;
+}
+
 template <typename T, int V>
 void launchLayout(Ptrs<T> const& ptrs, VaeWinoNormParams const& p, cudaStream_t stream)
 {
-    RowLayout const l = makeRowLayout<V>(p.channels);
-#define TRY_LAYOUT(LL, KK)                                                                                            \
+    RowLayout const l = winoRowLayout<V>(p.channels);
+#define TRY_LAYOUT(LL, KK)                                                                                             \
     if (l.lanesPerRow == (LL) && l.vecsPerLane == (KK))                                                                \
     {                                                                                                                  \
         launchModes<T, V, LL, KK>(ptrs, p, stream);                                                                    \
@@ -472,7 +600,8 @@ void launchVaeWinoNormSilu(VaeWinoNormPointers const& in, VaeWinoNormParams cons
     TLLM_CHECK_WITH_INFO(p.frames >= 2 && p.frames % 2 == 0, "vaeWinoNormSilu: frames must be even and >= 2");
     TLLM_CHECK_WITH_INFO(p.cacheFrames >= 0 && p.cacheFrames <= 2, "vaeWinoNormSilu: cacheFrames must be 0..2");
     TLLM_CHECK_WITH_INFO((in.x == nullptr) != (in.m[0] == nullptr), "vaeWinoNormSilu: exactly one of x and m");
-    TLLM_CHECK_WITH_INFO((in.residual == nullptr) == (in.sum == nullptr), "vaeWinoNormSilu: residual and sum go together");
+    TLLM_CHECK_WITH_INFO(
+        (in.residual == nullptr) == (in.sum == nullptr), "vaeWinoNormSilu: residual and sum go together");
     if (p.positions == 0)
     {
         return;

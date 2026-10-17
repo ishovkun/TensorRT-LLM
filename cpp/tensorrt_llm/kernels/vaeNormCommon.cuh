@@ -162,7 +162,12 @@ __device__ __forceinline__ float normElement(float x, float denom, float invDeno
     X(8, 1)                                                                                                            \
     X(16, 1)                                                                                                           \
     X(1, 3)                                                                                                            \
-    X(32, 3)
+    X(32, 3)                                                                                                           \
+    X(1, 2)                                                                                                            \
+    X(2, 2)                                                                                                            \
+    X(4, 2)                                                                                                            \
+    X(8, 2)                                                                                                            \
+    X(16, 2)
 
 } // namespace vae_norm
 } // namespace kernels
