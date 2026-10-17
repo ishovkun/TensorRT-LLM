@@ -373,12 +373,11 @@ def wino_spatial_conv_cute(
 ) -> torch.Tensor:
     """Same contract as :func:`wino_spatial_conv_cuda` with ``u_cute`` from
     :func:`cute_spatial_filters`: input transform by the CUDA kernel, then the CuTe DSL kernels.
-    Cout % 256 == 0: the 256x256-tile two-pass kernel writes the row-combined partials and a CUDA
-    kernel finishes the output transform; otherwise the 128-wide persistent kernel does the 64
-    GEMMs and the whole output transform on chip."""
+    Cout % 256 == 0: the 256x256-tile two-pass kernel (output transform finished by the last
+    arriving CTA of each tile block); otherwise the 128-wide persistent kernel."""
     from tensorrt_llm._torch.visual_gen.models.wan.wino_cute import (
+        wino_spatial_conv_pass2,
         wino_spatial_conv_persistent,
-        wino_spatial_gemm_pass2,
     )
 
     comps, pairs, positions, cin = d.shape
@@ -388,10 +387,7 @@ def wino_spatial_conv_cute(
     v = torch.ops.trtllm.vae_wino_spatial_in(frames, comps, 0, tile_rows)
     out = torch.empty((comps * pairs, height, width, cout), dtype=d.dtype, device=d.device)
     if cout % 256 == 0:
-        rows = v.shape[1]
-        t = torch.empty((comps * 8, rows, cout), dtype=d.dtype, device=d.device)
-        wino_spatial_gemm_pass2(v, u_cute, t, rows)
-        torch.ops.trtllm.vae_wino_spatial_combine(t, out, comps)
+        wino_spatial_conv_pass2(v, u_cute, out, comps, pairs, height, width)
     else:
         wino_spatial_conv_persistent(v, u_cute, out, comps, pairs, height, width)
     return out.view(comps, pairs, positions, cout)

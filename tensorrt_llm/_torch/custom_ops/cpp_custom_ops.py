@@ -242,11 +242,6 @@ def _register_fake():
     def _(m, frames, components, row0, row1):
         return frames
 
-    @torch.library.register_fake("trtllm::vae_wino_spatial_combine")
-    def _(t: torch.Tensor, frames: torch.Tensor,
-          components: int) -> torch.Tensor:
-        return frames
-
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")
     def _(q: torch.Tensor, num_heads: int, head_dim: int, eps: float):
         return torch.empty_like(q)
