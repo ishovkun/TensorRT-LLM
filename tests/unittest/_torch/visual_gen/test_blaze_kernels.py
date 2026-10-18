@@ -695,6 +695,39 @@ def test_spatial_winograd_conv_matches_conv2d(
 
 
 @spatial_op
+@pytest.mark.parametrize("cin_cout", [(64, 128), (128, 64)])
+@pytest.mark.parametrize("hw", [(6, 10), (9, 13)])
+@pytest.mark.parametrize("tile", [2, 4])
+@pytest.mark.parametrize("taps", [1, 3])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_spatial_winograd_frames_matches_conv3d(
+    cin_cout: tuple[int, int], hw: tuple[int, int], tile: int, taps: int, with_bias: bool
+) -> None:
+    """One output frame of a causal 3x3x3 conv by spatial Winograd alone: the current frame
+    (zero history) or the three tap frames summed inside the GEMM."""
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        wino_spatial_conv_frames,
+        winograd_spatial_taps_weights,
+    )
+
+    torch.manual_seed(3)
+    cin, cout = cin_cout
+    h, w = hw
+    weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
+    bias = torch.randn(cout, device="cuda").to(torch.bfloat16) if with_bias else None
+    frames = torch.randn(taps, h * w, cin, device="cuda").to(torch.bfloat16)
+    u = winograd_spatial_taps_weights(weight, tile, taps)
+    assert u.shape == ((tile + 2) ** 2, taps * cin, cout)
+    got = wino_spatial_conv_frames(frames, u, h, w, bias)
+    x = frames.view(taps, h, w, cin).permute(3, 0, 1, 2).unsqueeze(0).float()
+    x = F.pad(x, (0, 0, 0, 0, 3 - taps, 0))  # zero history before the first frame
+    ref = F.conv3d(x, weight.float(), bias.float() if with_bias else None, 1, (0, 1, 1))
+    ref = ref[0, :, 0].permute(1, 2, 0).reshape(h * w, cout)
+    rel = ((got.float() - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@spatial_op
 @pytest.mark.parametrize("cin_cout_hw", [(64, 128, 6, 10), (128, 256, 9, 13), (64, 512, 30, 52)])
 def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, int, int]) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (

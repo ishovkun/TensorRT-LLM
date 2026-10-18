@@ -20,6 +20,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#include <optional>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
@@ -46,42 +48,55 @@ tensorrt_llm::kernels::VaeWinoSpatialParams params(
 } // namespace
 
 // V = B^T d B for tile rows [row0, row1): frames [N, H, W, C] bf16 -> fp16
-// [components*(tile+2)^2, (N/components)*ntiles, C].
+// [components*(tile+2)^2, (N/components)*ntiles, C], or with stack_frames (components == 1)
+// [(tile+2)^2, ntiles, N*C]: the frames side by side along the GEMM's K axis.
 torch::Tensor vae_wino_spatial_in(
-    torch::Tensor const& frames, int64_t components, int64_t row0, int64_t row1, int64_t tile)
+    torch::Tensor const& frames, int64_t components, int64_t row0, int64_t row1, int64_t tile, bool stack_frames)
 {
-    auto const p = params(frames, components, row0, row1, tile);
+    auto p = params(frames, components, row0, row1, tile);
+    p.stackFrames = stack_frames ? 1 : 0;
     int64_t const coords = (tile + 2) * (tile + 2);
     int64_t const ntiles = static_cast<int64_t>(p.row1 - p.row0) * ((p.width + tile - 1) / tile);
-    auto v = torch::empty(
-        {components * coords, (p.frames / components) * ntiles, p.channels}, frames.options().dtype(torch::kHalf));
+    auto v = stack_frames ? torch::empty({coords, ntiles, p.frames * p.channels}, frames.options().dtype(torch::kHalf))
+                          : torch::empty({components * coords, (p.frames / components) * ntiles, p.channels},
+                              frames.options().dtype(torch::kHalf));
     tensorrt_llm::kernels::launchVaeWinoSpatialInput(
         frames.data_ptr(), v.data_ptr(), p, at::cuda::getCurrentCUDAStream(frames.get_device()));
     return v;
 }
 
-// y[:, tile*i+a, tile*j+b, :] = A^T M A for tile rows [row0, row1); writes into ``frames`` and returns it.
-torch::Tensor vae_wino_spatial_out(
-    torch::Tensor const& m, torch::Tensor const& frames, int64_t components, int64_t row0, int64_t row1, int64_t tile)
+// y[:, tile*i+a, tile*j+b, :] = A^T M A (+ bias) for tile rows [row0, row1); writes into ``frames`` and
+// returns it.
+torch::Tensor vae_wino_spatial_out(torch::Tensor const& m, torch::Tensor const& frames, int64_t components,
+    int64_t row0, int64_t row1, int64_t tile, std::optional<torch::Tensor> const& bias)
 {
     auto const p = params(frames, components, row0, row1, tile);
     CHECK_INPUT(m, torch::kHalf);
+    void const* biasPtr = nullptr;
+    if (bias.has_value())
+    {
+        CHECK_INPUT(bias.value(), torch::kBFloat16);
+        TORCH_CHECK(bias->dim() == 1 && bias->size(0) == p.channels, "bias must be [C]");
+        biasPtr = bias->data_ptr();
+    }
     int64_t const coords = (tile + 2) * (tile + 2);
     int64_t const ntiles = static_cast<int64_t>(p.row1 - p.row0) * ((p.width + tile - 1) / tile);
     TORCH_CHECK(m.dim() == 3 && m.size(0) == components * coords && m.size(1) == (p.frames / components) * ntiles
             && m.size(2) == p.channels,
         "m must be [components*(tile+2)^2, (N/components)*ntiles, C]");
     tensorrt_llm::kernels::launchVaeWinoSpatialOutput(
-        m.data_ptr(), frames.data_ptr(), p, at::cuda::getCurrentCUDAStream(frames.get_device()));
+        m.data_ptr(), frames.data_ptr(), biasPtr, p, at::cuda::getCurrentCUDAStream(frames.get_device()));
     return frames;
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("vae_wino_spatial_in(Tensor frames, int components, int row0, int row1, int tile=2) -> Tensor");
     m.def(
-        "vae_wino_spatial_out(Tensor m, Tensor(a!) frames, int components, int row0, int row1, int tile=2)"
-        " -> Tensor(a!)");
+        "vae_wino_spatial_in(Tensor frames, int components, int row0, int row1, int tile=2, bool stack_frames=False)"
+        " -> Tensor");
+    m.def(
+        "vae_wino_spatial_out(Tensor m, Tensor(a!) frames, int components, int row0, int row1, int tile=2,"
+        " Tensor? bias=None) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

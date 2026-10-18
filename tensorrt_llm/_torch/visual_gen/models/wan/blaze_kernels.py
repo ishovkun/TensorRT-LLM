@@ -358,6 +358,41 @@ def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2) -> torch.Tenso
     return u.reshape(4 * coords, cout, cin).transpose(1, 2).contiguous().to(torch.float16)
 
 
+def winograd_spatial_taps_weights(weight: torch.Tensor, tile: int, taps: int) -> torch.Tensor:
+    """Filters for :func:`wino_spatial_conv_frames`: ``[Cout, Cin, 3, 3, 3]`` ->
+    ``U [(tile+2)^2, taps * Cin, Cout]`` fp16. ``taps = 1`` keeps the current-frame tap
+    (zero history: the first frame of a clip, every image); ``taps = 3`` stacks the taps
+    for frames t-2, t-1, t along K, in that order, so one GEMM sums the causal 3x3x3 conv."""
+    g = weight.detach().double()[:, :, 3 - taps :]  # [Cout, Cin, taps, 3, 3]
+    gm = _WINO_G[tile].to(weight.device)
+    u = torch.einsum("xa,oitab,yb->xytio", gm, g, gm)  # [a, a, taps, Cin, Cout]
+    cout, cin = weight.shape[:2]
+    return u.reshape((tile + 2) ** 2, taps * cin, cout).contiguous().to(torch.float16)
+
+
+def wino_spatial_conv_frames(
+    frames: torch.Tensor,
+    u: torch.Tensor,
+    height: int,
+    width: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """One output frame of a causal 3x3x3 conv (padding 1) by spatial Winograd alone:
+    ``frames [taps, H*W, Cin]`` bf16 (the taps' input frames, oldest first) with ``u`` from
+    :func:`winograd_spatial_taps_weights` -> ``[H*W, Cout]`` bf16, bias added by the output
+    transform. The taps are summed inside the GEMM (K = taps * Cin)."""
+    taps, _, cin = frames.shape
+    tile = spatial_tile_of(u, 1)
+    tile_rows = -(-height // tile)
+    v = torch.ops.trtllm.vae_wino_spatial_in(
+        frames.view(taps, height, width, cin), 1, 0, tile_rows, tile, taps > 1
+    )
+    m = torch.bmm(v, u)
+    out = torch.empty((1, height, width, u.shape[2]), dtype=frames.dtype, device=frames.device)
+    torch.ops.trtllm.vae_wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
+    return out.view(height * width, u.shape[2])
+
+
 def spatial_tile_of(u: torch.Tensor, components: int = 4) -> int:
     """The tile size a :func:`winograd_spatial_weights` tensor was built for."""
     return int(round((u.shape[0] // components) ** 0.5)) - 2

@@ -39,20 +39,28 @@ namespace kernels
 // The N frames form `components` groups of N / components frames (temporal Winograd
 // components); V and M are [components * (m+2)^2, (N / components) * ntilesStrip, C] with
 // ntilesStrip = (row1 - row0) * ceil(W/m) and tile index = pair * ntilesStrip + (i - row0) * ceil(W/m) + j.
+//
+// With `stackFrames` (components == 1) the input transform instead writes V as
+// [(m+2)^2, ntilesStrip, N * C], frame n at channel offset n * C: the N frames sit side by
+// side along the GEMM's K axis, so one GEMM sums their contributions (the three temporal taps
+// of a causal 3x3x3 conv on one output frame).
 struct VaeWinoSpatialParams
 {
-    int frames;     // N
-    int height;     // H
-    int width;      // W
+    int frames;      // N
+    int height;      // H
+    int width;       // W
     int channels;
-    int components; // temporal components; frame n belongs to component n / (N / components)
-    int row0;       // first tile row of the strip
-    int row1;       // one past the last tile row
-    int tile;       // output tile side m: 2 (F(2x2, 3x3)) or 4 (F(4x4, 3x3))
+    int components;  // temporal components; frame n belongs to component n / (N / components)
+    int row0;        // first tile row of the strip
+    int row1;        // one past the last tile row
+    int tile;        // output tile side m: 2 (F(2x2, 3x3)) or 4 (F(4x4, 3x3))
+    int stackFrames; // input transform only: V layout [(m+2)^2, ntilesStrip, N * C]
 };
 
 void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream);
-void launchVaeWinoSpatialOutput(void const* m, void* frames, VaeWinoSpatialParams const& p, cudaStream_t stream);
+// `bias` (bf16 [C], may be null) is added to every output pixel before rounding.
+void launchVaeWinoSpatialOutput(
+    void const* m, void* frames, void const* bias, VaeWinoSpatialParams const& p, cudaStream_t stream);
 
 } // namespace kernels
 

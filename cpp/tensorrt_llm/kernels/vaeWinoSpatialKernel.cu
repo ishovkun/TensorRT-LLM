@@ -55,6 +55,7 @@ struct Geometry
     int64_t tilesPerFrame; // stripRows * tw
     int64_t tilesPerComp;  // pairs * tilesPerFrame
     int pairs;
+    int64_t coordStride;   // elements between consecutive coordinates of V / M
 };
 
 template <int M>
@@ -66,16 +67,23 @@ __device__ __forceinline__ Geometry geometry(VaeWinoSpatialParams const& p)
     g.tilesPerFrame = static_cast<int64_t>(g.stripRows) * g.tw;
     g.pairs = p.frames / p.components;
     g.tilesPerComp = g.pairs * g.tilesPerFrame;
+    g.coordStride = p.stackFrames ? g.tilesPerFrame * p.frames * p.channels : g.tilesPerComp * p.channels;
     return g;
 }
 
-// Element offset of V/M[(comp, coord)][pair, tile][c0]: layout [comp * coords, pairs * tiles, C].
+// Element offset of coordinate 0 of V / M for frame n (component comp, pair within it), a tile
+// and channel c0. Layout [comp * coords, pairs * tiles, C], or with stacked frames
+// [coords, tiles, N * C] (frame n at channel offset n * C).
 template <int COORDS>
 __device__ __forceinline__ int64_t vmOffset(
-    Geometry const& g, int comp, int coord, int pair, int64_t tile, int c0, int C)
+    Geometry const& g, VaeWinoSpatialParams const& p, int n, int comp, int pair, int64_t tile, int c0)
 {
-    int64_t const row = (static_cast<int64_t>(comp) * COORDS + coord) * g.tilesPerComp + pair * g.tilesPerFrame + tile;
-    return row * C + c0;
+    if (p.stackFrames)
+    {
+        return tile * (static_cast<int64_t>(p.frames) * p.channels) + static_cast<int64_t>(n) * p.channels + c0;
+    }
+    int64_t const row = static_cast<int64_t>(comp) * COORDS * g.tilesPerComp + pair * g.tilesPerFrame + tile;
+    return row * p.channels + c0;
 }
 
 __device__ __forceinline__ float2 operator+(float2 a, float2 b)
@@ -199,8 +207,8 @@ __global__ void __launch_bounds__(kThreads)
                 }
             }
         }
-        TS* vp = v + vmOffset<A * A>(g, comp, 0, pair, tile, c0, C);
-        int64_t const coordStride = g.tilesPerComp * C;
+        TS* vp = v + vmOffset<A * A>(g, p, n, comp, pair, tile, c0);
+        int64_t const coordStride = g.coordStride;
 #pragma unroll
         for (int x = 0; x < A; ++x)
         {
@@ -238,8 +246,8 @@ __global__ void __launch_bounds__(kThreads)
 
 // y = A^T M A for one tile and V channels: (m+2)^2 vectors in, m x m output pixels out.
 template <int M>
-__global__ void __launch_bounds__(kThreads)
-    vaeWinoSpatialOutputKernel(TS const* __restrict__ m, T* __restrict__ frames, VaeWinoSpatialParams p)
+__global__ void __launch_bounds__(kThreads) vaeWinoSpatialOutputKernel(
+    TS const* __restrict__ m, T* __restrict__ frames, T const* __restrict__ bias, VaeWinoSpatialParams p)
 {
     using W = WinoMath<M>;
     constexpr int A = W::A;
@@ -262,14 +270,15 @@ __global__ void __launch_bounds__(kThreads)
         int const comp = n / g.pairs, pair = n - comp * g.pairs;
 
         VecS mv[A * A];
-        TS const* mp = m + vmOffset<A * A>(g, comp, 0, pair, tile, c0, C);
-        int64_t const coordStride = g.tilesPerComp * C;
+        TS const* mp = m + vmOffset<A * A>(g, p, n, comp, pair, tile, c0);
+        int64_t const coordStride = g.coordStride;
 #pragma unroll
         for (int k = 0; k < A * A; ++k)
         {
             mv[k] = *reinterpret_cast<VecS const*>(mp);
             mp += coordStride;
         }
+        Vec const bv = bias ? *reinterpret_cast<Vec const*>(bias + c0) : common::make_zeros<Vec>();
         T* frame0 = frames + (static_cast<int64_t>(n) * p.height * p.width) * C + c0;
 #pragma unroll
         for (int r = 0; r < M; ++r)
@@ -293,7 +302,7 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
                 for (int sidx = 0; sidx < M; ++sidx)
                 {
-                    setPair(out[sidx], e, W::at(sidx, tb));
+                    setPair(out[sidx], e, W::at(sidx, tb) + pairAt(bv, e));
                 }
             }
             T* rowp = frame0 + (static_cast<int64_t>(M * i + r) * p.width + M * j) * C;
@@ -326,6 +335,7 @@ void check(VaeWinoSpatialParams const& p)
     TLLM_CHECK_WITH_INFO(p.channels % 8 == 0, "vaeWinoSpatial: channels must be a multiple of 8");
     TLLM_CHECK_WITH_INFO(
         p.components >= 1 && p.frames % p.components == 0, "vaeWinoSpatial: frames must be a multiple of components");
+    TLLM_CHECK_WITH_INFO(!p.stackFrames || p.components == 1, "vaeWinoSpatial: stacked frames need components == 1");
     TLLM_CHECK_WITH_INFO(0 <= p.row0 && p.row0 < p.row1 && p.row1 <= (p.height + p.tile - 1) / p.tile,
         "vaeWinoSpatial: bad tile-row range");
 }
@@ -356,19 +366,21 @@ void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams
     sync_check_cuda_error(stream);
 }
 
-void launchVaeWinoSpatialOutput(void const* m, void* frames, VaeWinoSpatialParams const& p, cudaStream_t stream)
+void launchVaeWinoSpatialOutput(
+    void const* m, void* frames, void const* bias, VaeWinoSpatialParams const& p, cudaStream_t stream)
 {
     check(p);
+    TLLM_CHECK_WITH_INFO(!p.stackFrames, "vaeWinoSpatial: the output transform has no stacked-frame layout");
     unsigned const grid = gridFor(stripVectors(p));
     if (p.tile == 2)
     {
-        vaeWinoSpatialOutputKernel<2>
-            <<<grid, kThreads, 0, stream>>>(static_cast<TS const*>(m), static_cast<T*>(frames), p);
+        vaeWinoSpatialOutputKernel<2><<<grid, kThreads, 0, stream>>>(
+            static_cast<TS const*>(m), static_cast<T*>(frames), static_cast<T const*>(bias), p);
     }
     else
     {
-        vaeWinoSpatialOutputKernel<4>
-            <<<grid, kThreads, 0, stream>>>(static_cast<TS const*>(m), static_cast<T*>(frames), p);
+        vaeWinoSpatialOutputKernel<4><<<grid, kThreads, 0, stream>>>(
+            static_cast<TS const*>(m), static_cast<T*>(frames), static_cast<T const*>(bias), p);
     }
     sync_check_cuda_error(stream);
 }
