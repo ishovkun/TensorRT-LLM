@@ -36,23 +36,32 @@ using namespace vae_norm;
 constexpr int kThreads = 256;
 using T = __nv_bfloat16; // frames
 using TS = __half;       // transformed data (V, M): fp16 keeps three more mantissa bits than bf16
-constexpr int V = static_cast<int>(sizeof(float4) / sizeof(T));
-using Vec = PackedAligned<T, V>;
-using VecS = PackedAligned<TS, V>;
+
+// Channels per thread: 8 (16-byte vectors) for m = 2; 2 (one bf16x2 / fp16x2 pair) for m = 4,
+// whose 6x6 window would otherwise not fit in registers (measured: 4 channels per thread
+// costs 175 registers and is no faster).
+template <int M>
+struct Lanes
+{
+    static constexpr int V = M == 2 ? 8 : 2;
+    using Vec = PackedAligned<T, V>;
+    using VecS = PackedAligned<TS, V>;
+};
 
 struct Geometry
 {
-    int tw;                // tiles per row (W / 2)
+    int tw;                // tiles per row (ceil(W / m))
     int stripRows;         // row1 - row0
     int64_t tilesPerFrame; // stripRows * tw
     int64_t tilesPerComp;  // pairs * tilesPerFrame
     int pairs;
 };
 
+template <int M>
 __device__ __forceinline__ Geometry geometry(VaeWinoSpatialParams const& p)
 {
     Geometry g;
-    g.tw = (p.width + 1) / 2;
+    g.tw = (p.width + M - 1) / M;
     g.stripRows = p.row1 - p.row0;
     g.tilesPerFrame = static_cast<int64_t>(g.stripRows) * g.tw;
     g.pairs = p.frames / p.components;
@@ -60,19 +69,101 @@ __device__ __forceinline__ Geometry geometry(VaeWinoSpatialParams const& p)
     return g;
 }
 
-// Element offset of V/M[(comp, coord)][pair, tile][c0]: layout [comp*16, pairs*tiles, C].
+// Element offset of V/M[(comp, coord)][pair, tile][c0]: layout [comp * coords, pairs * tiles, C].
+template <int COORDS>
 __device__ __forceinline__ int64_t vmOffset(
     Geometry const& g, int comp, int coord, int pair, int64_t tile, int c0, int C)
 {
-    int64_t const row = (static_cast<int64_t>(comp) * 16 + coord) * g.tilesPerComp + pair * g.tilesPerFrame + tile;
+    int64_t const row = (static_cast<int64_t>(comp) * COORDS + coord) * g.tilesPerComp + pair * g.tilesPerFrame + tile;
     return row * C + c0;
 }
 
-// V = B^T d B for one 4x4 window and 8 channels, written as 16 vectors.
+__device__ __forceinline__ float2 operator+(float2 a, float2 b)
+{
+    return make_float2(a.x + b.x, a.y + b.y);
+}
+
+__device__ __forceinline__ float2 operator-(float2 a, float2 b)
+{
+    return make_float2(a.x - b.x, a.y - b.y);
+}
+
+__device__ __forceinline__ float2 operator*(float k, float2 a)
+{
+    return make_float2(k * a.x, k * a.y);
+}
+
+// Lavin & Gray transforms, written out (interpolation points 0, +-1, +-2 for m = 4). Integer
+// coefficients: with bf16 / fp16 inputs every product and sum is exact in fp32 except the
+// final rounding, so the input transform is bitwise reproducible.
+// bt<M>(x, d): row x of B^T applied to the (m+2) values d; at<M>(r, t): row r of A^T.
+template <int M>
+struct WinoMath;
+
+template <>
+struct WinoMath<2>
+{
+    static constexpr int A = 4;
+
+    static __device__ __forceinline__ float2 bt(int x, float2 const (&d)[4])
+    {
+        switch (x)
+        {
+        case 0: return d[0] - d[2];
+        case 1: return d[1] + d[2];
+        case 2: return d[2] - d[1];
+        default: return d[1] - d[3];
+        }
+    }
+
+    static __device__ __forceinline__ float2 at(int r, float2 const (&t)[4])
+    {
+        return r == 0 ? t[0] + t[1] + t[2] : t[1] - t[2] - t[3];
+    }
+};
+
+template <>
+struct WinoMath<4>
+{
+    static constexpr int A = 6;
+
+    static __device__ __forceinline__ float2 bt(int x, float2 const (&d)[6])
+    {
+        switch (x)
+        {
+        case 0: return 4.f * d[0] - 5.f * d[2] + d[4];
+        case 1: return -4.f * (d[1] + d[2]) + d[3] + d[4];
+        case 2: return 4.f * (d[1] - d[2]) - d[3] + d[4];
+        case 3: return -2.f * d[1] - d[2] + 2.f * d[3] + d[4];
+        case 4: return 2.f * d[1] - d[2] - 2.f * d[3] + d[4];
+        default: return 4.f * d[1] - 5.f * d[3] + d[5];
+        }
+    }
+
+    static __device__ __forceinline__ float2 at(int r, float2 const (&t)[6])
+    {
+        switch (r)
+        {
+        case 0: return t[0] + t[1] + t[2] + t[3] + t[4];
+        case 1: return t[1] - t[2] + 2.f * (t[3] - t[4]);
+        case 2: return t[1] + t[2] + 4.f * (t[3] + t[4]);
+        default: return t[1] - t[2] + 8.f * (t[3] - t[4]) + t[5];
+        }
+    }
+};
+
+// V = B^T d B for one (m+2) x (m+2) window and V channels, written as (m+2)^2 vectors; one
+// coordinate row at a time so the register footprint stays bounded.
+template <int M>
 __global__ void __launch_bounds__(kThreads)
     vaeWinoSpatialInputKernel(T const* __restrict__ frames, TS* __restrict__ v, VaeWinoSpatialParams p)
 {
-    Geometry const g = geometry(p);
+    using W = WinoMath<M>;
+    constexpr int A = W::A;
+    constexpr int V = Lanes<M>::V;
+    using Vec = typename Lanes<M>::Vec;
+    using VecS = typename Lanes<M>::VecS;
+    Geometry const g = geometry<M>(p);
     int const C = p.channels;
     int const cvec = C / V;
     int64_t const total = static_cast<int64_t>(p.frames) * g.tilesPerFrame * cvec;
@@ -87,20 +178,20 @@ __global__ void __launch_bounds__(kThreads)
         int const j = static_cast<int>(tile - static_cast<int64_t>(i - p.row0) * g.tw);
         int const comp = n / g.pairs, pair = n - comp * g.pairs;
 
-        // Load the 4x4 window (zero outside the frame), 8 channels per element, kept as bf16.
-        Vec d[4][4];
+        Vec d[A][A];
+        T const* frame0 = frames + (static_cast<int64_t>(n) * p.height * p.width) * C + c0;
 #pragma unroll
-        for (int a = 0; a < 4; ++a)
+        for (int a = 0; a < A; ++a)
         {
-            int const row = 2 * i - 1 + a;
+            int const row = M * i - 1 + a;
+            T const* rowp = frame0 + (static_cast<int64_t>(row) * p.width + (M * j - 1)) * C;
 #pragma unroll
-            for (int b = 0; b < 4; ++b)
+            for (int b = 0; b < A; ++b)
             {
-                int const col = 2 * j - 1 + b;
+                int const col = M * j - 1 + b;
                 if (row >= 0 && row < p.height && col >= 0 && col < p.width)
                 {
-                    int64_t const off = ((static_cast<int64_t>(n) * p.height + row) * p.width + col) * C + c0;
-                    d[a][b] = *reinterpret_cast<Vec const*>(frames + off);
+                    d[a][b] = *reinterpret_cast<Vec const*>(rowp + b * C);
                 }
                 else
                 {
@@ -108,46 +199,54 @@ __global__ void __launch_bounds__(kThreads)
                 }
             }
         }
-        // Rows: t[a] = BT[a] . d  (t0 = d0 - d2, t1 = d1 + d2, t2 = d2 - d1, t3 = d1 - d3), then the
-        // same combination along columns; one 16-byte vector per coordinate.
-        VecS out[16];
+        TS* vp = v + vmOffset<A * A>(g, comp, 0, pair, tile, c0, C);
+        int64_t const coordStride = g.tilesPerComp * C;
 #pragma unroll
-        for (int e = 0; e < V / 2; ++e)
+        for (int x = 0; x < A; ++x)
         {
-            float2 tmat[4][4];
+            VecS out[A];
 #pragma unroll
-            for (int b = 0; b < 4; ++b)
+            for (int e = 0; e < V / 2; ++e)
             {
-                float2 const d0 = pairAt(d[0][b], e), d1 = pairAt(d[1][b], e), d2 = pairAt(d[2][b], e),
-                             d3 = pairAt(d[3][b], e);
-                tmat[0][b] = make_float2(d0.x - d2.x, d0.y - d2.y);
-                tmat[1][b] = make_float2(d1.x + d2.x, d1.y + d2.y);
-                tmat[2][b] = make_float2(d2.x - d1.x, d2.y - d1.y);
-                tmat[3][b] = make_float2(d1.x - d3.x, d1.y - d3.y);
+                float2 tb[A];
+#pragma unroll
+                for (int b = 0; b < A; ++b)
+                {
+                    float2 col[A];
+#pragma unroll
+                    for (int a = 0; a < A; ++a)
+                    {
+                        col[a] = pairAt(d[a][b], e);
+                    }
+                    tb[b] = W::bt(x, col);
+                }
+#pragma unroll
+                for (int y = 0; y < A; ++y)
+                {
+                    setPair(out[y], e, W::bt(y, tb));
+                }
             }
 #pragma unroll
-            for (int a = 0; a < 4; ++a)
+            for (int y = 0; y < A; ++y)
             {
-                float2 const t0 = tmat[a][0], t1 = tmat[a][1], t2 = tmat[a][2], t3 = tmat[a][3];
-                setPair(out[a * 4 + 0], e, make_float2(t0.x - t2.x, t0.y - t2.y));
-                setPair(out[a * 4 + 1], e, make_float2(t1.x + t2.x, t1.y + t2.y));
-                setPair(out[a * 4 + 2], e, make_float2(t2.x - t1.x, t2.y - t1.y));
-                setPair(out[a * 4 + 3], e, make_float2(t1.x - t3.x, t1.y - t3.y));
+                *reinterpret_cast<VecS*>(vp) = out[y];
+                vp += coordStride;
             }
-        }
-#pragma unroll
-        for (int k = 0; k < 16; ++k)
-        {
-            *reinterpret_cast<VecS*>(v + vmOffset(g, comp, k, pair, tile, c0, C)) = out[k];
         }
     }
 }
 
-// y = A^T M A for one tile and 8 channels: 16 vectors in, 4 output pixels out.
+// y = A^T M A for one tile and V channels: (m+2)^2 vectors in, m x m output pixels out.
+template <int M>
 __global__ void __launch_bounds__(kThreads)
     vaeWinoSpatialOutputKernel(TS const* __restrict__ m, T* __restrict__ frames, VaeWinoSpatialParams p)
 {
-    Geometry const g = geometry(p);
+    using W = WinoMath<M>;
+    constexpr int A = W::A;
+    constexpr int V = Lanes<M>::V;
+    using Vec = typename Lanes<M>::Vec;
+    using VecS = typename Lanes<M>::VecS;
+    Geometry const g = geometry<M>(p);
     int const C = p.channels;
     int const cvec = C / V;
     int64_t const total = static_cast<int64_t>(p.frames) * g.tilesPerFrame * cvec;
@@ -162,45 +261,48 @@ __global__ void __launch_bounds__(kThreads)
         int const j = static_cast<int>(tile - static_cast<int64_t>(i - p.row0) * g.tw);
         int const comp = n / g.pairs, pair = n - comp * g.pairs;
 
-        VecS mv[16];
+        VecS mv[A * A];
+        TS const* mp = m + vmOffset<A * A>(g, comp, 0, pair, tile, c0, C);
+        int64_t const coordStride = g.tilesPerComp * C;
 #pragma unroll
-        for (int k = 0; k < 16; ++k)
+        for (int k = 0; k < A * A; ++k)
         {
-            mv[k] = *reinterpret_cast<VecS const*>(m + vmOffset(g, comp, k, pair, tile, c0, C));
+            mv[k] = *reinterpret_cast<VecS const*>(mp);
+            mp += coordStride;
         }
-        Vec out[2][2];
+        T* frame0 = frames + (static_cast<int64_t>(n) * p.height * p.width) * C + c0;
 #pragma unroll
-        for (int e = 0; e < V / 2; ++e)
+        for (int r = 0; r < M; ++r)
         {
-            // Rows: t[r] = AT[r] . m  (t0 = m0 + m1 + m2, t1 = m1 - m2 - m3), then along columns.
-            float2 tmat[2][4];
+            Vec out[M];
 #pragma unroll
-            for (int b = 0; b < 4; ++b)
+            for (int e = 0; e < V / 2; ++e)
             {
-                float2 const m0 = pairAt(mv[0 * 4 + b], e), m1 = pairAt(mv[1 * 4 + b], e),
-                             m2 = pairAt(mv[2 * 4 + b], e), m3 = pairAt(mv[3 * 4 + b], e);
-                tmat[0][b] = make_float2(m0.x + m1.x + m2.x, m0.y + m1.y + m2.y);
-                tmat[1][b] = make_float2(m1.x - m2.x - m3.x, m1.y - m2.y - m3.y);
-            }
+                float2 tb[A];
 #pragma unroll
-            for (int r = 0; r < 2; ++r)
-            {
-                float2 const t0 = tmat[r][0], t1 = tmat[r][1], t2 = tmat[r][2], t3 = tmat[r][3];
-                setPair(out[r][0], e, make_float2(t0.x + t1.x + t2.x, t0.y + t1.y + t2.y));
-                setPair(out[r][1], e, make_float2(t1.x - t2.x - t3.x, t1.y - t2.y - t3.y));
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 2; ++r)
-        {
-#pragma unroll
-            for (int c = 0; c < 2; ++c)
-            {
-                if (2 * i + r < p.height && 2 * j + c < p.width)
+                for (int b = 0; b < A; ++b)
                 {
-                    int64_t const off
-                        = ((static_cast<int64_t>(n) * p.height + 2 * i + r) * p.width + 2 * j + c) * C + c0;
-                    *reinterpret_cast<Vec*>(frames + off) = out[r][c];
+                    float2 col[A];
+#pragma unroll
+                    for (int x = 0; x < A; ++x)
+                    {
+                        col[x] = pairAt(mv[x * A + b], e);
+                    }
+                    tb[b] = W::at(r, col);
+                }
+#pragma unroll
+                for (int sidx = 0; sidx < M; ++sidx)
+                {
+                    setPair(out[sidx], e, W::at(sidx, tb));
+                }
+            }
+            T* rowp = frame0 + (static_cast<int64_t>(M * i + r) * p.width + M * j) * C;
+#pragma unroll
+            for (int sidx = 0; sidx < M; ++sidx)
+            {
+                if (M * i + r < p.height && M * j + sidx < p.width)
+                {
+                    *reinterpret_cast<Vec*>(rowp + sidx * C) = out[sidx];
                 }
             }
         }
@@ -220,11 +322,19 @@ unsigned gridFor(int64_t total)
 
 void check(VaeWinoSpatialParams const& p)
 {
-    TLLM_CHECK_WITH_INFO(p.channels % V == 0, "vaeWinoSpatial: channels must be a multiple of %d", V);
+    TLLM_CHECK_WITH_INFO(p.tile == 2 || p.tile == 4, "vaeWinoSpatial: tile must be 2 or 4");
+    TLLM_CHECK_WITH_INFO(p.channels % 8 == 0, "vaeWinoSpatial: channels must be a multiple of 8");
     TLLM_CHECK_WITH_INFO(
         p.components >= 1 && p.frames % p.components == 0, "vaeWinoSpatial: frames must be a multiple of components");
-    TLLM_CHECK_WITH_INFO(
-        0 <= p.row0 && p.row0 < p.row1 && p.row1 <= (p.height + 1) / 2, "vaeWinoSpatial: bad tile-row range");
+    TLLM_CHECK_WITH_INFO(0 <= p.row0 && p.row0 < p.row1 && p.row1 <= (p.height + p.tile - 1) / p.tile,
+        "vaeWinoSpatial: bad tile-row range");
+}
+
+int64_t stripVectors(VaeWinoSpatialParams const& p)
+{
+    int const lanes = p.tile == 2 ? Lanes<2>::V : Lanes<4>::V;
+    return static_cast<int64_t>(p.frames) * (p.row1 - p.row0) * ((p.width + p.tile - 1) / p.tile)
+        * (p.channels / lanes);
 }
 
 } // namespace
@@ -232,18 +342,34 @@ void check(VaeWinoSpatialParams const& p)
 void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream)
 {
     check(p);
-    int64_t const total = static_cast<int64_t>(p.frames) * (p.row1 - p.row0) * ((p.width + 1) / 2) * (p.channels / V);
-    vaeWinoSpatialInputKernel<<<gridFor(total), kThreads, 0, stream>>>(
-        static_cast<T const*>(frames), static_cast<TS*>(v), p);
+    unsigned const grid = gridFor(stripVectors(p));
+    if (p.tile == 2)
+    {
+        vaeWinoSpatialInputKernel<2>
+            <<<grid, kThreads, 0, stream>>>(static_cast<T const*>(frames), static_cast<TS*>(v), p);
+    }
+    else
+    {
+        vaeWinoSpatialInputKernel<4>
+            <<<grid, kThreads, 0, stream>>>(static_cast<T const*>(frames), static_cast<TS*>(v), p);
+    }
     sync_check_cuda_error(stream);
 }
 
 void launchVaeWinoSpatialOutput(void const* m, void* frames, VaeWinoSpatialParams const& p, cudaStream_t stream)
 {
     check(p);
-    int64_t const total = static_cast<int64_t>(p.frames) * (p.row1 - p.row0) * ((p.width + 1) / 2) * (p.channels / V);
-    vaeWinoSpatialOutputKernel<<<gridFor(total), kThreads, 0, stream>>>(
-        static_cast<TS const*>(m), static_cast<T*>(frames), p);
+    unsigned const grid = gridFor(stripVectors(p));
+    if (p.tile == 2)
+    {
+        vaeWinoSpatialOutputKernel<2>
+            <<<grid, kThreads, 0, stream>>>(static_cast<TS const*>(m), static_cast<T*>(frames), p);
+    }
+    else
+    {
+        vaeWinoSpatialOutputKernel<4>
+            <<<grid, kThreads, 0, stream>>>(static_cast<TS const*>(m), static_cast<T*>(frames), p);
+    }
     sync_check_cuda_error(stream);
 }
 

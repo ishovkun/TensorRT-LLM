@@ -2185,12 +2185,19 @@ def _main_fused(args) -> None:
         t_port = _time_cupti(
             lambda: wino_spatial_conv_cuda(d4, u_portable, h, w), 3, args.iters, use_graph=True
         )["span"]["median_us"]
+        u_f4 = winograd_spatial_weights(weight, 4)
+        y_f4 = wino_spatial_conv_cuda(d4, u_f4, h, w).view(components * pairs, h, w, cout)
+        rel_f4 = ((y_f4.float() - ref).norm() / ref.norm()).item()
+        t_f4 = _time_cupti(
+            lambda: wino_spatial_conv_cuda(d4, u_f4, h, w), 3, args.iters, use_graph=True
+        )["span"]["median_us"]
         t_cute = _time_cupti(
             lambda: wino_spatial_conv_cute(d4, u_cute, h, w), 3, args.iters, use_graph=True
         )["span"]["median_us"]
         print(
             f"portable path: {t_port / 1000:8.3f} ms  (in-transform + cuBLAS bmm + out-transform)"
         )
+        print(f"portable F4  : {t_f4 / 1000:8.3f} ms  (F(4x4,3x3): 36 GEMMs; rel-L2 {rel_f4:.3e})")
         print(
             f"cute path    : {t_cute / 1000:8.3f} ms  (in-transform + two-pass GEMM, combine inside)"
         )

@@ -326,23 +326,41 @@ def winograd_weights(weight: torch.Tensor) -> list[torch.Tensor]:
     return [g.to(weight.dtype).contiguous(memory_format=torch.channels_last) for g in gs]
 
 
-# F(2x2, 3x3) spatial transform constants (Lavin & Gray); fp32, moved to the device once.
-_WINO_G = torch.tensor(
-    [[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]], dtype=torch.float32
-)
+# Spatial filter transforms G of F(2x2, 3x3) and F(4x4, 3x3) (Lavin & Gray; points 0, +-1, +-2
+# for the latter), applied in fp64 and rounded once.
+_WINO_G = {
+    2: torch.tensor([[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]], dtype=torch.float64),
+    4: torch.tensor(
+        [
+            [1 / 4, 0, 0],
+            [-1 / 6, -1 / 6, -1 / 6],
+            [-1 / 6, 1 / 6, -1 / 6],
+            [1 / 24, 1 / 12, 1 / 6],
+            [1 / 24, -1 / 12, 1 / 6],
+            [0, 0, 1],
+        ],
+        dtype=torch.float64,
+    ),
+}
 
 
-def winograd_spatial_weights(weight: torch.Tensor) -> torch.Tensor:
-    """``[Cout, Cin, 3, 3, 3]`` -> ``U [64, Cin, Cout]`` fp16: the four temporal components of
-    :func:`winograd_weights`, each transformed as ``G g G^T`` (fp32, rounded once), ordered
-    ``component * 16 + row * 4 + col`` to match ``trtllm::vae_wino_spatial_in``. The transformed
-    data is fp16 end to end (V, U, M): three more mantissa bits than bf16 through the GEMMs."""
-    g0, g1, g2 = (weight[:, :, i].detach().float() for i in range(3))
+def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2) -> torch.Tensor:
+    """``[Cout, Cin, 3, 3, 3]`` -> ``U [4 * (tile+2)^2, Cin, Cout]`` fp16: the four temporal
+    components of :func:`winograd_weights`, each transformed as ``G g G^T`` for spatial
+    F(tile x tile, 3x3), ordered ``component * (tile+2)^2 + row * (tile+2) + col`` to match
+    ``trtllm::vae_wino_spatial_in``. The transformed data is fp16 end to end (V, U, M)."""
+    g0, g1, g2 = (weight[:, :, i].detach().double() for i in range(3))
     comps = torch.stack([g0, (g0 + g1 + g2) / 2, (g0 - g1 + g2) / 2, g2])  # [4, Cout, Cin, 3, 3]
-    gm = _WINO_G.to(weight.device)
-    u = torch.einsum("xa,noiab,yb->nxyoi", gm, comps, gm)  # [4, 4, 4, Cout, Cin]
+    gm = _WINO_G[tile].to(weight.device)
+    u = torch.einsum("xa,noiab,yb->nxyoi", gm, comps, gm)  # [4, a, a, Cout, Cin]
     cout, cin = weight.shape[:2]
-    return u.reshape(64, cout, cin).transpose(1, 2).contiguous().to(torch.float16)
+    coords = (tile + 2) ** 2
+    return u.reshape(4 * coords, cout, cin).transpose(1, 2).contiguous().to(torch.float16)
+
+
+def spatial_tile_of(u: torch.Tensor, components: int = 4) -> int:
+    """The tile size a :func:`winograd_spatial_weights` tensor was built for."""
+    return int(round((u.shape[0] // components) ** 0.5)) - 2
 
 
 def cuda_wino_spatial_available() -> bool:
@@ -399,15 +417,16 @@ def wino_spatial_conv_cuda(
 ) -> torch.Tensor:
     """3x3 conv (padding 1) of the four slabs by their four filters as spatial Winograd:
     ``D [4, pairs, H*W, Cin]`` -> ``M [4, pairs, H*W, Cout]`` (bias-free, fp32 accumulate).
-    Input transform and output transform are CUDA kernels; the 64 GEMMs are one
-    cuBLAS batched call."""
+    Input transform and output transform are CUDA kernels; the batched GEMMs are one cuBLAS
+    call. The tile size (2 or 4) follows the filters ``u``."""
     comps, pairs, positions, cin = d.shape
+    tile = spatial_tile_of(u, comps)
     frames = d.view(comps * pairs, height, width, cin)
-    tile_rows = (height + 1) // 2
-    v = torch.ops.trtllm.vae_wino_spatial_in(frames, comps, 0, tile_rows)
+    tile_rows = -(-height // tile)
+    v = torch.ops.trtllm.vae_wino_spatial_in(frames, comps, 0, tile_rows, tile)
     m = torch.bmm(v, u)
     out = torch.empty((comps * pairs, height, width, u.shape[2]), dtype=d.dtype, device=d.device)
-    torch.ops.trtllm.vae_wino_spatial_out(m, out, comps, 0, tile_rows)
+    torch.ops.trtllm.vae_wino_spatial_out(m, out, comps, 0, tile_rows, tile)
     return out.view(comps, pairs, positions, u.shape[2])
 
 

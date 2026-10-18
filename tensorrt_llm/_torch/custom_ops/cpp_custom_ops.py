@@ -232,15 +232,15 @@ def _register_fake():
         return u.new_empty((2 * u.shape[0], u.shape[1], u.shape[2] // 2))
 
     @torch.library.register_fake("trtllm::vae_wino_spatial_in")
-    def _(frames, components, row0, row1):
+    def _(frames, components, row0, row1, tile=2):
         n, _, w, c = frames.shape
         return frames.new_empty(
-            (components * 16,
-             (n // components) * (row1 - row0) * ((w + 1) // 2), c),
+            (components * (tile + 2) * (tile + 2),
+             (n // components) * (row1 - row0) * ((w + tile - 1) // tile), c),
             dtype=torch.float16)
 
     @torch.library.register_fake("trtllm::vae_wino_spatial_out")
-    def _(m, frames, components, row0, row1):
+    def _(m, frames, components, row0, row1, tile=2):
         return frames
 
     @torch.library.register_fake("trtllm::deepseek_v4_q_norm")

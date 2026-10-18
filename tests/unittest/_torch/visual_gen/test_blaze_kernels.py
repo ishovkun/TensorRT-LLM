@@ -566,69 +566,110 @@ _BT = torch.tensor([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], 
 _AT = torch.tensor([[1, 1, 1, 0], [0, 1, -1, -1]], dtype=torch.float32)
 
 
-def _ref_spatial_in(frames: torch.Tensor, components: int, row0: int, row1: int) -> torch.Tensor:
-    """frames [N, H, W, C] -> V [components*16, (N/components) * strip tiles, C] in fp32."""
+_BT4 = torch.tensor(
+    [
+        [4, 0, -5, 0, 1, 0],
+        [0, -4, -4, 1, 1, 0],
+        [0, 4, -4, -1, 1, 0],
+        [0, -2, -1, 2, 1, 0],
+        [0, 2, -1, -2, 1, 0],
+        [0, 4, 0, -5, 0, 1],
+    ],
+    dtype=torch.float32,
+)
+_AT4 = torch.tensor(
+    [[1, 1, 1, 1, 1, 0], [0, 1, -1, 2, -2, 0], [0, 1, 1, 4, 4, 0], [0, 1, -1, 8, -8, 1]],
+    dtype=torch.float32,
+)
+_SPATIAL_MATS = {2: (_BT, _AT), 4: (_BT4, _AT4)}
+
+
+def _ref_spatial_in(
+    frames: torch.Tensor, components: int, row0: int, row1: int, tile: int = 2
+) -> torch.Tensor:
+    """frames [N, H, W, C] -> V [components*(tile+2)^2, (N/components) * strip tiles, C] in fp32."""
     n, h, w, c = frames.shape
+    a = tile + 2
+    th, tw = -(-h // tile), -(-w // tile)
     x = frames.permute(0, 3, 1, 2).float()
     tiles = F.unfold(
-        F.pad(x, (1, 1 + w % 2, 1, 1 + h % 2)), kernel_size=4, stride=2
-    )  # [n, c*16, L]
-    th, tw = (h + 1) // 2, (w + 1) // 2
-    tiles = tiles.view(n, c, 4, 4, th, tw)[..., row0:row1, :].reshape(n, c, 4, 4, -1)
-    bt = _BT.to(frames.device)
+        F.pad(
+            x,
+            (1, th * tile + 1 - h, 1, tw * tile + 1 - w)
+            if False
+            else (1, tw * tile + 1 - w, 1, th * tile + 1 - h),
+        ),
+        kernel_size=a,
+        stride=tile,
+    )  # [n, c*a*a, L]
+    tiles = tiles.view(n, c, a, a, th, tw)[..., row0:row1, :].reshape(n, c, a, a, -1)
+    bt = _SPATIAL_MATS[tile][0].to(frames.device)
     v = torch.einsum("xa,ncabl,yb->nxylc", bt, tiles, bt)
     pairs = n // components
     return (
-        v.reshape(components, pairs, 16, -1, c)
+        v.reshape(components, pairs, a * a, -1, c)
         .permute(0, 2, 1, 3, 4)
-        .reshape(components * 16, -1, c)
+        .reshape(components * a * a, -1, c)
     )
 
 
 def _ref_spatial_out(
-    m: torch.Tensor, n: int, h: int, w: int, components: int, row0: int, row1: int
+    m: torch.Tensor, n: int, h: int, w: int, components: int, row0: int, row1: int, tile: int = 2
 ) -> torch.Tensor:
-    """M [components*16, (N/components) * strip tiles, C] -> y [N, 2*(row1-row0), W, C] in fp32."""
-    comp16, _, c = m.shape
+    """M [components*(tile+2)^2, (N/components) * strip tiles, C] -> y [N, tile*(row1-row0), W, C]
+    in fp32."""
+    _, _, c = m.shape
+    a = tile + 2
     pairs = n // components
-    rows, tw = row1 - row0, (w + 1) // 2
-    mm = m.float().view(components, 4, 4, pairs, rows, tw, c)
-    at = _AT.to(m.device)
+    rows, tw = row1 - row0, -(-w // tile)
+    mm = m.float().view(components, a, a, pairs, rows, tw, c)
+    at = _SPATIAL_MATS[tile][1].to(m.device)
     y = torch.einsum("rx,nxyphwc,sy->nphrwsc", at, mm, at)
-    return y.reshape(n, rows * 2, tw * 2, c)[:, : min(rows * 2, h - 2 * row0), :w]
+    return y.reshape(n, rows * tile, tw * tile, c)[:, : min(rows * tile, h - tile * row0), :w]
 
 
 @spatial_op
 @pytest.mark.parametrize("C", [8, 160, 256])
-@pytest.mark.parametrize("hw", [(6, 10), (5, 9)])
+@pytest.mark.parametrize("hw", [(6, 10), (5, 9), (12, 20), (9, 13)])
 @pytest.mark.parametrize("strip", [(0, 3), (1, 2), (2, 3)])
-def test_spatial_winograd_transforms(C: int, strip: tuple[int, int], hw: tuple[int, int]) -> None:
+@pytest.mark.parametrize("tile", [2, 4])
+def test_spatial_winograd_transforms(
+    C: int, strip: tuple[int, int], hw: tuple[int, int], tile: int
+) -> None:
     torch.manual_seed(0)
     n, components = 8, 4
     (h, w), (row0, row1) = hw, strip
+    if row1 > -(-h // tile):
+        pytest.skip("strip past the last tile row")
     frames = torch.randn(n, h, w, C, device="cuda").to(torch.bfloat16)
-    v = torch.ops.trtllm.vae_wino_spatial_in(frames, components, row0, row1)
-    v_ref = _ref_spatial_in(frames, components, row0, row1)
+    v = torch.ops.trtllm.vae_wino_spatial_in(frames, components, row0, row1, tile)
+    v_ref = _ref_spatial_in(frames, components, row0, row1, tile)
     assert v.shape == v_ref.shape
     assert v.dtype == torch.float16
+    # bf16 inputs times integer transform entries are exact in fp32: bitwise after rounding.
     assert torch.equal(v.float(), v_ref.to(torch.float16).float())
 
-    m = torch.randn(components * 16, v.shape[1], C, device="cuda").to(torch.float16)
+    coords = (tile + 2) ** 2
+    m = torch.randn(components * coords, v.shape[1], C, device="cuda").to(torch.float16)
     out = torch.full((n, h, w, C), float("nan"), device="cuda", dtype=torch.bfloat16)
-    torch.ops.trtllm.vae_wino_spatial_out(m, out, components, row0, row1)
-    got = out[:, 2 * row0 : min(2 * row1, h)]
-    assert torch.equal(
-        got.float(), _ref_spatial_out(m, n, h, w, components, row0, row1).to(torch.bfloat16).float()
-    )
-    untouched = torch.cat([out[:, : 2 * row0], out[:, 2 * row1 :]], dim=1)
+    torch.ops.trtllm.vae_wino_spatial_out(m, out, components, row0, row1, tile)
+    got = out[:, tile * row0 : min(tile * row1, h)].float()
+    ref = _ref_spatial_out(m, n, h, w, components, row0, row1, tile)
+    if tile == 2:
+        assert torch.equal(got, ref.to(torch.bfloat16).float())
+    else:
+        # fp16 products with entries up to 8 summed over six terms: fp32 order-dependent.
+        torch.testing.assert_close(got, ref.to(torch.bfloat16).float(), rtol=2e-2, atol=1e-2)
+    untouched = torch.cat([out[:, : tile * row0], out[:, tile * row1 :]], dim=1)
     assert torch.isnan(untouched.float()).all()
 
 
 @spatial_op
 @pytest.mark.parametrize("cin_cout", [(16, 24), (64, 32)])
 @pytest.mark.parametrize("hw", [(6, 10), (5, 9)])
+@pytest.mark.parametrize("tile", [2, 4])
 def test_spatial_winograd_conv_matches_conv2d(
-    cin_cout: tuple[int, int], hw: tuple[int, int]
+    cin_cout: tuple[int, int], hw: tuple[int, int], tile: int
 ) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
         wino_spatial_conv_cuda,
@@ -642,7 +683,7 @@ def test_spatial_winograd_conv_matches_conv2d(
     pairs = 3
     weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
     d = torch.randn(4, pairs, h * w, cin, device="cuda").to(torch.bfloat16)
-    got = wino_spatial_conv_cuda(d, winograd_spatial_weights(weight), h, w)
+    got = wino_spatial_conv_cuda(d, winograd_spatial_weights(weight, tile), h, w)
     g = winograd_weights(weight)
     for k in range(4):
         ref = F.conv2d(

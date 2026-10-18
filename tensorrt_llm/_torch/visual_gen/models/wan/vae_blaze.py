@@ -132,10 +132,14 @@ class VaeBlazeOptions:
     # channel): "auto" uses it on convs with >= 1024 input channels and at most 90x160
     # pixels, "all" on every Winograd conv (tests), "off" never. Needs winograd_temporal.
     winograd_spatial: str = "off"
-    # Spatial-Winograd GEMM kernel: "cute" = the CuTe DSL two-pass kernel + CUDA combine on
-    # Blackwell for convs with Cout % 256 == 0 and frames of at least 45x80 pixels (cuBLAS
-    # elsewhere); "cublas" = the portable path everywhere.
-    winograd_spatial_kernel: str = "cute"
+    # Spatial-Winograd GEMM kernel: "cublas" = the portable path (transform kernels + cuBLAS
+    # batched GEMMs); "cute" = the CuTe DSL two-pass kernel on Blackwell for F(2x2, 3x3) convs
+    # with Cout % 256 == 0 and frames of at least 45x80 pixels (cuBLAS elsewhere). Measured on
+    # GB200, the portable F(4x4, 3x3) path is the fastest on every layer it applies to.
+    winograd_spatial_kernel: str = "cublas"
+    # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (1.8x fewer GEMM FLOPs
+    # and transformed bytes; fp16 storage keeps its error below the bf16 F2 path).
+    winograd_spatial_tile: int = 4
     # Checklist item 9: the convs that still run as 3D with a causal cache (one frame per
     # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
     # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
@@ -157,6 +161,10 @@ class VaeBlazeOptions:
         if self.winograd_spatial not in ("off", "auto", "all"):
             raise ValueError(
                 f"winograd_spatial must be 'off', 'auto' or 'all', got {self.winograd_spatial!r}"
+            )
+        if self.winograd_spatial_tile not in (2, 4):
+            raise ValueError(
+                f"winograd_spatial_tile must be 2 or 4, got {self.winograd_spatial_tile!r}"
             )
         if self.winograd_spatial_kernel not in ("cublas", "cute"):
             raise ValueError(
@@ -482,6 +490,7 @@ class BlazeCausalConv3d(nn.Conv3d):
         # Spatial Winograd mode for forward_winograd ("off", "auto", "all"), set by the block.
         self.winograd_spatial = "off"
         self.winograd_spatial_kernel = "cublas"
+        self.winograd_spatial_tile = 2
         self._wino_u_nk: tuple[int, int, torch.Tensor] | None = None
         self._wino_u: tuple[int, int, torch.Tensor] | None = None
 
@@ -601,15 +610,15 @@ class BlazeCausalConv3d(nn.Conv3d):
         )
 
     def _winograd_spatial_weights(self) -> torch.Tensor:
-        key = (self.weight.data_ptr(), self.weight._version)
-        if self._wino_u is None or self._wino_u[:2] != key:
-            self._wino_u = (*key, winograd_spatial_weights(self.weight))
-        return self._wino_u[2]
+        key = (self.weight.data_ptr(), self.weight._version, self.winograd_spatial_tile)
+        if self._wino_u is None or self._wino_u[:3] != key:
+            self._wino_u = (*key, winograd_spatial_weights(self.weight, self.winograd_spatial_tile))
+        return self._wino_u[3]
 
     def _winograd_spatial_weights_cute(self) -> torch.Tensor:
         key = (self.weight.data_ptr(), self.weight._version)
         if self._wino_u_nk is None or self._wino_u_nk[:2] != key:
-            u_nk = self._winograd_spatial_weights().transpose(1, 2).contiguous()
+            u_nk = winograd_spatial_weights(self.weight, 2).transpose(1, 2).contiguous()
             self._wino_u_nk = (*key, cute_spatial_filters(u_nk))
         return self._wino_u_nk[2]
 
@@ -629,6 +638,10 @@ class BlazeCausalConv3d(nn.Conv3d):
             return False
         if self.winograd_spatial == "all":
             return True
+        # Measured winners on GB200: with F(4x4, 3x3) every 1024-channel layer and the
+        # 512-channel level up to 180x320; with F(2x2, 3x3) the 1024-channel levels only.
+        if self.winograd_spatial_tile == 4:
+            return self.in_channels >= 512 and height * width <= 180 * 320
         return self.in_channels >= 1024 and height * width <= 90 * 160
 
     def forward_winograd(self, slabs: WinoSlabs) -> list[torch.Tensor]:
@@ -1095,6 +1108,9 @@ class BlazeResidualBlock(nn.Module):
         self.conv1.winograd_spatial = self.conv2.winograd_spatial = spatial
         self.conv1.winograd_spatial_kernel = self.conv2.winograd_spatial_kernel = (
             self.options.winograd_spatial_kernel
+        )
+        self.conv1.winograd_spatial_tile = self.conv2.winograd_spatial_tile = (
+            self.options.winograd_spatial_tile
         )
         m1 = self.conv1.forward_winograd(slabs)
 
