@@ -60,6 +60,8 @@ from .blaze_kernels import (
     wino_norm_silu_cuda,
     wino_spatial_conv_cuda,
     wino_spatial_conv_cute,
+    wino_spatial_conv_frames,
+    winograd_spatial_taps_weights,
     winograd_spatial_weights,
     winograd_weights,
 )
@@ -119,7 +121,8 @@ class VaeBlazeOptions:
     conv_out_frame_split: int = 0
     # Checklist item 7: on a chunk with no causal history (the first chunk of a video,
     # every image) a 3x3x3 causal conv on one frame equals a 3x3 conv2d with the
-    # current-frame weight slice; the two zero-history taps are skipped.
+    # current-frame weight slice; the two zero-history taps are skipped (cuDNN conv2d, or
+    # spatial Winograd with ``winograd_spatial_first_frame``).
     first_frame_conv2d: bool = False
     # Checklist item 8: temporal Winograd F(2,3) on the residual-block convs of chunks
     # with an even number (>= 2) of frames. The norm kernel emits the four transformed
@@ -128,9 +131,12 @@ class VaeBlazeOptions:
     winograd_temporal: bool = False
     # Checklist item 22: spatial Winograd F(2x2,3x3) on top of the temporal one. The four
     # 3x3 conv2d calls become an input transform, 64 cuBLAS batched GEMMs and an output
-    # transform. It pays only where cuDNN's implicit GEMM is weak (few output pixels per
-    # channel): "auto" uses it on convs with >= 1024 input channels and at most 90x160
-    # pixels, "all" on every Winograd conv (tests), "off" never. Needs winograd_temporal.
+    # transform. Single-frame calls (the first frame of a clip, every image, and the
+    # one-frame chunks of a streaming decode at the low-resolution levels) run spatial
+    # Winograd alone: the three temporal taps are summed inside the GEMM (K = 3 * Cin), the
+    # zero-history first frame keeps one tap. It pays where cuDNN's implicit GEMM is weak
+    # (few output pixels per channel): "auto" uses it on the measured winners (see
+    # ``spatial_eligible``), "all" on every eligible conv (tests), "off" never.
     winograd_spatial: str = "off"
     # Spatial-Winograd GEMM kernel: "cublas" = the portable path (transform kernels + cuBLAS
     # batched GEMMs); "cute" = the CuTe DSL two-pass kernel on Blackwell for F(2x2, 3x3) convs
@@ -140,6 +146,15 @@ class VaeBlazeOptions:
     # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (1.8x fewer GEMM FLOPs
     # and transformed bytes; fp16 storage keeps its error below the bf16 F2 path).
     winograd_spatial_tile: int = 4
+    # Tile for the single-frame calls with a causal history (spatial Winograd alone, the three
+    # taps summed in the GEMM). They replace a direct cuDNN conv3d, so F(2x2, 3x3), whose
+    # per-conv error matches direct bf16, keeps the model's accuracy; F(4x4, 3x3) is faster
+    # and ~2x noisier per conv.
+    winograd_spatial_single_tile: int = 2
+    # Run the zero-history first frame (and every image) as spatial Winograd on the
+    # current-frame tap instead of cuDNN conv2d. Faster at the 1024-channel levels with
+    # ``winograd_spatial_tile = 4``, at ~2x the per-conv error of the conv2d it replaces.
+    winograd_spatial_first_frame: bool = False
     # Checklist item 9: the convs that still run as 3D with a causal cache (one frame per
     # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
     # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
@@ -161,6 +176,10 @@ class VaeBlazeOptions:
         if self.winograd_spatial not in ("off", "auto", "all"):
             raise ValueError(
                 f"winograd_spatial must be 'off', 'auto' or 'all', got {self.winograd_spatial!r}"
+            )
+        if self.winograd_spatial_single_tile not in (2, 4):
+            raise ValueError(
+                f"winograd_spatial_single_tile must be 2 or 4, got {self.winograd_spatial_single_tile!r}"
             )
         if self.winograd_spatial_tile not in (2, 4):
             raise ValueError(
@@ -491,8 +510,11 @@ class BlazeCausalConv3d(nn.Conv3d):
         self.winograd_spatial = "off"
         self.winograd_spatial_kernel = "cublas"
         self.winograd_spatial_tile = 2
+        self.winograd_spatial_single_tile = 2
+        self.winograd_spatial_first_frame = False
         self._wino_u_nk: tuple[int, int, torch.Tensor] | None = None
         self._wino_u: tuple[int, int, torch.Tensor] | None = None
+        self._wino_u_taps: dict[int, tuple[int, int, torch.Tensor]] = {}
 
     # ---- frame buffer ("slab") for the causal history -------------------------------
     # The buffer holds [1, C, S, H, W] channels-last frames; frames [pos-2, pos) are the
@@ -560,6 +582,12 @@ class BlazeCausalConv3d(nn.Conv3d):
         slab = self._slab
         pos = self._slab_pos
         bias = None if self.defer_bias else self.bias
+        if frames == 1 and self.spatial_eligible(
+            slab.shape[3], slab.shape[4], self.winograd_spatial_single_tile
+        ):
+            y = self._forward_spatial_frames(slab[:, :, pos - 2 : pos + 1], bias)
+            self._slab_pos = pos + 1
+            return y
         if self.max_in_frames is not None and frames + 2 > self.max_in_frames:
             per_call = self.max_in_frames - 2
             parts = [
@@ -633,16 +661,39 @@ class BlazeCausalConv3d(nn.Conv3d):
             and height * width >= 45 * 80
         )
 
-    def spatial_eligible(self, height: int, width: int) -> bool:
-        if self.winograd_spatial == "off" or self.padding[1:] != (1, 1) or self.in_channels % 8:
+    def spatial_eligible(self, height: int, width: int, tile: int | None = None) -> bool:
+        tile = self.winograd_spatial_tile if tile is None else tile
+        if (
+            self.winograd_spatial == "off"
+            or self.padding[1:] != (1, 1)
+            or self.in_channels % 8
+            or self.out_channels % 8
+        ):
             return False
         if self.winograd_spatial == "all":
             return True
         # Measured winners on GB200: with F(4x4, 3x3) every 1024-channel layer and the
         # 512-channel level up to 180x320; with F(2x2, 3x3) the 1024-channel levels only.
-        if self.winograd_spatial_tile == 4:
+        if tile == 4:
             return self.in_channels >= 512 and height * width <= 180 * 320
         return self.in_channels >= 1024 and height * width <= 90 * 160
+
+    def _winograd_taps_weights(self, taps: int, tile: int) -> torch.Tensor:
+        key = (self.weight.data_ptr(), self.weight._version)
+        cached = self._wino_u_taps.get((taps, tile))
+        if cached is None or cached[:2] != key:
+            cached = (*key, winograd_spatial_taps_weights(self.weight, tile, taps))
+            self._wino_u_taps[(taps, tile)] = cached
+        return cached[2]
+
+    def _forward_spatial_frames(self, x: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+        """One output frame by spatial Winograd alone: ``x`` holds the taps' input frames
+        (``[1, C, 1, H, W]`` with zero history, or ``[1, C, 3, H, W]``: t-2, t-1, t)."""
+        _, _, taps, h, w = x.shape
+        tile = self.winograd_spatial_tile if taps == 1 else self.winograd_spatial_single_tile
+        u = self._winograd_taps_weights(taps, tile)
+        y = wino_spatial_conv_frames(frames_view(x), u, h, w, bias)
+        return frames_to_video(y.unsqueeze(0), h, w)
 
     def forward_winograd(self, slabs: WinoSlabs) -> list[torch.Tensor]:
         """The four 3x3 convs of the transformed slabs (bias left to the consumer): cuDNN
@@ -685,6 +736,8 @@ class BlazeCausalConv3d(nn.Conv3d):
             and spatial_padding is None
         ):
             # Zero history: only the current-frame taps contribute.
+            if self.winograd_spatial_first_frame and self.spatial_eligible(x.shape[3], x.shape[4]):
+                return self._forward_spatial_frames(x, bias)
             y = F.conv2d(
                 x[:, :, 0],
                 self._current_frame_weight(),
@@ -706,6 +759,17 @@ class BlazeCausalConv3d(nn.Conv3d):
         x = _channels_last_3d_if_needed(x)
         padding = self.padding if spatial_padding is None else (0, *spatial_padding)
         kt = self.kernel_size[0]
+        if (
+            kt == 3
+            and x.shape[2] == 3
+            and x.shape[0] == 1
+            and self.stride == (1, 1, 1)
+            and self.dilation == (1, 1, 1)
+            and self.groups == 1
+            and spatial_padding is None
+            and self.spatial_eligible(x.shape[3], x.shape[4], self.winograd_spatial_single_tile)
+        ):
+            return self._forward_spatial_frames(x, bias)
         if (
             self.max_in_frames is not None
             and self.stride[0] == 1
@@ -951,6 +1015,15 @@ class BlazeResidualBlock(nn.Module):
             BlazeCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
         )
         self._merged_bias: tuple[int, int, torch.Tensor] | None = None
+        # Spatial Winograd applies to both convs on every path (frame pairs, cached single
+        # frames, the first frame), so the mode is fixed here, not when a path first runs.
+        spatial = self.options.winograd_spatial if self.options.use_winograd_spatial else "off"
+        for conv in (self.conv1, self.conv2):
+            conv.winograd_spatial = spatial
+            conv.winograd_spatial_kernel = self.options.winograd_spatial_kernel
+            conv.winograd_spatial_tile = self.options.winograd_spatial_tile
+            conv.winograd_spatial_single_tile = self.options.winograd_spatial_single_tile
+            conv.winograd_spatial_first_frame = self.options.winograd_spatial_first_frame
 
     def _output_bias(self, with_shortcut: bool) -> torch.Tensor:
         """conv2's bias, plus the shortcut conv's when that one was deferred too."""
@@ -1104,14 +1177,6 @@ class BlazeResidualBlock(nn.Module):
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
         residual = self.conv_shortcut(x_in)
-        spatial = self.options.winograd_spatial if self.options.use_winograd_spatial else "off"
-        self.conv1.winograd_spatial = self.conv2.winograd_spatial = spatial
-        self.conv1.winograd_spatial_kernel = self.conv2.winograd_spatial_kernel = (
-            self.options.winograd_spatial_kernel
-        )
-        self.conv1.winograd_spatial_tile = self.conv2.winograd_spatial_tile = (
-            self.options.winograd_spatial_tile
-        )
         m1 = self.conv1.forward_winograd(slabs)
 
         idx = feat_idx[0]
