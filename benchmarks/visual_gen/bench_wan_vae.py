@@ -59,6 +59,8 @@ SHAPES: dict[str, tuple[int, int, int]] = {
     # Cosmos3-Nano-Sim-Bimanual streaming decode: 901 pixel frames = 226 latent frames,
     # decoded 2 latent frames (8 pixel frames) per step after a 1-frame cold start.
     "bimanual_480x832_901f": (901, 480, 832),
+    # Its conditioning input: one 480x832 image encoded once per episode.
+    "bimanual_cond_480x832": (1, 480, 832),
 }
 # Decoder temporal chunk size (latent frames per call) a shape is decoded with when the
 # command line does not override it.

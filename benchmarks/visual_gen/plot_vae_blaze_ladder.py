@@ -8,6 +8,44 @@ import argparse
 import json
 from pathlib import Path
 
+# Bars drawn per panel, in this order, and their display names. The vLLM-Omni bit-exact
+# level is kept in ladder.json but not drawn: it times the same as Diffusers by construction.
+SERIES = (
+    ("diffusers", "diffusers"),
+    ("native", "trt-llm native"),
+    ("vllm_channels_last", "vllm"),
+    ("blaze", "WinoVae"),
+)
+# Plot columns: per op the bench shape, the row field drawn, and the panel title (frames and
+# resolution as in SHAPES of bench_wan_vae.py). The bimanual-sim column shows what the sim
+# pays per episode: the steady-state decode step and the one-time encode of its input image.
+COLUMNS: dict[str, dict[str, tuple[str, str, str]]] = {
+    "t2i": {
+        "decode": ("t2i_1024", "median_ms", "decode — t2i, 1 frame @ 1024x1024"),
+        "encode": ("t2i_1024", "median_ms", "encode — t2i, 1 frame @ 1024x1024"),
+    },
+    "t2v_720p": {
+        "decode": ("t2v_720p_189f", "median_ms", "decode — t2v, 189 frames @ 720x1280"),
+        "encode": ("t2v_720p_189f", "median_ms", "encode — t2v, 189 frames @ 720x1280"),
+    },
+    "edge_480p": {
+        "decode": ("edge_480p_121f", "median_ms", "decode — edge, 121 frames @ 480x832"),
+        "encode": ("edge_480p_121f", "median_ms", "encode — edge, 121 frames @ 480x832"),
+    },
+    "bimanual_sim": {
+        "decode": (
+            "bimanual_480x832_901f",
+            "step_ms",
+            "bimanual-sim decode step: 2 latents -> 8 frames @ 480x832",
+        ),
+        "encode": (
+            "bimanual_cond_480x832",
+            "median_ms",
+            "bimanual-sim encode: 1 image @ 480x832, once per episode",
+        ),
+    },
+}
+
 
 def _load_runs(run_dir: Path) -> list[dict]:
     runs = [json.loads(p.read_text()) for p in sorted(run_dir.glob("run_*.json"))]
@@ -52,6 +90,8 @@ def _ladder_rows(runs: list[dict]) -> list[dict]:
                     "p90_ms": r["timing"]["span"]["p90_us"] / 1e3,
                     "wall_median_ms": r["timing"]["wall"]["median_us"] / 1e3,
                     "kernels_per_iter": r["timing"]["kernels_per_iter"],
+                    "step_ms": r.get("step_latency", {}).get("step_ms"),
+                    "cold_start_ms": r.get("step_latency", {}).get("cold_start_ms"),
                     "speedup_vs_diffusers": (_median_ms(diffusers) / _median_ms(r))
                     if diffusers
                     else None,
@@ -65,56 +105,47 @@ def _ladder_rows(runs: list[dict]) -> list[dict]:
     return rows
 
 
-def _plot(
-    rows: list[dict], out_png: Path, gpu: str, world_size: int, only_shapes: set[str] | None = None
-) -> None:
+def _plot(rows: list[dict], out_png: Path, gpu: str, world_size: int, columns: list[str]) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    ops = [op for op in ("decode", "encode") if any(r["op"] == op for r in rows)]
-    shapes = (
-        sorted({r["shape"] for r in rows} & only_shapes)
-        if only_shapes
-        else sorted({r["shape"] for r in rows})
-    )
-    # One bar per (backend/label) in chronological order; reference backends from their latest run.
+    ops = ("decode", "encode")
+    present = {r["shape"] for r in rows}
+    columns = [c for c in columns if any(COLUMNS[c][op][0] in present for op in ops)]
+    # Per panel the most recent measurement of each backend is drawn (a run may cover only
+    # some shapes). The history stays in ladder.json.
     series: list[tuple[str, dict[tuple[str, str], dict]]] = []
-    for backend in ("diffusers", "vllm_lossless", "vllm_channels_last", "native"):
+    for backend, name in SERIES:
         pts: dict[tuple[str, str], dict] = {}
-        for r in rows:  # rows are chronological; later runs overwrite
-            if r["backend"] == backend:
-                pts[(r["shape"], r["op"])] = r
+        for r in sorted((r for r in rows if r["backend"] == backend), key=lambda r: r["timestamp"]):
+            pts[(r["shape"], r["op"])] = r
         if pts:
-            series.append((backend, pts))
-    # Per panel the most recent blaze measurement is drawn (a run may cover only some
-    # shapes); the series is named after the newest of them. The history stays in ladder.json.
-    blaze_rows = sorted((r for r in rows if r["backend"] == "blaze"), key=lambda r: r["timestamp"])
-    if blaze_rows:
-        pts = {(r["shape"], r["op"]): r for r in blaze_rows}  # later rows overwrite
-        drawn = [r for r in pts.values() if only_shapes is None or r["shape"] in only_shapes]
-        latest_label = max(drawn or blaze_rows, key=lambda r: r["timestamp"])["label"]
-        series.append((f"blaze:{latest_label}", pts))
+            series.append((name, pts))
 
-    # One panel per (op, shape): rows are ops, columns are shapes, linear y per panel.
+    # One panel per (op, column), linear y per panel; speedups are against the panel's
+    # Diffusers bar.
     fig, axes = plt.subplots(
-        len(ops), len(shapes), figsize=(5.2 * len(shapes), 4.0 * len(ops)), squeeze=False
+        len(ops), len(columns), figsize=(5.2 * len(columns), 4.0 * len(ops)), squeeze=False
     )
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    series_index = {name: i for i, (_, name) in enumerate(SERIES)}  # one color per backend
     for oi, op in enumerate(ops):
-        for si, shape in enumerate(shapes):
+        for si, column in enumerate(columns):
             ax = axes[oi, si]
-            names, values, speedups = [], [], []
+            shape, field, title = COLUMNS[column][op]
+            names, values = [], []
             for name, pts in series:
                 r = pts.get((shape, op))
-                if r is None:
+                if r is None or r.get(field) is None:
                     continue
                 names.append(name)
-                values.append(r["median_ms"])
-                speedups.append(r["speedup_vs_diffusers"])
+                values.append(r[field])
+            base = dict(zip(names, values)).get(SERIES[0][1])
+            speedups = [base / v if base else None for v in values]
             xs = range(len(names))
-            bars = ax.bar(xs, values, color=[colors[i % len(colors)] for i in range(len(names))])
+            bars = ax.bar(xs, values, color=[colors[series_index[n] % len(colors)] for n in names])
             for bar, sp in zip(bars, speedups):
                 if sp is not None:
                     ax.annotate(
@@ -126,7 +157,7 @@ def _plot(
                     )
             ax.set_xticks(list(xs))
             ax.set_xticklabels(names, rotation=20, ha="right", fontsize=8)
-            ax.set_title(f"{op} — {shape}")
+            ax.set_title(title, fontsize=10)
             if si == 0:
                 ax.set_ylabel("Median GPU time [ms]")
             ax.set_ylim(0, max(values) * 1.15 if values else 1)
@@ -143,9 +174,9 @@ def main() -> None:
         "--out-dir", default=None, help="where ladder.json and the PNG go (default: run-dir)"
     )
     parser.add_argument(
-        "--shapes",
-        default="t2i_1024,t2v_720p_189f,edge_480p_121f",
-        help="comma list of shapes to draw (ladder.json keeps every shape); empty draws all",
+        "--columns",
+        default=",".join(COLUMNS),
+        help="comma list of plot columns to draw, in order (ladder.json keeps every shape)",
     )
     args = parser.parse_args()
     run_dir = Path(args.run_dir)
@@ -165,19 +196,19 @@ def main() -> None:
     for gpu, world_size in signatures:
         sig_rows = [r for r in rows if r["gpu"] == gpu and r["world_size"] == world_size]
         out_png = out_dir / f"ladder_{gpu}_ws{world_size}.png"
-        _plot(
-            sig_rows, out_png, gpu, world_size, set(args.shapes.split(",")) if args.shapes else None
-        )
+        _plot(sig_rows, out_png, gpu, world_size, args.columns.split(","))
 
     print(
-        f"{'label':22s} {'backend':19s} {'shape':16s} {'op':6s} {'median_ms':>10s} {'p90_ms':>10s} {'x_diffusers':>11s} {'x_native':>8s} {'rel_l2_ref':>11s}"
+        f"{'label':22s} {'backend':19s} {'shape':16s} {'op':6s} {'median_ms':>10s} {'p90_ms':>10s}"
+        f" {'x_diffusers':>11s} {'x_native':>8s} {'rel_l2_ref':>11s}"
     )
     for r in rows:
         sd = f"{r['speedup_vs_diffusers']:.3f}" if r["speedup_vs_diffusers"] else "-"
         sn = f"{r['speedup_vs_native']:.3f}" if r["speedup_vs_native"] else "-"
         rl = f"{r['rel_l2_vs_ref']:.2e}" if r["rel_l2_vs_ref"] is not None else "-"
         print(
-            f"{r['label']:22s} {r['backend']:19s} {r['shape']:16s} {r['op']:6s} {r['median_ms']:10.2f} {r['p90_ms']:10.2f} {sd:>11s} {sn:>8s} {rl:>11s}"
+            f"{r['label']:22s} {r['backend']:19s} {r['shape']:16s} {r['op']:6s} {r['median_ms']:10.2f}"
+            f" {r['p90_ms']:10.2f} {sd:>11s} {sn:>8s} {rl:>11s}"
         )
     print(f"wrote {out_dir / 'ladder.json'} and {len(signatures)} plot(s) in {out_dir}")
 
