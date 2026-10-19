@@ -273,7 +273,7 @@ __global__ void __launch_bounds__(kThreads)
     constexpr int A = W::A;
     constexpr int Cols = M * kStagedTiles + 2;
     constexpr int CH = kStagedChannels;
-    using VecS = typename Lanes<M>::VecS;
+    using PairS = PackedAligned<TS, 2>; // one channel pair per thread, whatever Lanes<M>::V is
     __shared__ __align__(16) T win[A][Cols][CH];
 
     Geometry const g = geometry<M>(p);
@@ -348,9 +348,9 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
         for (int y = 0; y < A; ++y)
         {
-            VecS out;
+            PairS out;
             setPair(out, 0, W::bt(y, tr[x]));
-            *reinterpret_cast<VecS*>(vp) = out;
+            *reinterpret_cast<PairS*>(vp) = out;
             vp += coordStride;
         }
     }
