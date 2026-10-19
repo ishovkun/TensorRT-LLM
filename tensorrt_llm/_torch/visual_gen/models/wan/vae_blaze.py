@@ -151,6 +151,11 @@ class VaeBlazeOptions:
     # CuTe DSL two-pass F(2x2, 3x3) kernel on Blackwell for Cout % 256 == 0 and frames of at
     # least 45x80 pixels (cuBLAS elsewhere). Single-frame calls always use the portable path.
     winograd_spatial_kernel: str = "kf"
+    # Launch form of the "kf" kernel: None picks by shape; "wa" / "wb" force a GEMM layout
+    # (rows = tiles / rows = Cout) with the four component chunks pipelined under PDL,
+    # "wa0" / "wb0" the same chunks as plain serialized launches, "wb1" one GEMM over all
+    # components without PDL. For measurements on other GPUs.
+    winograd_spatial_kf_mode: str | None = None
     # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (1.8x fewer GEMM FLOPs
     # and transformed bytes; fp16 storage keeps its error below the bf16 F2 path).
     winograd_spatial_tile: int = 4
@@ -208,6 +213,11 @@ class VaeBlazeOptions:
         if self.winograd_spatial_tile not in (2, 4):
             raise ValueError(
                 f"winograd_spatial_tile must be 2 or 4, got {self.winograd_spatial_tile!r}"
+            )
+        if self.winograd_spatial_kf_mode not in (None, "wa", "wb", "wa0", "wb0", "wb1"):
+            raise ValueError(
+                "winograd_spatial_kf_mode must be None, 'wa', 'wb', 'wa0', 'wb0' or 'wb1', "
+                f"got {self.winograd_spatial_kf_mode!r}"
             )
         if self.winograd_spatial_kernel not in ("kf", "cublas", "cute"):
             raise ValueError(
@@ -538,6 +548,7 @@ class BlazeCausalConv3d(nn.Conv3d):
         # Spatial Winograd mode for forward_winograd ("off", "auto", "all"), set by the block.
         self.winograd_spatial = "off"
         self.winograd_spatial_kernel = "cublas"
+        self.winograd_spatial_kf_mode: str | None = None
         self.winograd_spatial_tile = 2
         self.winograd_spatial_single_tile = 2
         self.winograd_spatial_first_frame = False
@@ -749,7 +760,13 @@ class BlazeCausalConv3d(nn.Conv3d):
         conv2d per slab, or spatial Winograd on all four at once where that is faster."""
         _, _, h, w = slabs.d[0].shape
         if self._use_kf_spatial(h, w) and self.spatial_eligible(h, w, kernel="kf"):
-            m = wino_spatial_conv_kf(slabs.stacked, self._winograd_spatial_weights_kf(), h, w)
+            m = wino_spatial_conv_kf(
+                slabs.stacked,
+                self._winograd_spatial_weights_kf(),
+                h,
+                w,
+                self.winograd_spatial_kf_mode,
+            )
             return [pairs_to_images(m[k], h, w) for k in range(4)]
         if self.spatial_eligible(h, w):
             if self._use_cute_spatial(h, w):
@@ -1127,6 +1144,7 @@ class BlazeResidualBlock(nn.Module):
         for conv in (self.conv1, self.conv2):
             conv.winograd_spatial = spatial
             conv.winograd_spatial_kernel = self.options.winograd_spatial_kernel
+            conv.winograd_spatial_kf_mode = self.options.winograd_spatial_kf_mode
             conv.winograd_spatial_tile = self.options.winograd_spatial_tile
             conv.winograd_spatial_single_tile = self.options.winograd_spatial_single_tile
             conv.winograd_spatial_first_frame = self.options.winograd_spatial_first_frame

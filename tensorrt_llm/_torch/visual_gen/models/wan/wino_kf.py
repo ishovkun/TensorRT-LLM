@@ -65,25 +65,28 @@ def wino_spatial_conv_kf(
     H*W, Cin]`` (bf16) -> ``M [components, pairs, H*W, Cout]`` (bias-free), ``u`` from
     :func:`kf_spatial_filters`. ``mode``: "wa" = GEMM rows are tiles (256x256 2-CTA tiles), "wb" =
     GEMM rows are output channels with the tile count split into 256/224/192-wide column
-    tiles, "wb1" = "wb" layout as one GEMM over all
-    components without PDL; ``None`` picks by shape."""
+    tiles, both as four per-component chunks pipelined under PDL; "wa0" / "wb0" = the same
+    chunks as plain serialized launches; "wb1" = "wb" layout as one GEMM over all components
+    without PDL; ``None`` picks by shape."""
     comps, pairs, positions, cin = d.shape
     cout = u.shape[2]
     x = d.view(comps * pairs, height, width, cin)
     y = torch.empty((comps * pairs, height, width, cout), dtype=d.dtype, device=d.device)
     mode = mode or _pick_mode(pairs, height, width, cin)
-    if mode == "wa":
-        _run_wa(x, u, y, comps, pairs)
-    elif mode == "wb":
-        _run_wb(x, u, y, comps, pairs, chunked=True)
+    if mode in ("wa", "wa0"):
+        _run_wa(x, u, y, comps, pairs, pdl=mode == "wa")
+    elif mode in ("wb", "wb0"):
+        _run_wb(x, u, y, comps, pairs, chunked=True, pdl=mode == "wb")
     elif mode == "wb1":
-        _run_wb(x, u, y, comps, pairs, chunked=False)
+        _run_wb(x, u, y, comps, pairs, chunked=False, pdl=False)
     else:
         raise ValueError(f"unknown spatial Winograd mode {mode!r}")
     return y.view(comps, pairs, positions, cout)
 
 
-def _run_wa(x: torch.Tensor, u: torch.Tensor, y: torch.Tensor, comps: int, pairs: int) -> None:
+def _run_wa(
+    x: torch.Tensor, u: torch.Tensor, y: torch.Tensor, comps: int, pairs: int, pdl: bool
+) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import wa
 
     _, height, width, cin = x.shape
@@ -101,11 +104,12 @@ def _run_wa(x: torch.Tensor, u: torch.Tensor, y: torch.Tensor, comps: int, pairs
     cluster = (
         wa.GEMM_CLUSTER_SMALL_U if cin * cout <= 512 * 512 else wa.GEMM_CFG["cluster_shape_mn"]
     )
-    gemm = wa._get(("gemm", 256, True, False, cluster))
-    in_first = wa._get(("it", height, width, ci2, th, tw, tiles, wa._FIRST))
-    in_mid = wa._get(("it", height, width, ci2, th, tw, tiles, wa._OVERLAP))
-    out_mid = wa._get(("ot", height, width, co2, th, tw, tiles, wa._OVERLAP))  # codespell:ignore ot
-    out_last = wa._get(("ot", height, width, co2, th, tw, tiles, wa._LAST))  # codespell:ignore ot
+    gemm = wa._get(("gemm", 256, pdl, False, cluster))
+    first, mid, last = (wa._FIRST, wa._OVERLAP, wa._LAST) if pdl else (None, None, None)
+    in_first = wa._get(("it", height, width, ci2, th, tw, tiles, first))
+    in_mid = wa._get(("it", height, width, ci2, th, tw, tiles, mid))
+    out_mid = wa._get(("ot", height, width, co2, th, tw, tiles, mid))  # codespell:ignore ot
+    out_last = wa._get(("ot", height, width, co2, th, tw, tiles, last))  # codespell:ignore ot
     # it0, G0, it1, G1, ot0, it2, G2, ot1, ..., ot_{n-1}: the first kernel waits for the
     # producer of x, every other transform overlaps the GEMM launched before it.
     for k in range(comps):
@@ -117,7 +121,13 @@ def _run_wa(x: torch.Tensor, u: torch.Tensor, y: torch.Tensor, comps: int, pairs
 
 
 def _run_wb(
-    x: torch.Tensor, u: torch.Tensor, y: torch.Tensor, comps: int, pairs: int, chunked: bool
+    x: torch.Tensor,
+    u: torch.Tensor,
+    y: torch.Tensor,
+    comps: int,
+    pairs: int,
+    chunked: bool,
+    pdl: bool,
 ) -> None:
     import cuda.bindings.driver as cuda
     from cutlass.cute.runtime import from_dlpack
@@ -168,6 +178,14 @@ def _run_wb(
         wb._xform_kernel("out", wino.out_xform, [m, y], (frames, height, width, cout, 4, 4, 0))(
             stream
         )
+        return
+    if not pdl:
+        for k in range(comps):
+            xform_in(k, 0)
+            gemm(
+                u[:, k], v[:, k * tiles : (k + 1) * tiles], m[:, k * tiles : (k + 1) * tiles], False
+            )
+            xform_out(k, 0)
         return
     # in0, G0, in1, G1, out0, in2, G2, out1, ..., out_{n-1} under PDL (see _run_wa).
     for k in range(comps):

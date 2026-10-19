@@ -762,7 +762,7 @@ def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, 
 
 
 @spatial_op
-@pytest.mark.parametrize("mode", ["wa", "wb", "wb1", None])
+@pytest.mark.parametrize("mode", ["wa", "wb", "wa0", "wb0", "wb1", None])
 @pytest.mark.parametrize(
     "cin_cout_hw_pairs", [(64, 256, 6, 12, 4), (128, 256, 9, 16, 2), (512, 512, 24, 40, 2)]
 )
