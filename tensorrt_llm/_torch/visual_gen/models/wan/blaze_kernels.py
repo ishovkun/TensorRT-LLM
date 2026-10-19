@@ -465,6 +465,17 @@ def wino_spatial_conv_cuda(
     return out.view(comps, pairs, positions, u.shape[2])
 
 
+def unpatchify_clamp_available() -> bool:
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_unpatchify_clamp")
+
+
+def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, patch: int) -> None:
+    """Write ``clamp(unpatchify(chunk), -1, 1)`` into ``out[:, :, frame0:frame0 + t]``: ``chunk``
+    ``[1, C*patch*patch, t, H, W]`` and ``out`` ``[1, C, T, H*patch, W*patch]``, both channels-last
+    bf16. Same element mapping as :func:`wan_vae.unpatchify`."""
+    torch.ops.trtllm.vae_unpatchify_clamp(chunk, out, frame0, patch)
+
+
 def frames_view(x: torch.Tensor) -> torch.Tensor:
     """Batch-1 channels-last ``[1, C, T, H, W]`` -> ``[T, H*W, C]`` view (no copy)."""
     _, c, t, h, w = x.shape

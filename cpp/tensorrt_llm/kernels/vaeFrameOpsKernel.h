@@ -17,8 +17,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -78,14 +78,31 @@ struct VaeAvgDownParams
 {
     int64_t outPositions; // H' * W'
     int outHeight, outWidth;
-    int inWidth;    // W (= W' * factorS)
-    int inFrames;   // T (source frames, before the front padding)
-    int outFrames;  // T'
+    int inWidth;          // W (= W' * factorS)
+    int inFrames;         // T (source frames, before the front padding)
+    int outFrames;        // T'
     int cin, cout;
     int factorT, factorS, groupSize, padT;
 };
 
 void launchVaeAvgDownAdd(void const* x, void const* r, void* y, VaeAvgDownParams const& p, cudaStream_t stream);
+
+// Decoder output assembly: chunk [1, C*patch*patch, t, H, W] (channels-last) ->
+// out[:, :, frame0 : frame0 + t] of the video [1, C, T, H*patch, W*patch] (channels-last), with
+// out[c, f, h*patch + j, w*patch + i] = clamp(chunk[c*patch*patch + i*patch + j, f, h, w], -1, 1),
+// the mapping of wan_vae.unpatchify.
+struct VaeUnpatchifyParams
+{
+    int frames;    // t: frames in the chunk
+    int height;    // H
+    int width;     // W
+    int channels;  // C: output channels
+    int patch;     // spatial patch side
+    int outFrames; // T
+    int frame0;    // first output frame of the chunk
+};
+
+void launchVaeUnpatchifyClamp(void const* chunk, void* out, VaeUnpatchifyParams const& p, cudaStream_t stream);
 
 } // namespace kernels
 

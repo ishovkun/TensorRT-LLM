@@ -87,6 +87,10 @@ OPTION_SETS = [
     {"fused_norm": True, "fused_residual": True, "fused_upsample": True, "fused_bias": True},
     {"conv_out_frame_split": 3},
     {"first_frame_conv2d": True},
+    {"fold_encoder_tail": True},
+    {"encoder_chunk_frames": 8},
+    {"fused_output": True},
+    {"fused_norm": True, "fused_residual": True, "fold_encoder_tail": True, "fused_output": True},
     {"fused_norm": True, "winograd_temporal": True},
     {"fused_norm": True, "winograd_temporal": True, "winograd_spatial": "all"},
     {
@@ -192,3 +196,36 @@ def test_each_option_stays_close_to_native(option: dict, frames: int) -> None:
             # roundings; reference mode: fp32 reduction order), amplified by the random-weight
             # network. Bitwise equality of the kernel itself is checked in test_blaze_kernels.
             assert rel_l2.item() < 2e-2, f"{option}: rel_l2={rel_l2.item():.3e}"
+
+
+def test_encode_mode_matches_posterior_mode() -> None:
+    _, fast = _pair(VaeBlazeOptions(fold_encoder_tail=True))
+    pixels, _ = _inputs(9)
+    with torch.inference_mode():
+        mean_only = fast.encode_mode(pixels)
+        full = fast.encode(pixels, return_dict=False)[0]
+        assert torch.equal(mean_only.float(), full.mode().float())
+        # The lazy posterior still serves the sampling path.
+        assert full.sample().shape == full.mode().shape
+        assert torch.isfinite(full.std.float()).all()
+
+
+def test_fold_latent_affine_matches_eager() -> None:
+    _, fast = _pair(VaeBlazeOptions())
+    _, latents = _inputs(5)
+    z = SMALL_CONFIG["z_dim"]
+    gen = torch.Generator().manual_seed(3)
+    mean = (torch.randn(z, generator=gen) * 0.5).to(DEVICE)
+    std = (torch.rand(z, generator=gen) + 0.5).to(DEVICE)
+    with torch.inference_mode():
+        eager = fast.decode(
+            (latents.float() * std.view(1, z, 1, 1, 1) + mean.view(1, z, 1, 1, 1)).to(DTYPE),
+            return_dict=False,
+        )[0]
+        fast.fold_latent_affine(mean, std)
+        folded = fast.decode(latents, return_dict=False)[0]
+        fast.clear_latent_affine()
+        again = fast.decode(latents, return_dict=False)[0]
+    diff = (folded.float() - eager.float()).norm() / eager.float().norm().clamp_min(1e-12)
+    assert diff.item() < 2e-2, f"rel_l2={diff.item():.3e}"
+    assert not torch.equal(again.float(), folded.float())  # the fold is really off again

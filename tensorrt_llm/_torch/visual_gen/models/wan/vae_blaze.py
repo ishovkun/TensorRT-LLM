@@ -53,6 +53,8 @@ from .blaze_kernels import (
     pairs_to_images,
     rms_norm_silu,
     rms_norm_silu_cuda,
+    unpatchify_clamp_available,
+    unpatchify_clamp_into,
     upsample_gather_cuda,
     upsample_gather_reference,
     wino_combine_cuda,
@@ -163,6 +165,18 @@ class VaeBlazeOptions:
     # bias in the epilogue on the row view (no permute/contiguous copy), and the residual
     # add handed to the next block's norm as a PendingAdd.
     fused_attention: bool = False
+    # Checklist item 15: the encoder's conv_out (3x3x3) and quant_conv (1x1x1) have no
+    # activation between them, so quant_conv folds into conv_out's weights (composed in
+    # fp32, rounded once); ``encode_mode`` then runs only the mean half of the folded conv.
+    # Off in "reference" mode, where every rounding of the eager path is reproduced.
+    fold_encoder_tail: bool = False
+    # Checklist item 20: pixel frames per encoder pass after the first one-frame pass. Must
+    # be a multiple of 4 so every pass ends at the same temporal-downsampler parity.
+    encoder_chunk_frames: int = 4
+    # Checklist item 14: the decoder writes each chunk's unpatchified, clamped frames
+    # straight into the preallocated output (one kernel per chunk) instead of
+    # cat + unpatchify + clamp over the whole video. Needs the CUDA op; bf16, batch 1.
+    fused_output: bool = False
 
     def __post_init__(self) -> None:
         if self.norm_mode not in ("fp32", "reference"):
@@ -191,6 +205,10 @@ class VaeBlazeOptions:
             )
         if self.conv_out_frame_split < 0 or self.conv_out_frame_split in (1, 2):
             raise ValueError("conv_out_frame_split must be 0 (off) or at least 3 input frames")
+        if self.encoder_chunk_frames < 4 or self.encoder_chunk_frames % 4:
+            raise ValueError(
+                f"encoder_chunk_frames must be a positive multiple of 4, got {self.encoder_chunk_frames!r}"
+            )
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "VaeBlazeOptions":
@@ -1435,6 +1453,9 @@ class BlazeEncoder3d(nn.Module):
         )
         self.norm_out = BlazeRMSNorm(out_dim, images=False, options=options)
         self.conv_out = BlazeCausalConv3d(out_dim, z_dim, 3, padding=1)
+        # A replacement for conv_out for the duration of one encode (the folded encoder
+        # tail); not a submodule, so the state dict is untouched.
+        self.conv_out_override: BlazeCausalConv3d | None = None
         self.gradient_checkpointing = False
 
     def forward(
@@ -1463,6 +1484,7 @@ class BlazeEncoder3d(nn.Module):
                 x = layer(x)
 
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        conv_out = self.conv_out_override or self.conv_out
         frames = x.frames if isinstance(x, PendingAdd) else x.shape[2]
         like = _pending_like(x)
         if (
@@ -1470,22 +1492,22 @@ class BlazeEncoder3d(nn.Module):
             and feat_cache is not None
             and feat_idx is not None
             and like.shape[0] == 1
-            and self.conv_out.slab_eligible(like)
+            and conv_out.slab_eligible(like)
             and not (
-                self.conv_out.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
+                conv_out.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
             )
         ):
             idx = feat_idx[0]
-            window = self.conv_out.slab_begin(feat_cache[idx], frames, like)
-            feat_cache[idx] = self.conv_out
+            window = conv_out.slab_begin(feat_cache[idx], frames, like)
+            feat_cache[idx] = conv_out
             feat_idx[0] += 1
             self.norm_out.forward_silu(x, out=window)
-            return self.conv_out.slab_conv(frames)
+            return conv_out.slab_conv(frames)
         x = self.norm_out.forward_silu(x)
         if feat_cache is not None and feat_idx is not None:
-            x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
+            x = _causal_conv_with_cache(conv_out, x, feat_cache, feat_idx)
         else:
-            x = self.conv_out(x)
+            x = conv_out(x)
         return _channels_last_3d_if_needed(x)
 
 
@@ -1708,8 +1730,48 @@ class BlazeDecoder3d(nn.Module):
         return _channels_last_3d_if_needed(x)
 
 
+class LazyDiagonalGaussianDistribution(DiagonalGaussianDistribution):
+    """``DiagonalGaussianDistribution`` whose ``std``/``var``/clamped ``logvar`` are computed
+    on first use: ``mode()`` launches nothing beyond the view split."""
+
+    def __init__(self, parameters: torch.Tensor, deterministic: bool = False) -> None:
+        self.parameters = parameters
+        self.mean, self._logvar_raw = torch.chunk(parameters, 2, dim=1)
+        self.deterministic = deterministic
+        self._logvar: torch.Tensor | None = None
+        self._std: torch.Tensor | None = None
+        self._var: torch.Tensor | None = None
+
+    @property
+    def logvar(self) -> torch.Tensor:
+        if self._logvar is None:
+            self._logvar = torch.clamp(self._logvar_raw, -30.0, 20.0)
+        return self._logvar
+
+    @property
+    def std(self) -> torch.Tensor:
+        if self._std is None:
+            self._std = (
+                torch.zeros_like(self.mean) if self.deterministic else torch.exp(0.5 * self.logvar)
+            )
+        return self._std
+
+    @property
+    def var(self) -> torch.Tensor:
+        if self._var is None:
+            self._var = (
+                torch.zeros_like(self.mean) if self.deterministic else torch.exp(self.logvar)
+            )
+        return self._var
+
+
 class VaeBlaze(nn.Module):
-    """Optimized Wan VAE; state-dict compatible with ``WanVAE`` and ``AutoencoderKLWan``."""
+    """Optimized Wan VAE; state-dict compatible with ``WanVAE`` and ``AutoencoderKLWan``.
+
+    Beyond the ``AutoencoderKLWan`` interface: ``encode_mode(x)`` returns the posterior mean
+    directly, and ``fold_latent_affine(mean, std)`` folds the latent de-normalization into
+    ``post_quant_conv`` so ``decode`` takes the model's raw latents.
+    """
 
     def __init__(
         self,
@@ -1772,6 +1834,8 @@ class VaeBlaze(nn.Module):
                 isinstance(module, BlazeCausalConv3d) for module in self.encoder.modules()
             ),
         }
+        self._folded_tail: dict[int | None, tuple[tuple, BlazeCausalConv3d]] = {}
+        self._post_quant_folded: tuple[torch.Tensor, torch.Tensor] | None = None
         self.clear_cache()
 
     @property
@@ -1786,17 +1850,60 @@ class VaeBlaze(nn.Module):
         self._enc_conv_idx = [0]
         self._enc_feat_map: list[torch.Tensor | str | None] = [None] * self._enc_conv_num
 
-    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+    def _encode(self, x: torch.Tensor, *, mode_only: bool = False) -> torch.Tensor:
         prev_benchmark = torch.backends.cudnn.benchmark
         torch.backends.cudnn.benchmark = self.options.benchmark_convs(
             encoder=True, frames=x.shape[2]
         )
         try:
-            return self._encode_impl(x)
+            return self._encode_impl(x, mode_only=mode_only)
         finally:
             torch.backends.cudnn.benchmark = prev_benchmark
 
-    def _encode_impl(self, x: torch.Tensor) -> torch.Tensor:
+    def _use_folded_tail(self) -> bool:
+        return self.options.fold_encoder_tail and self.options.norm_mode != "reference"
+
+    def _folded_tail_conv(self, rows: int | None) -> BlazeCausalConv3d:
+        """conv_out with quant_conv folded in: ``W' = Q A``, ``b' = Q a + q`` (composed in
+        fp32, rounded once to the model dtype); ``rows`` keeps only the first output
+        channels (the posterior mean) or all of them."""
+        conv_out, quant = self.encoder.conv_out, self.quant_conv
+        key = (
+            conv_out.weight.data_ptr(),
+            conv_out.weight._version,
+            quant.weight.data_ptr(),
+            quant.weight._version,
+            rows,
+        )
+        cached = self._folded_tail.get(rows)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        q = quant.weight.detach().float().flatten(1)  # [2z, 2z]
+        qb = quant.bias.detach().float() if quant.bias is not None else torch.zeros_like(q[:, 0])
+        a = conv_out.weight.detach().float()  # [2z, Cin, 3, 3, 3]
+        ab = (
+            conv_out.bias.detach().float()
+            if conv_out.bias is not None
+            else torch.zeros_like(q[:, 0])
+        )
+        if rows is not None:
+            q, qb = q[:rows], qb[:rows]
+        w = torch.einsum("om,mikhw->oikhw", q, a)
+        b = q @ ab + qb
+        folded = BlazeCausalConv3d(
+            conv_out.in_channels, w.shape[0], conv_out.kernel_size, padding=conv_out.padding[1]
+        ).to(device=a.device, dtype=conv_out.weight.dtype)
+        with torch.no_grad():
+            folded.weight.copy_(w)
+            folded.bias.copy_(b)
+        folded.weight.requires_grad_(False)
+        folded.bias.requires_grad_(False)
+        folded.first_frame_conv2d = conv_out.first_frame_conv2d
+        folded.max_in_frames = conv_out.max_in_frames
+        self._folded_tail[rows] = (key, folded)
+        return folded
+
+    def _encode_impl(self, x: torch.Tensor, *, mode_only: bool = False) -> torch.Tensor:
         _, _, num_frame, _, _ = x.shape
 
         self.clear_cache()
@@ -1804,28 +1911,38 @@ class VaeBlaze(nn.Module):
             x = patchify(x, patch_size=self.config.patch_size)
         x = _channels_last_3d_if_needed(x)
 
-        num_chunks = 1 + (num_frame - 1) // 4
+        folded = self._use_folded_tail()
+        if mode_only and not folded:
+            raise ValueError("encode_mode needs fold_encoder_tail (and norm_mode != 'reference')")
+        self.encoder.conv_out_override = (
+            self._folded_tail_conv(self.z_dim if mode_only else None) if folded else None
+        )
+        # The first pass is one frame; every later pass is a multiple of four frames so the
+        # stride-2 temporal downsamplers see chunk boundaries at the same parity each time.
+        step = self.options.encoder_chunk_frames
+        bounds = [(0, 1)] + [
+            (start, min(start + step, num_frame)) for start in range(1, num_frame, step)
+        ]
         out_chunks: list[torch.Tensor] = []
-        for i in range(num_chunks):
-            self._enc_conv_idx = [0]
-            if i == 0:
-                out_chunk = self.encoder(
-                    x[:, :, :1, :, :], feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx
+        try:
+            for start, end in bounds:
+                self._enc_conv_idx = [0]
+                out_chunks.append(
+                    self.encoder(
+                        x[:, :, start:end, :, :],
+                        feat_cache=self._enc_feat_map,
+                        feat_idx=self._enc_conv_idx,
+                    )
                 )
-            else:
-                out_chunk = self.encoder(
-                    x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :],
-                    feat_cache=self._enc_feat_map,
-                    feat_idx=self._enc_conv_idx,
-                )
-            out_chunks.append(out_chunk)
+        finally:
+            self.encoder.conv_out_override = None
 
         if len(out_chunks) == 1:
             out = out_chunks[0]
         else:
             out = torch.cat(out_chunks, dim=2)
 
-        enc = self.quant_conv(out)
+        enc = out if folded else self.quant_conv(out)
         enc = _channels_last_3d_if_needed(enc)
         self.clear_cache()
         return enc
@@ -1836,10 +1953,15 @@ class VaeBlaze(nn.Module):
         return_dict: bool = True,
     ) -> AutoencoderKLOutput | tuple[DiagonalGaussianDistribution]:
         h = self._encode(x)
-        posterior = DiagonalGaussianDistribution(h)
+        posterior = LazyDiagonalGaussianDistribution(h)
         if not return_dict:
             return (posterior,)
         return AutoencoderKLOutput(latent_dist=posterior)
+
+    def encode_mode(self, x: torch.Tensor) -> torch.Tensor:
+        """The posterior mean ``[B, z, T', H', W']`` without computing the log-variance half:
+        the folded encoder tail runs only its first ``z`` output channels."""
+        return self._encode(x, mode_only=True)
 
     def _decode(
         self,
@@ -1861,12 +1983,49 @@ class VaeBlaze(nn.Module):
         finally:
             torch.backends.cudnn.benchmark = prev_benchmark
 
+    def fold_latent_affine(self, latents_mean: torch.Tensor, latents_std: torch.Tensor) -> None:
+        """Fold the latent de-normalization ``u = std * z + mean`` into ``post_quant_conv``
+        (``P' = P diag(std)``, ``b' = P mean + b``, composed in fp32, rounded once). After
+        this call ``decode`` takes the model's raw latents; ``clear_latent_affine`` undoes it.
+        The module's own weights are untouched."""
+        conv = self.post_quant_conv
+        w = conv.weight.detach().float()  # [z, z, 1, 1, 1]
+        z = w.shape[0]
+        mean = latents_mean.detach().to(w.device, torch.float32).reshape(z)
+        std = latents_std.detach().to(w.device, torch.float32).reshape(z)
+        b = conv.bias.detach().float() if conv.bias is not None else torch.zeros(z, device=w.device)
+        folded_w = (w * std.view(1, z, 1, 1, 1)).to(conv.weight.dtype)
+        folded_b = (w.view(z, z) @ mean + b).to(conv.weight.dtype)
+        self._post_quant_folded = (folded_w, folded_b)
+
+    def clear_latent_affine(self) -> None:
+        self._post_quant_folded = None
+
+    def _post_quant(self, z: torch.Tensor) -> torch.Tensor:
+        if self._post_quant_folded is None:
+            return self.post_quant_conv(z)
+        w, b = self._post_quant_folded
+        return _channels_last_3d_if_needed(F.conv3d(z, w, b))
+
+    def _use_fused_output(self, x: torch.Tensor) -> bool:
+        return (
+            self.options.fused_output
+            and self.config.patch_size is not None
+            and x.shape[0] == 1
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and unpatchify_clamp_available()
+        )
+
     def _decode_impl(
         self, z: torch.Tensor, return_dict: bool, temporal_chunk_size: int
     ) -> DecoderOutput | tuple[torch.Tensor]:
         _, _, num_frame, _, _ = z.shape
         z = _channels_last_3d_if_needed(z)
-        x = self.post_quant_conv(z)
+        x = self._post_quant(z)
+        fused = self._use_fused_output(x)
+        out: torch.Tensor | None = None
+        frames_done = 0
         out_chunks: list[torch.Tensor] = []
         for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, temporal_chunk_size)):
             self._conv_idx = [0]
@@ -1876,17 +2035,41 @@ class VaeBlaze(nn.Module):
                 feat_idx=self._conv_idx,
                 first_chunk=index == 0,
             )
-            out_chunks.append(out_chunk)
+            if fused:
+                # Unpatchify + clamp of this chunk straight into the preallocated video.
+                out_chunk = _channels_last_3d_if_needed(out_chunk)
+                if out is None:
+                    patch = self.config.patch_size
+                    total = (num_frame - 1) * self.config.scale_factor_temporal + 1
+                    out = torch.empty(
+                        (
+                            1,
+                            out_chunk.shape[1] // (patch * patch),
+                            total,
+                            out_chunk.shape[3] * patch,
+                            out_chunk.shape[4] * patch,
+                        ),
+                        dtype=out_chunk.dtype,
+                        device=out_chunk.device,
+                        memory_format=torch.channels_last_3d,
+                    )
+                unpatchify_clamp_into(out_chunk, out, frames_done, self.config.patch_size)
+                frames_done += out_chunk.shape[2]
+            else:
+                out_chunks.append(out_chunk)
 
-        if len(out_chunks) == 1:
-            out = out_chunks[0]
+        if fused:
+            assert out is not None
+            if frames_done != out.shape[2]:
+                raise RuntimeError(
+                    f"decoder produced {frames_done} frames for a {out.shape[2]}-frame output"
+                )
         else:
-            out = torch.cat(out_chunks, dim=2)
-
-        if self.config.patch_size is not None:
-            out = unpatchify(out, patch_size=self.config.patch_size)
-        out = _channels_last_3d_if_needed(out)
-        out = torch.clamp(out, min=-1.0, max=1.0)
+            out = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks, dim=2)
+            if self.config.patch_size is not None:
+                out = unpatchify(out, patch_size=self.config.patch_size)
+            out = _channels_last_3d_if_needed(out)
+            out = torch.clamp(out, min=-1.0, max=1.0)
 
         self.clear_cache()
         if not return_dict:

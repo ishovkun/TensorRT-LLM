@@ -752,3 +752,33 @@ def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, 
     ).float()
     rel = ((got - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+frame_ops_op = pytest.mark.skipif(
+    not (hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_unpatchify_clamp")),
+    reason="trtllm::vae_unpatchify_clamp not built",
+)
+
+
+@frame_ops_op
+@pytest.mark.parametrize("patch", [1, 2])
+@pytest.mark.parametrize("shape", [(3, 5, 7, 3), (4, 6, 10, 3), (2, 3, 4, 5)])
+def test_unpatchify_clamp_into_matches_eager(patch: int, shape: tuple[int, int, int, int]) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import unpatchify_clamp_into
+    from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import unpatchify
+
+    t, h, w, c = shape
+    torch.manual_seed(4)
+    chunks = [
+        (torch.randn(1, c * patch * patch, n, h, w, device="cuda") * 1.5)
+        .to(torch.bfloat16)
+        .contiguous(memory_format=torch.channels_last_3d)
+        for n in (1, t)
+    ]
+    out = torch.full(
+        (1, c, 1 + t, h * patch, w * patch), float("nan"), device="cuda", dtype=torch.bfloat16
+    ).contiguous(memory_format=torch.channels_last_3d)
+    unpatchify_clamp_into(chunks[0], out, 0, patch)
+    unpatchify_clamp_into(chunks[1], out, 1, patch)
+    ref = torch.clamp(unpatchify(torch.cat(chunks, dim=2), patch), -1.0, 1.0)
+    assert torch.equal(out.float(), ref.float())

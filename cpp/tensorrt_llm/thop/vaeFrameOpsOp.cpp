@@ -135,8 +135,34 @@ torch::Tensor vae_interleave_bias(torch::Tensor const& u, std::optional<torch::T
     return y;
 }
 
+// chunk [1, C*patch^2, t, H, W] -> out[:, :, frame0:frame0+t] of [1, C, T, H*patch, W*patch], clamped to
+// [-1, 1]; both channels-last bf16. See vaeFrameOpsKernel.h.
+torch::Tensor vae_unpatchify_clamp(torch::Tensor const& chunk, torch::Tensor const& out, int64_t frame0, int64_t patch)
+{
+    TORCH_CHECK(chunk.dim() == 5 && out.dim() == 5 && chunk.size(0) == 1 && out.size(0) == 1, "batch-1 5D tensors");
+    TORCH_CHECK(chunk.scalar_type() == torch::kBFloat16 && out.scalar_type() == torch::kBFloat16, "bf16 only");
+    TORCH_CHECK(
+        chunk.is_contiguous(at::MemoryFormat::ChannelsLast3d) && out.is_contiguous(at::MemoryFormat::ChannelsLast3d),
+        "chunk and out must be channels-last 3D");
+    TORCH_CHECK(patch >= 1 && chunk.size(1) == out.size(1) * patch * patch, "chunk channels must be C * patch^2");
+    TORCH_CHECK(chunk.size(3) * patch == out.size(3) && chunk.size(4) * patch == out.size(4), "spatial sizes");
+    TORCH_CHECK(frame0 >= 0 && frame0 + chunk.size(2) <= out.size(2), "frame range");
+    tensorrt_llm::kernels::VaeUnpatchifyParams p{};
+    p.frames = static_cast<int>(chunk.size(2));
+    p.height = static_cast<int>(chunk.size(3));
+    p.width = static_cast<int>(chunk.size(4));
+    p.channels = static_cast<int>(out.size(1));
+    p.patch = static_cast<int>(patch);
+    p.outFrames = static_cast<int>(out.size(2));
+    p.frame0 = static_cast<int>(frame0);
+    tensorrt_llm::kernels::launchVaeUnpatchifyClamp(
+        chunk.data_ptr(), out.data_ptr(), p, at::cuda::getCurrentCUDAStream(chunk.get_device()));
+    return out;
+}
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("vae_unpatchify_clamp(Tensor chunk, Tensor(a!) out, int frame0, int patch) -> Tensor(a!)");
     m.def(
         "vae_wino_combine(Tensor? x, Tensor[] m, Tensor? bias, Tensor? residual, int frames, int height, int width, "
         "int pad_h, int pad_w) -> Tensor");
@@ -150,6 +176,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("vae_wino_combine", &vae_wino_combine);
     m.impl("vae_interleave_bias", &vae_interleave_bias);
+    m.impl("vae_unpatchify_clamp", &vae_unpatchify_clamp);
     m.impl("vae_avg_down_add", &vae_avg_down_add);
 }
 

@@ -227,6 +227,10 @@ def _register_fake():
           pad_t):
         return x.new_empty(x.shape)
 
+    @torch.library.register_fake("trtllm::vae_unpatchify_clamp")
+    def _(chunk, out, frame0, patch):
+        return out
+
     @torch.library.register_fake("trtllm::vae_interleave_bias")
     def _(u, bias):
         return u.new_empty((2 * u.shape[0], u.shape[1], u.shape[2] // 2))
