@@ -1878,6 +1878,17 @@ class VaeBlaze(nn.Module):
         cached = self._folded_tail.get(rows)
         if cached is not None and cached[0] == key:
             return cached[1]
+        # Built outside inference mode even when called from it: the folded conv's weight
+        # caches key on the tensor version counter, which inference tensors do not carry.
+        with torch.inference_mode(False), torch.no_grad():
+            folded = self._build_folded_tail(conv_out, quant, rows)
+        self._folded_tail[rows] = (key, folded)
+        return folded
+
+    @staticmethod
+    def _build_folded_tail(
+        conv_out: BlazeCausalConv3d, quant: BlazeCausalConv3d, rows: int | None
+    ) -> BlazeCausalConv3d:
         q = quant.weight.detach().float().flatten(1)  # [2z, 2z]
         qb = quant.bias.detach().float() if quant.bias is not None else torch.zeros_like(q[:, 0])
         a = conv_out.weight.detach().float()  # [2z, Cin, 3, 3, 3]
@@ -1893,14 +1904,12 @@ class VaeBlaze(nn.Module):
         folded = BlazeCausalConv3d(
             conv_out.in_channels, w.shape[0], conv_out.kernel_size, padding=conv_out.padding[1]
         ).to(device=a.device, dtype=conv_out.weight.dtype)
-        with torch.no_grad():
-            folded.weight.copy_(w)
-            folded.bias.copy_(b)
+        folded.weight.copy_(w)
+        folded.bias.copy_(b)
         folded.weight.requires_grad_(False)
         folded.bias.requires_grad_(False)
         folded.first_frame_conv2d = conv_out.first_frame_conv2d
         folded.max_in_frames = conv_out.max_in_frames
-        self._folded_tail[rows] = (key, folded)
         return folded
 
     def _encode_impl(self, x: torch.Tensor, *, mode_only: bool = False) -> torch.Tensor:
@@ -1989,13 +1998,18 @@ class VaeBlaze(nn.Module):
         this call ``decode`` takes the model's raw latents; ``clear_latent_affine`` undoes it.
         The module's own weights are untouched."""
         conv = self.post_quant_conv
-        w = conv.weight.detach().float()  # [z, z, 1, 1, 1]
-        z = w.shape[0]
-        mean = latents_mean.detach().to(w.device, torch.float32).reshape(z)
-        std = latents_std.detach().to(w.device, torch.float32).reshape(z)
-        b = conv.bias.detach().float() if conv.bias is not None else torch.zeros(z, device=w.device)
-        folded_w = (w * std.view(1, z, 1, 1, 1)).to(conv.weight.dtype)
-        folded_b = (w.view(z, z) @ mean + b).to(conv.weight.dtype)
+        with torch.inference_mode(False), torch.no_grad():
+            w = conv.weight.detach().float()  # [z, z, 1, 1, 1]
+            z = w.shape[0]
+            mean = latents_mean.detach().to(w.device, torch.float32).reshape(z)
+            std = latents_std.detach().to(w.device, torch.float32).reshape(z)
+            b = (
+                conv.bias.detach().float()
+                if conv.bias is not None
+                else torch.zeros(z, device=w.device)
+            )
+            folded_w = (w * std.view(1, z, 1, 1, 1)).to(conv.weight.dtype)
+            folded_b = (w.view(z, z) @ mean + b).to(conv.weight.dtype)
         self._post_quant_folded = (folded_w, folded_b)
 
     def clear_latent_affine(self) -> None:

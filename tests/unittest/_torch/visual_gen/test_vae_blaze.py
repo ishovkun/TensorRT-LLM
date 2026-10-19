@@ -91,6 +91,13 @@ OPTION_SETS = [
     {"encoder_chunk_frames": 8},
     {"fused_output": True},
     {"fused_norm": True, "fused_residual": True, "fold_encoder_tail": True, "fused_output": True},
+    {
+        "fused_norm": True,
+        "first_frame_conv2d": True,
+        "conv_slabs": True,
+        "conv_out_frame_split": 3,
+        "fold_encoder_tail": True,
+    },
     {"fused_norm": True, "winograd_temporal": True},
     {"fused_norm": True, "winograd_temporal": True, "winograd_spatial": "all"},
     {
