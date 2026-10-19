@@ -323,11 +323,22 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
                         v.x += ib.val[2 * i];
                         v.y += ib.val[2 * i + 1];
                     }
-                    v = Elem<T>::toFloat2(Elem<T>::fromFloat2(v)); // the conv output as eager holds it
+                    // Reference mode reproduces eager's bf16 roundings of the conv output and of
+                    // the residual sum; fp32 mode keeps the fp32 values (each round trip is a pack
+                    // and an unpack per pair, and those conversions are this kernel's largest
+                    // instruction class). The bf16 ``sum`` row is rounded once either way.
+                    if constexpr (REF)
+                    {
+                        v = Elem<T>::toFloat2(Elem<T>::fromFloat2(v));
+                    }
                     if constexpr (HAS_RESIDUAL)
                     {
                         float2 const r = pairAt(cres, i);
-                        v = Elem<T>::toFloat2(Elem<T>::fromFloat2(make_float2(v.x + r.x, v.y + r.y)));
+                        v = make_float2(v.x + r.x, v.y + r.y);
+                        if constexpr (REF)
+                        {
+                            v = Elem<T>::toFloat2(Elem<T>::fromFloat2(v));
+                        }
                     }
                     ss = fmaf(v.x, v.x, ss);
                     ss = fmaf(v.y, v.y, ss);
