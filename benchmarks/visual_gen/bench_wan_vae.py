@@ -15,6 +15,7 @@ import atexit
 import bisect
 import datetime as dt
 import json
+import os
 import platform
 import re
 import statistics
@@ -186,6 +187,38 @@ def _build(
                     file=sys.stderr,
                 )
     return model
+
+
+def _init_parallel(world_size: int, split_dim: str):
+    """Join the torchrun process group and return ``(rank, wrapper)``.
+
+    ``wrapper`` turns a single-GPU VAE into its spatially sharded ParallelVAE; without
+    parallelism the result is ``(0, None)``.
+    """
+    if world_size <= 1:
+        return 0, None
+    import torch.distributed as dist
+
+    from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group("nccl")
+    if dist.get_world_size() != world_size:
+        raise RuntimeError(
+            f"torchrun started {dist.get_world_size()} ranks, --world-size is {world_size}"
+        )
+    ranks = list(range(world_size))
+    pg = dist.new_group(ranks, use_local_synchronization=False)
+    adj_groups = [
+        dist.new_group([ranks[i], ranks[i + 1]], use_local_synchronization=False)
+        for i in range(world_size - 1)
+    ]
+
+    def wrap(model: torch.nn.Module) -> torch.nn.Module:
+        return ParallelVAEFactory.from_vae(model, split_dim, pg, adj_groups).eval()
+
+    return dist.get_rank(), wrap
 
 
 def _make_op(
@@ -424,8 +457,45 @@ def main() -> None:
     parser.add_argument("--cudnn-benchmark", action="store_true")
     parser.add_argument("--skip-accuracy", action="store_true")
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--world-size", type=int, default=1, help="recorded in the signature only")
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=1,
+        help="GPUs for the spatially sharded parallel VAE (native and diffusers backends); "
+        "re-executes itself under torchrun when > 1",
+    )
+    parser.add_argument(
+        "--split-dim",
+        default="height",
+        choices=["height", "width"],
+        help="shard dimension of the parallel VAE when --world-size > 1",
+    )
     args = parser.parse_args()
+
+    if args.world_size > 1 and "RANK" not in os.environ:
+        # Launch the ranks under torchrun; this process only forwards the exit code.
+        cmd = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nnodes=1",
+            f"--nproc-per-node={args.world_size}",
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+        ]
+        sys.exit(subprocess.call(cmd))
+    dist_rank, parallel = _init_parallel(args.world_size, args.split_dim)
+    if parallel is not None:
+        unsupported = [b for b in args.backends.split(",") if b in ("blaze",) or b in VLLM_BACKENDS]
+        if unsupported:
+            # VaeBlaze has no halo-exchange wrapper yet (its fused norm/slab path would have to
+            # exchange borders), and the vLLM-Omni fast path refuses sharded modules.
+            print(
+                f"[parallel] world_size={args.world_size}: skipping {unsupported} (no parallel wrapper)",
+                file=sys.stderr,
+            )
+            args.backends = ",".join(b for b in args.backends.split(",") if b not in unsupported)
 
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
     dtype = getattr(torch, args.dtype)
@@ -448,6 +518,9 @@ def main() -> None:
 
     repo = Path(__file__).resolve().parents[2]
     gpu_full, gpu_short = _gpu_signature()
+    quiet = dist_rank != 0  # ranks other than 0 compute but do not report
+    if quiet:
+        sys.stdout = open(os.devnull, "w")
     import diffusers
 
     meta = {
@@ -508,6 +581,8 @@ def main() -> None:
             for backend in backends:
                 t_start = time.time()
                 model = _build(backend, state_dict, dtype, blaze_opts if backend == "blaze" else {})
+                if parallel is not None:
+                    model = parallel(model)
                 run_fn = _make_op(model, backend, op, inp, decode_chunk)
 
                 row: dict[str, Any] = {
@@ -521,6 +596,8 @@ def main() -> None:
                     row["fastpath"] = model._bench_fastpath[
                         {"decode": "decoder", "encode": "encoder"}[op]
                     ]
+                if parallel is not None:
+                    torch.distributed.barrier()
                 if not args.skip_accuracy:
                     torch.cuda.reset_peak_memory_stats()
                     with torch.inference_mode():
@@ -586,10 +663,14 @@ def main() -> None:
         del inputs
         torch.cuda.empty_cache()
 
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_path = out_dir / f"run_{stamp}_{args.label}_{gpu_short}_ws{args.world_size}.json"
-    out_path.write_text(json.dumps({"meta": meta, "results": results}, indent=1))
-    print(f"\nwrote {out_path}")
+    if not quiet:
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = out_dir / f"run_{stamp}_{args.label}_{gpu_short}_ws{args.world_size}.json"
+        out_path.write_text(json.dumps({"meta": meta, "results": results}, indent=1))
+        print(f"\nwrote {out_path}")
+    if parallel is not None:
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
