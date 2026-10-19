@@ -547,10 +547,21 @@ def avg_down_add_cuda(
     factor_s: int,
     group_size: int,
     pad_t: int,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``x + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``."""
+    """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``;
+    ``bias`` is the downsample conv's bias when that conv ran without it."""
     return torch.ops.trtllm.vae_avg_down_add(
-        x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t
+        x,
+        r,
+        out_height,
+        out_width,
+        in_width,
+        factor_t,
+        factor_s,
+        group_size,
+        pad_t,
+        bias.reshape(-1).contiguous() if bias is not None else None,
     )
 
 

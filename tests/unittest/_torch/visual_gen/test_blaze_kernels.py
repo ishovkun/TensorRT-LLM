@@ -505,7 +505,10 @@ from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import AvgDown3D  # noqa:
 @frame_ops
 @pytest.mark.parametrize("cin_cout_ft", [(160, 160, 1), (160, 320, 2), (320, 640, 2)])
 @pytest.mark.parametrize("frames", [4, 1])
-def test_avg_down_add_matches_eager(cin_cout_ft: tuple[int, int, int], frames: int) -> None:
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_avg_down_add_matches_eager(
+    cin_cout_ft: tuple[int, int, int], frames: int, with_bias: bool
+) -> None:
     cin, cout, ft = cin_cout_ft
     gen = torch.Generator(device="cuda").manual_seed(cin + frames)
     h, w = 12, 20
@@ -522,7 +525,8 @@ def test_avg_down_add_matches_eager(cin_cout_ft: tuple[int, int, int], frames: i
         .to(bf)
         .to(memory_format=torch.channels_last_3d)
     )
-    ref = x + ref_avg
+    bias = torch.randn(cout, generator=gen, device="cuda").to(bf) if with_bias else None
+    ref = (x.float() + (bias.float().view(1, -1, 1, 1, 1) if with_bias else 0.0) + ref_avg.float()).to(bf)
     pad_t = (ft - frames % ft) % ft
     got = avg_down_add_cuda(
         r.new_empty(0)
@@ -536,6 +540,7 @@ def test_avg_down_add_matches_eager(cin_cout_ft: tuple[int, int, int], frames: i
         2,
         dup.group_size,
         pad_t,
+        bias,
     )
     got = got.view(1, x.shape[2], h // 2, w // 2, cout).permute(0, 4, 1, 2, 3)
     assert torch.equal(got, ref), "group size 4 means the mean is exact: bitwise with eager"

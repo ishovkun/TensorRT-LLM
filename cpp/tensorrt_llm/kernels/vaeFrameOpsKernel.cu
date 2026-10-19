@@ -119,8 +119,8 @@ __global__ void __launch_bounds__(kThreads) vaeWinoCombineKernel(T const* __rest
 }
 
 // One thread per (output pixel, 8 output channels): y = x + mean over the group.
-__global__ void __launch_bounds__(kThreads)
-    vaeAvgDownAddKernel(T const* __restrict__ x, T const* __restrict__ r, T* __restrict__ y, VaeAvgDownParams p)
+__global__ void __launch_bounds__(kThreads) vaeAvgDownAddKernel(T const* __restrict__ x, T const* __restrict__ r,
+    T const* __restrict__ bias, T* __restrict__ y, VaeAvgDownParams p)
 {
     int const cvec = p.cout / V;
     int64_t const total = static_cast<int64_t>(p.outFrames) * p.outPositions * cvec;
@@ -136,6 +136,7 @@ __global__ void __launch_bounds__(kThreads)
         int const iOut = static_cast<int>(sp / p.outWidth);
         int const jOut = static_cast<int>(sp - static_cast<int64_t>(iOut) * p.outWidth);
         Vec xv = *reinterpret_cast<Vec const*>(x + idx * V);
+        Vec const bv = bias != nullptr ? *reinterpret_cast<Vec const*>(bias + o0) : common::make_zeros<Vec>();
         Vec out;
 #pragma unroll
         for (int k = 0; k < V; ++k)
@@ -161,7 +162,8 @@ __global__ void __launch_bounds__(kThreads)
             }
             // mean in fp32 (PyTorch's bf16 mean accumulates in fp32), then the eager add
             float const m = roundPair(make_float2(acc * inv, 0.0f)).x;
-            out.val[k] = Elem<T>::fromFloat2(make_float2(Elem<T>::toFloat(xv.val[k]) + m, 0.0f)).x;
+            float const xb = Elem<T>::toFloat(xv.val[k]) + Elem<T>::toFloat(bv.val[k]);
+            out.val[k] = Elem<T>::fromFloat2(make_float2(xb + m, 0.0f)).x;
         }
         *reinterpret_cast<Vec*>(y + idx * V) = out;
     }
@@ -291,7 +293,8 @@ void launchVaeWinoCombine(VaeWinoCombinePointers const& in, VaeWinoCombineParams
     sync_check_cuda_error(stream);
 }
 
-void launchVaeAvgDownAdd(void const* x, void const* r, void* y, VaeAvgDownParams const& p, cudaStream_t stream)
+void launchVaeAvgDownAdd(
+    void const* x, void const* r, void const* bias, void* y, VaeAvgDownParams const& p, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(p.cout % V == 0, "vaeAvgDownAdd: cout must be a multiple of %d", V);
     TLLM_CHECK_WITH_INFO(p.groupSize >= 1 && p.factorT >= 1 && p.factorS >= 1, "vaeAvgDownAdd: bad factors");
@@ -300,8 +303,8 @@ void launchVaeAvgDownAdd(void const* x, void const* r, void* y, VaeAvgDownParams
     {
         return;
     }
-    vaeAvgDownAddKernel<<<gridFor(total), kThreads, 0, stream>>>(
-        static_cast<T const*>(x), static_cast<T const*>(r), static_cast<T*>(y), p);
+    vaeAvgDownAddKernel<<<gridFor(total), kThreads, 0, stream>>>(static_cast<T const*>(x), static_cast<T const*>(r),
+        static_cast<T const*>(bias), static_cast<T*>(y), p);
     sync_check_cuda_error(stream);
 }
 

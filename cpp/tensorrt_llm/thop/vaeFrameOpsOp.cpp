@@ -85,10 +85,18 @@ torch::Tensor vae_wino_combine(std::optional<torch::Tensor> const& x, std::vecto
 
 // y = x + AvgDown3D(r); x, y: [T', P', Cout]; r: [T, P, Cin]. See vaeFrameOpsKernel.h.
 torch::Tensor vae_avg_down_add(torch::Tensor const& x, torch::Tensor const& r, int64_t out_height, int64_t out_width,
-    int64_t in_width, int64_t factor_t, int64_t factor_s, int64_t group_size, int64_t pad_t)
+    int64_t in_width, int64_t factor_t, int64_t factor_s, int64_t group_size, int64_t pad_t,
+    std::optional<torch::Tensor> const& bias)
 {
     CHECK_INPUT(x, torch::kBFloat16);
     CHECK_INPUT(r, torch::kBFloat16);
+    void const* biasPtr = nullptr;
+    if (bias.has_value())
+    {
+        CHECK_INPUT(bias.value(), torch::kBFloat16);
+        TORCH_CHECK(bias->numel() == x.size(2), "bias must have Cout values");
+        biasPtr = bias->data_ptr();
+    }
     TORCH_CHECK(x.dim() == 3 && r.dim() == 3, "frame tensors must be [T, P, C]");
     TORCH_CHECK(x.size(1) == out_height * out_width, "x positions must equal out_height * out_width");
     tensorrt_llm::kernels::VaeAvgDownParams p{};
@@ -108,7 +116,7 @@ torch::Tensor vae_avg_down_add(torch::Tensor const& x, torch::Tensor const& r, i
     TORCH_CHECK(p.cin * p.factorT * p.factorS * p.factorS == p.cout * p.groupSize, "channel grouping mismatch");
     auto y = torch::empty_like(x);
     tensorrt_llm::kernels::launchVaeAvgDownAdd(
-        x.data_ptr(), r.data_ptr(), y.data_ptr(), p, at::cuda::getCurrentCUDAStream(x.get_device()));
+        x.data_ptr(), r.data_ptr(), biasPtr, y.data_ptr(), p, at::cuda::getCurrentCUDAStream(x.get_device()));
     return y;
 }
 
@@ -169,7 +177,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def("vae_interleave_bias(Tensor u, Tensor? bias) -> Tensor");
     m.def(
         "vae_avg_down_add(Tensor x, Tensor r, int out_height, int out_width, int in_width, int factor_t, int factor_s, "
-        "int group_size, int pad_t) -> Tensor");
+        "int group_size, int pad_t, Tensor? bias=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

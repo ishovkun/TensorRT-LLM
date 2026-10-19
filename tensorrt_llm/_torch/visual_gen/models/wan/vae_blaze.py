@@ -171,8 +171,12 @@ class VaeBlazeOptions:
     # Off in "reference" mode, where every rounding of the eager path is reproduced.
     fold_encoder_tail: bool = False
     # Checklist item 20: pixel frames per encoder pass after the first one-frame pass. Must
-    # be a multiple of 4 so every pass ends at the same temporal-downsampler parity.
-    encoder_chunk_frames: int = 4
+    # be a multiple of 4 so every pass ends at the same temporal-downsampler parity. Larger
+    # passes give the convs more rows and fewer launches: 720p encode 726 ms at 4 frames,
+    # 628 at 24 (flat beyond), 480p 224 -> 184; peak memory 9 -> 29 GB at 720p. From 8 frames
+    # up the deepest levels see frame pairs and take the Winograd pair path, which moves the
+    # encode error from 1.27e-2 to 1.35e-2 against the fp32 reference (decode's level).
+    encoder_chunk_frames: int = 24
     # Checklist item 14: the decoder writes each chunk's unpatchified, clamped frames
     # straight into the preallocated output (one kernel per chunk) instead of
     # cat + unpatchify + clamp over the whole video. Needs the CUDA op; bf16, batch 1.
@@ -825,6 +829,10 @@ class BlazeResample(nn.Module):
         self.mode = mode
         self.options = options or VaeBlazeOptions()
         self._packed: tuple[int, int, torch.Tensor, torch.Tensor | None] | None = None
+        # Downsample conv bias left out of the conv (fused_bias): the time conv absorbs it
+        # (downsample3d) or the block's shortcut-add kernel adds it (downsample2d).
+        self.pending_bias: torch.Tensor | None = None
+        self._time_bias: tuple[int, int, int, int, torch.Tensor] | None = None
         if upsample_out_dim is None:
             upsample_out_dim = dim // 2
 
@@ -969,8 +977,52 @@ class BlazeResample(nn.Module):
         x = _channels_last_2d_if_needed(x_4d)
         if self.options.fused_upsample and self.mode.startswith("upsample"):
             return self._fused_upsample(x, batch_size, frames, shortcut)
-        x = self.resample(x)
+        if self.mode.startswith("downsample"):
+            x = self._downsample_conv(self.resample[0](x), batch_size)
+        else:
+            x = self.resample(x)
         return self._after_resample(x, batch_size, frames, feat_cache, feat_idx)
+
+    def _defer_downsample_bias(self, x: torch.Tensor, batch_size: int) -> bool:
+        conv = self.resample[1]
+        return (
+            self.options.fused_bias
+            and self.options.norm_mode != "reference"
+            and conv.bias is not None
+            and cuda_frame_ops_available()
+            and batch_size == 1
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+        )
+
+    def _downsample_conv(self, x_4d: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """The stride-2 3x3 conv of the downsample modes; with a deferred bias the conv runs
+        bias-free and the bias is left in ``pending_bias`` for the consumer."""
+        conv = self.resample[1]
+        if self._defer_downsample_bias(x_4d, batch_size):
+            self.pending_bias = conv.bias
+            return F.conv2d(x_4d, conv.weight, None, conv.stride, conv.padding)
+        self.pending_bias = None
+        return conv(x_4d)
+
+    def take_pending_bias(self) -> torch.Tensor | None:
+        bias, self.pending_bias = self.pending_bias, None
+        return bias
+
+    def _time_conv_bias(self, bias: torch.Tensor) -> torch.Tensor:
+        """``time_conv``'s bias with the downsample conv's bias folded through its taps:
+        every input frame of the stride-2 time conv carries ``bias``, so
+        ``b' = b_t + sum_k W_t[:, :, k] @ bias`` (composed in fp32, rounded once)."""
+        tc = self.time_conv
+        key = (tc.weight.data_ptr(), tc.weight._version, bias.data_ptr(), bias._version)
+        if self._time_bias is None or self._time_bias[:4] != key:
+            with torch.inference_mode(False), torch.no_grad():
+                w = tc.weight.detach().float()[:, :, :, 0, 0]  # [Cout, Cin, taps]
+                b = bias.detach().float()
+                bt = tc.bias.detach().float() if tc.bias is not None else torch.zeros_like(b)
+                folded = (bt + torch.einsum("oik,i->o", w, b)).to(tc.weight.dtype)
+            self._time_bias = (*key, folded)
+        return self._time_bias[4]
 
     def forward_prepadded(
         self,
@@ -983,7 +1035,7 @@ class BlazeResample(nn.Module):
         ``ZeroPad2d`` would add; ``x_4d`` is ``[T, C, H+1, W+1]`` channels-last, batch 1."""
         if not self.mode.startswith("downsample"):
             raise ValueError("forward_prepadded is for the downsample modes")
-        x = self.resample[1](_channels_last_2d_if_needed(x_4d))
+        x = self._downsample_conv(_channels_last_2d_if_needed(x_4d), 1)
         return self._after_resample(x, 1, frames, feat_cache, feat_idx)
 
     def _after_resample(
@@ -1004,7 +1056,13 @@ class BlazeResample(nn.Module):
                 feat_idx[0] += 1
             else:
                 cache_x = x[:, :, -1:, :, :]
-                x = self.time_conv(torch.cat([feat_cache[idx][:, :, -1:, :, :], x], dim=2))
+                x_in = torch.cat([feat_cache[idx][:, :, -1:, :, :], x], dim=2)
+                bias = self.take_pending_bias()
+                if bias is not None:
+                    tc = self.time_conv
+                    x = F.conv3d(x_in, tc.weight, self._time_conv_bias(bias), tc.stride)
+                else:
+                    x = self.time_conv(x_in)
                 feat_cache[idx] = cache_x
                 feat_idx[0] += 1
         return x
@@ -1365,6 +1423,9 @@ class BlazeResidualDownBlock(nn.Module):
         else:
             x = _tensor(x)
         x = _channels_last_3d_if_needed(x)
+        # The downsample conv's bias, when it ran without one (downsample2d; the time conv
+        # absorbs it in downsample3d).
+        bias = self.downsampler.take_pending_bias() if self.downsampler is not None else None
         dup = self.avg_shortcut
         if (
             cuda_frame_ops_available()
@@ -1387,8 +1448,11 @@ class BlazeResidualDownBlock(nn.Module):
                 dup.factor_s,
                 dup.group_size,
                 pad_t,
+                bias,
             )
             return frames_to_video(y, h_out, w_out)
+        if bias is not None:
+            x = x + bias.view(1, -1, 1, 1, 1)
         return _channels_last_3d_if_needed(x + dup(residual))
 
 

@@ -85,7 +85,10 @@ struct VaeAvgDownParams
     int factorT, factorS, groupSize, padT;
 };
 
-void launchVaeAvgDownAdd(void const* x, void const* r, void* y, VaeAvgDownParams const& p, cudaStream_t stream);
+// y = x (+ bias[c]) + AvgDown3D(r); ``bias`` (bf16 [Cout], may be null) is the downsample conv's
+// bias, added here in fp32 instead of by a separate pass over its output.
+void launchVaeAvgDownAdd(
+    void const* x, void const* r, void const* bias, void* y, VaeAvgDownParams const& p, cudaStream_t stream);
 
 // Decoder output assembly: chunk [1, C*patch*patch, t, H, W] (channels-last) ->
 // out[:, :, frame0 : frame0 + t] of the video [1, C, T, H*patch, W*patch] (channels-last), with

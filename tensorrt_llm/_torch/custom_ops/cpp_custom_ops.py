@@ -224,7 +224,7 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::vae_avg_down_add")
     def _(x, r, out_height, out_width, in_width, factor_t, factor_s, group_size,
-          pad_t):
+          pad_t, bias=None):
         return x.new_empty(x.shape)
 
     @torch.library.register_fake("trtllm::vae_unpatchify_clamp")
