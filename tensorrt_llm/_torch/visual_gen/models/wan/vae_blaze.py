@@ -151,10 +151,11 @@ class VaeBlazeOptions:
     # CuTe DSL two-pass F(2x2, 3x3) kernel on Blackwell for Cout % 256 == 0 and frames of at
     # least 45x80 pixels (cuBLAS elsewhere). Single-frame calls always use the portable path.
     winograd_spatial_kernel: str = "kf"
-    # Launch form of the "kf" kernel: None picks by shape; "wa" / "wb" force a GEMM layout
-    # (rows = tiles / rows = Cout) with the four component chunks pipelined under PDL,
-    # "wa0" / "wb0" the same chunks as plain serialized launches, "wb1" one GEMM over all
-    # components without PDL. For measurements on other GPUs.
+    # Launch form of the "kf" kernel: None = one GEMM over all components without PDL (the
+    # measured choice on the power-capped GB200); "wa" / "wb" force a GEMM layout (rows =
+    # tiles / rows = Cout) with the four component chunks pipelined under PDL, 10-20% faster
+    # per conv in isolation where the GPU is below its power cap; "wa0" / "wb0" the same
+    # chunks as plain serialized launches; "wb1" the default spelled out.
     winograd_spatial_kf_mode: str | None = None
     # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (1.8x fewer GEMM FLOPs
     # and transformed bytes; fp16 storage keeps its error below the bf16 F2 path).

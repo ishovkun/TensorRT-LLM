@@ -17,8 +17,6 @@ import functools
 
 import torch
 
-MAX_WA_TILES = 4000  # per component; above this the Cout-row layout ("wb") measured faster on GB200
-
 
 @functools.lru_cache(maxsize=None)
 def kf_wino_available() -> bool:
@@ -50,12 +48,12 @@ def kf_eligible(cin: int, cout: int) -> bool:
 
 
 def _pick_mode(pairs: int, height: int, width: int, cin: int) -> str:
-    """Measured on GB200 (pair path, four components): rows = tiles wins up to a few thousand
-    tiles per component, rows = Cout from there (512 @ 180x320 and wider)."""
-    tiles = pairs * -(-height // 4) * -(-width // 4)
-    if tiles < MAX_WA_TILES and (tiles * cin // 2) % 128 == 0:
-        return "wa"
-    return "wb"
+    """One GEMM over all components, no PDL. Measured on GB200 (pair path, four components):
+    the PDL-pipelined chunks are 10-20% faster per conv in isolation, but the decoder runs at
+    the board's power cap, where the overlap only lowers the clock (720p decode 2066 ms
+    pipelined vs 2033 ms single GEMM vs 2045 ms cuBLAS); the single GEMM also launches the
+    fewest kernels. The chunked forms stay selectable through ``mode``."""
+    return "wb1"
 
 
 def wino_spatial_conv_kf(
