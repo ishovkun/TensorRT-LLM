@@ -108,6 +108,12 @@ OPTION_SETS = [
     },
     {
         "fused_norm": True,
+        "winograd_temporal": True,
+        "winograd_spatial": "all",
+        "winograd_spatial_kernel": "kf",
+    },
+    {
+        "fused_norm": True,
         "fused_residual": True,
         "fused_upsample": True,
         "fused_bias": True,

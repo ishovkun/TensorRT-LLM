@@ -49,6 +49,9 @@ from .blaze_kernels import (
     frames_view,
     images_to_pairs,
     interleave_bias_cuda,
+    kf_spatial_eligible,
+    kf_spatial_filters,
+    kf_wino_available,
     pack_upsample_weights,
     pairs_to_images,
     rms_norm_silu,
@@ -63,6 +66,7 @@ from .blaze_kernels import (
     wino_spatial_conv_cuda,
     wino_spatial_conv_cute,
     wino_spatial_conv_frames,
+    wino_spatial_conv_kf,
     winograd_spatial_taps_weights,
     winograd_spatial_weights,
     winograd_weights,
@@ -140,11 +144,13 @@ class VaeBlazeOptions:
     # (few output pixels per channel): "auto" uses it on the measured winners (see
     # ``spatial_eligible``), "all" on every eligible conv (tests), "off" never.
     winograd_spatial: str = "off"
-    # Spatial-Winograd GEMM kernel: "cublas" = the portable path (transform kernels + cuBLAS
-    # batched GEMMs); "cute" = the CuTe DSL two-pass kernel on Blackwell for F(2x2, 3x3) convs
-    # with Cout % 256 == 0 and frames of at least 45x80 pixels (cuBLAS elsewhere). Measured on
-    # GB200, the portable F(4x4, 3x3) path is the fastest on every layer it applies to.
-    winograd_spatial_kernel: str = "cublas"
+    # Spatial-Winograd kernel for the frame-pair path: "kf" = the Kernel Factory F(4x4, 3x3)
+    # pipeline (CuTe DSL on Blackwell; Cin % 64 == 0, Cout % 256 == 0, width % 4 == 0; the
+    # portable path elsewhere), the fastest on every eligible layer measured on GB200;
+    # "cublas" = the portable path (transform kernels + cuBLAS batched GEMMs); "cute" = the
+    # CuTe DSL two-pass F(2x2, 3x3) kernel on Blackwell for Cout % 256 == 0 and frames of at
+    # least 45x80 pixels (cuBLAS elsewhere). Single-frame calls always use the portable path.
+    winograd_spatial_kernel: str = "kf"
     # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (1.8x fewer GEMM FLOPs
     # and transformed bytes; fp16 storage keeps its error below the bf16 F2 path).
     winograd_spatial_tile: int = 4
@@ -203,9 +209,10 @@ class VaeBlazeOptions:
             raise ValueError(
                 f"winograd_spatial_tile must be 2 or 4, got {self.winograd_spatial_tile!r}"
             )
-        if self.winograd_spatial_kernel not in ("cublas", "cute"):
+        if self.winograd_spatial_kernel not in ("kf", "cublas", "cute"):
             raise ValueError(
-                f"winograd_spatial_kernel must be 'cublas' or 'cute', got {self.winograd_spatial_kernel!r}"
+                "winograd_spatial_kernel must be 'kf', 'cublas' or 'cute', "
+                f"got {self.winograd_spatial_kernel!r}"
             )
         if self.conv_out_frame_split < 0 or self.conv_out_frame_split in (1, 2):
             raise ValueError("conv_out_frame_split must be 0 (off) or at least 3 input frames")
@@ -535,6 +542,7 @@ class BlazeCausalConv3d(nn.Conv3d):
         self.winograd_spatial_single_tile = 2
         self.winograd_spatial_first_frame = False
         self._wino_u_nk: tuple[int, int, torch.Tensor] | None = None
+        self._wino_u_kf: tuple[int, int, torch.Tensor] | None = None
         self._wino_u: tuple[int, int, torch.Tensor] | None = None
         self._wino_u_taps: dict[int, tuple[int, int, torch.Tensor]] = {}
 
@@ -672,6 +680,19 @@ class BlazeCausalConv3d(nn.Conv3d):
             self._wino_u_nk = (*key, cute_spatial_filters(u_nk))
         return self._wino_u_nk[2]
 
+    def _winograd_spatial_weights_kf(self) -> torch.Tensor:
+        key = (self.weight.data_ptr(), self.weight._version)
+        if self._wino_u_kf is None or self._wino_u_kf[:2] != key:
+            self._wino_u_kf = (*key, kf_spatial_filters(self._winograd_weights()))
+        return self._wino_u_kf[2]
+
+    def _use_kf_spatial(self, height: int, width: int) -> bool:
+        return (
+            self.winograd_spatial_kernel == "kf"
+            and kf_wino_available()
+            and kf_spatial_eligible(self.in_channels, self.out_channels, width)
+        )
+
     def _use_cute_spatial(self, height: int, width: int) -> bool:
         # The 256-wide two-pass kernel beats the portable path from 45x80 pixels up (its
         # 256-row tiles waste too many rows below that); smaller frames stay on cuBLAS.
@@ -683,7 +704,9 @@ class BlazeCausalConv3d(nn.Conv3d):
             and height * width >= 45 * 80
         )
 
-    def spatial_eligible(self, height: int, width: int, tile: int | None = None) -> bool:
+    def spatial_eligible(
+        self, height: int, width: int, tile: int | None = None, kernel: str = "cublas"
+    ) -> bool:
         tile = self.winograd_spatial_tile if tile is None else tile
         if (
             self.winograd_spatial == "off"
@@ -694,8 +717,12 @@ class BlazeCausalConv3d(nn.Conv3d):
             return False
         if self.winograd_spatial == "all":
             return True
-        # Measured winners on GB200: with F(4x4, 3x3) every 1024-channel layer and the
-        # 512-channel level up to 180x320; with F(2x2, 3x3) the 1024-channel levels only.
+        # Measured winners on GB200: the Kernel Factory F(4x4, 3x3) pipeline on every conv
+        # with at least 512 input channels (incl. 512 -> 256 at 360x640); the portable path
+        # with F(4x4, 3x3) on every 1024-channel layer and the 512-channel level up to
+        # 180x320, with F(2x2, 3x3) on the 1024-channel levels only.
+        if kernel == "kf":
+            return self.in_channels >= 512 and height * width <= 360 * 640
         if tile == 4:
             return self.in_channels >= 512 and height * width <= 180 * 320
         return self.in_channels >= 1024 and height * width <= 90 * 160
@@ -721,6 +748,9 @@ class BlazeCausalConv3d(nn.Conv3d):
         """The four 3x3 convs of the transformed slabs (bias left to the consumer): cuDNN
         conv2d per slab, or spatial Winograd on all four at once where that is faster."""
         _, _, h, w = slabs.d[0].shape
+        if self._use_kf_spatial(h, w) and self.spatial_eligible(h, w, kernel="kf"):
+            m = wino_spatial_conv_kf(slabs.stacked, self._winograd_spatial_weights_kf(), h, w)
+            return [pairs_to_images(m[k], h, w) for k in range(4)]
         if self.spatial_eligible(h, w):
             if self._use_cute_spatial(h, w):
                 m = wino_spatial_conv_cute(

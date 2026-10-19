@@ -447,6 +447,38 @@ def wino_spatial_conv_cute(
     return out.view(comps, pairs, positions, cout)
 
 
+@functools.lru_cache(maxsize=None)
+def kf_wino_available() -> bool:
+    """The Kernel Factory spatial-Winograd kernels: Blackwell (sm100) and ``nvidia-cutlass-dsl``."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_kf import kf_wino_available as avail
+
+    return avail()
+
+
+def kf_spatial_eligible(cin: int, cout: int, width: int) -> bool:
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_kf import kf_eligible
+
+    return kf_eligible(cin, cout) and width % 4 == 0
+
+
+def kf_spatial_filters(g: list[torch.Tensor]) -> torch.Tensor:
+    """Transformed filters for :func:`wino_spatial_conv_kf` from the four component filters
+    ``g[k] [Cout, Cin, 3, 3]`` (:func:`winograd_weights`)."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_kf import kf_spatial_filters as filters
+
+    return filters(g)
+
+
+def wino_spatial_conv_kf(
+    d: torch.Tensor, u: torch.Tensor, height: int, width: int, mode: str | None = None
+) -> torch.Tensor:
+    """Same contract as :func:`wino_spatial_conv_cuda` with ``u`` from
+    :func:`kf_spatial_filters`: the Kernel Factory F(4x4, 3x3) pipeline (CuTe DSL, sm100)."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_kf import wino_spatial_conv_kf as conv
+
+    return conv(d, u, height, width, mode)
+
+
 def wino_spatial_conv_cuda(
     d: torch.Tensor, u: torch.Tensor, height: int, width: int
 ) -> torch.Tensor:

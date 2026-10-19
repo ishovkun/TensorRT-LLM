@@ -526,7 +526,9 @@ def test_avg_down_add_matches_eager(
         .to(memory_format=torch.channels_last_3d)
     )
     bias = torch.randn(cout, generator=gen, device="cuda").to(bf) if with_bias else None
-    ref = (x.float() + (bias.float().view(1, -1, 1, 1, 1) if with_bias else 0.0) + ref_avg.float()).to(bf)
+    ref = (
+        x.float() + (bias.float().view(1, -1, 1, 1, 1) if with_bias else 0.0) + ref_avg.float()
+    ).to(bf)
     pad_t = (ft - frames % ft) % ft
     got = avg_down_add_cuda(
         r.new_empty(0)
@@ -755,6 +757,43 @@ def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, 
     got = wino_spatial_conv_cute(
         d, cute_spatial_filters(u.transpose(1, 2).contiguous()), h, w
     ).float()
+    rel = ((got - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@spatial_op
+@pytest.mark.parametrize("mode", ["wa", "wb", "wb1", None])
+@pytest.mark.parametrize(
+    "cin_cout_hw_pairs", [(64, 256, 6, 12, 4), (128, 256, 9, 16, 2), (512, 512, 24, 40, 2)]
+)
+def test_spatial_winograd_kf_matches_reference(
+    mode: str | None, cin_cout_hw_pairs: tuple[int, int, int, int, int]
+) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        kf_spatial_filters,
+        kf_wino_available,
+        wino_spatial_conv_kf,
+        winograd_weights,
+    )
+
+    if not kf_wino_available():
+        pytest.skip("Kernel Factory spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    torch.manual_seed(3)
+    cin, cout, h, w, pairs = cin_cout_hw_pairs
+    weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
+    d = torch.randn(4, pairs, h * w, cin, device="cuda").to(torch.bfloat16)
+    g = winograd_weights(weight)
+    ref = torch.stack(
+        [
+            F.conv2d(
+                d[k].view(pairs, h, w, cin).permute(0, 3, 1, 2).float(), g[k].float(), None, 1, 1
+            )
+            .permute(0, 2, 3, 1)
+            .reshape(pairs, h * w, cout)
+            for k in range(4)
+        ]
+    )
+    got = wino_spatial_conv_kf(d, kf_spatial_filters(g), h, w, mode).float()
     rel = ((got - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
 
