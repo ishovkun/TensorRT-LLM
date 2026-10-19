@@ -124,12 +124,18 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
     int64_t const P = p.positions;
     int const posInBlock = warp * kPosPerWarp + group;
 
+    // Table layout: the V floats of vector vi are split into 16-byte quarters stored in
+    // separate planes ((q * nvec + vi) * 4 + e), so a warp reads each quarter with a
+    // 16-byte lane stride (bank-conflict free; the natural 32-byte stride is 2-way conflicted).
+    constexpr int kQuarters = V / 4;
+    int const nvec = C / V;
     for (int c = tid; c < C; c += kThreads)
     {
         float const g = Elem<T>::toFloat(ptrs.gamma[c]);
-        sGamma[c] = REF ? g : g * (0.5f * p.scale);
-        sBias[c] = HAS_BIAS ? Elem<T>::toFloat(ptrs.bias[c]) : 0.0f;
-        sInBias[c] = HAS_IN_BIAS ? Elem<T>::toFloat(ptrs.inBias[c]) : 0.0f;
+        int const idx = (((c % V) / 4) * nvec + c / V) * 4 + c % 4;
+        sGamma[idx] = REF ? g : g * (0.5f * p.scale);
+        sBias[idx] = HAS_BIAS ? Elem<T>::toFloat(ptrs.bias[c]) : 0.0f;
+        sInBias[idx] = HAS_IN_BIAS ? Elem<T>::toFloat(ptrs.inBias[c]) : 0.0f;
     }
     __syncthreads();
 
@@ -137,12 +143,27 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
     int64_t const gridPos = static_cast<int64_t>(gridDim.x) * kPosPerBlock;
     int const T_ = p.frames;
 
+    auto tableVec = [&](float const* table, int k) -> VecF
+    {
+        VecF r;
+        int const vi = laneInGroup + k * L;
+#pragma unroll
+        for (int q = 0; q < kQuarters; ++q)
+        {
+            float4 const f = *reinterpret_cast<float4 const*>(table + (q * nvec + vi) * 4);
+            r.val[4 * q] = f.x;
+            r.val[4 * q + 1] = f.y;
+            r.val[4 * q + 2] = f.z;
+            r.val[4 * q + 3] = f.w;
+        }
+        return r;
+    };
     VecF gReg, bReg, ibReg;
     if constexpr (CONST_REGS)
     {
-        gReg = *reinterpret_cast<VecF const*>(sGamma + laneChunkOff);
-        bReg = *reinterpret_cast<VecF const*>(sBias + laneChunkOff);
-        ibReg = *reinterpret_cast<VecF const*>(sInBias + laneChunkOff);
+        gReg = tableVec(sGamma, 0);
+        bReg = tableVec(sBias, 0);
+        ibReg = tableVec(sInBias, 0);
     }
     auto constAt = [&](float const* table, VecF const& reg, int k) -> VecF
     {
@@ -152,7 +173,7 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
         }
         else
         {
-            return *reinterpret_cast<VecF const*>(table + laneChunkOff + k * L * V);
+            return tableVec(table, k);
         }
     };
 
