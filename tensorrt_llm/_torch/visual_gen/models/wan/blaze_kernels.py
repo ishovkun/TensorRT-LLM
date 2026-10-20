@@ -446,6 +446,23 @@ def cuda_wino_spatial_available() -> bool:
 
 
 @functools.lru_cache(maxsize=None)
+def jit_norm_available() -> bool:
+    """cuda-python and a CUDA toolkit (nvcc) for the runtime-compiled norm kernel."""
+    try:
+        from cuda.bindings import driver  # noqa: F401
+        from torch.utils.cpp_extension import CUDA_HOME
+    except ImportError:
+        return False
+    import os
+
+    return (
+        CUDA_HOME is not None
+        and os.path.exists(os.path.join(CUDA_HOME, "bin", "nvcc"))
+        and torch.cuda.is_available()
+    )
+
+
+@functools.lru_cache(maxsize=None)
 def cute_wino_available() -> bool:
     """The CuTe DSL fused spatial-Winograd kernel: Blackwell (sm100) and ``nvidia-cutlass-dsl`` installed."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
@@ -668,10 +685,29 @@ def wino_norm_silu_cuda(
     reference_rounding: bool = False,
     order: int = 2,
     half_slabs: bool = False,
+    jit: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
     ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
-    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16."""
+    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16. ``jit`` runs
+    the NVRTC-compiled kernel (:mod:`jit_norm`) instead of the prebuilt op."""
+    if jit:
+        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import wino_norm_silu as jit_norm
+
+        return jit_norm(
+            x,
+            m,
+            residual,
+            in_bias.reshape(-1) if in_bias is not None else None,
+            cache,
+            gamma.reshape(-1),
+            bias.reshape(-1) if bias is not None else None,
+            float(scale),
+            frames,
+            order=order,
+            half_slabs=half_slabs,
+            reference_rounding=reference_rounding,
+        )
     s, y_tail, d = torch.ops.trtllm.vae_wino_norm_silu(
         x,
         m,

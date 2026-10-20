@@ -99,6 +99,8 @@ OPTION_SETS = [
         "fold_encoder_tail": True,
     },
     {"fused_norm": True, "winograd_temporal": True},
+    {"fused_norm": True, "winograd_temporal": True, "winograd_norm_jit": True},
+    {"fused_norm": True, "conv_slabs": True, "cudnn_frontend": True},
     {"fused_norm": True, "winograd_temporal": True, "winograd_temporal_order": 2},
     {
         "fused_norm": True,

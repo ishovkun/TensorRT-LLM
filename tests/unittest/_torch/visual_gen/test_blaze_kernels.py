@@ -374,8 +374,9 @@ def test_cuda_upsample_gather_with_shortcut(
 # Temporal Winograd norm kernel vs its eager reference
 # ---------------------------------------------------------------------------
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402  # noqa: E402
     cuda_wino_available,
+    jit_norm_available,
     wino_norm_silu_cuda,
     wino_norm_silu_reference,
 )
@@ -386,14 +387,47 @@ wino_op = pytest.mark.skipif(
 
 
 @wino_op
+@pytest.mark.parametrize("C", [512, 1024, 160])
+@pytest.mark.parametrize("order_dtype", [(2, "bf16"), (4, "fp16")])
+@pytest.mark.parametrize("source", ["x", "m"])
+def test_wino_norm_silu_jit_matches_op(C: int, order_dtype: tuple[int, str], source: str) -> None:
+    """The runtime-compiled kernel and the prebuilt op run the same source: identical outputs."""
+    if not jit_norm_available():
+        pytest.skip("NVRTC not available")
+    order, slab = order_dtype
+    slab_dtype = torch.float16 if slab == "fp16" else torch.bfloat16
+    gen = torch.Generator(device="cuda").manual_seed(C)
+    T, P = 2 * order, 11 * 13
+    bf = torch.bfloat16
+    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
+    x = rnd(T, P, C) if source == "x" else None
+    m = [rnd(T // order, P, C).to(slab_dtype) for _ in range(order + 2)] if source == "m" else None
+    residual = rnd(T, P, C)
+    in_bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    cache = rnd(2, P, C)
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    bias = (0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    args = (x, m, residual, in_bias, cache, gamma, bias, C**0.5, T)
+    kw = dict(order=order, half_slabs=slab == "fp16")
+    s_op, tail_op, d_op = wino_norm_silu_cuda(*args, **kw)
+    s_jit, tail_jit, d_jit = wino_norm_silu_cuda(*args, jit=True, **kw)
+    assert torch.equal(s_op, s_jit)
+    assert torch.equal(tail_op, tail_jit)
+    assert torch.equal(d_op, d_jit)
+
+
+@wino_op
 @pytest.mark.parametrize("C", [256, 512, 1024, 160, 48])
 @pytest.mark.parametrize("cache_frames", [0, 1, 2])
 @pytest.mark.parametrize("source", ["x", "m"])
 @pytest.mark.parametrize("extras", ["plain", "residual_bias"])
 @pytest.mark.parametrize("order_dtype", [(2, "bf16"), (2, "fp16"), (4, "fp16")])
+@pytest.mark.parametrize("backend", ["op", "jit"])
 def test_wino_norm_silu_reference_mode_is_bitwise(
-    C: int, cache_frames: int, source: str, extras: str, order_dtype: tuple[int, str]
+    C: int, cache_frames: int, source: str, extras: str, order_dtype: tuple[int, str], backend: str
 ) -> None:
+    if backend == "jit" and not jit_norm_available():
+        pytest.skip("NVRTC not available")
     order, slab = order_dtype
     slab_dtype = torch.float16 if slab == "fp16" else torch.bfloat16
     gen = torch.Generator(device="cuda").manual_seed(C + cache_frames)
@@ -427,6 +461,7 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
         reference_rounding=True,
         order=order,
         half_slabs=slab == "fp16",
+        jit=backend == "jit",
     )
     assert d.dtype == slab_dtype and d.shape[0] == order + 2
     if residual is not None:
@@ -445,7 +480,10 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
 @wino_op
 @pytest.mark.parametrize("C", [256, 160])
 @pytest.mark.parametrize("order", [2, 4])
-def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
+@pytest.mark.parametrize("backend", ["op", "jit"])
+def test_wino_norm_silu_fp32_mode_close(C: int, order: int, backend: str) -> None:
+    if backend == "jit" and not jit_norm_available():
+        pytest.skip("NVRTC not available")
     gen = torch.Generator(device="cuda").manual_seed(C)
     T, P = (6 if order == 2 else 8), 20 * 20
     bf = torch.bfloat16
@@ -457,7 +495,18 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
         x, None, None, None, cache, gamma, 0.0, C**0.5, order, slab_dtype
     )
     _, tail, d = wino_norm_silu_cuda(
-        x, None, None, None, cache, gamma, None, C**0.5, T, order=order, half_slabs=order == 4
+        x,
+        None,
+        None,
+        None,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        half_slabs=order == 4,
+        jit=backend == "jit",
     )
     for a, b in [(tail, tail_ref), *zip(d, d_ref)]:
         rel = ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-6)).item()
@@ -935,6 +984,42 @@ def test_spatial_winograd_kf_fp16_six_components(mode: str | None) -> None:
     assert got.dtype == torch.float16
     rel = ((got.float() - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [((1, 64, 6, 12, 20), 48, True), ((1, 32, 5, 9, 11), 32, False)])
+def test_cudnn_frontend_conv3d_matches_torch(
+    dtype: torch.dtype, shape: tuple[tuple[int, ...], int, bool]
+) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.cudnn_conv import (
+        conv_frontend,
+        cudnn_frontend_available,
+    )
+
+    if not cudnn_frontend_available():
+        pytest.skip("cudnn frontend not installed")
+    torch.manual_seed(1)
+    xshape, cout, with_bias = shape
+    cin = xshape[1]
+    x = (
+        torch.randn(*xshape, device="cuda")
+        .to(dtype)
+        .contiguous(memory_format=torch.channels_last_3d)
+    )
+    w = (
+        (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda"))
+        .to(dtype)
+        .contiguous(memory_format=torch.channels_last_3d)
+    )
+    b = (0.3 * torch.randn(cout, device="cuda")).to(dtype) if with_bias else None
+    ref = F.conv3d(x, w, b, 1, (0, 1, 1))
+    got = conv_frontend(x, w, b, (1, 1, 1), (0, 1, 1), (1, 1, 1))
+    assert got.shape == ref.shape and got.dtype == dtype
+    rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+    assert rel < 5e-3, f"rel_l2={rel:.2e}"
+    # second call reuses the selected plan
+    got2 = conv_frontend(x, w, b, (1, 1, 1), (0, 1, 1), (1, 1, 1))
+    assert torch.equal(got, got2)
 
 
 frame_ops_op = pytest.mark.skipif(

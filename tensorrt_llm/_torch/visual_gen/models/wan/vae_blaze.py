@@ -71,6 +71,7 @@ from .blaze_kernels import (
     winograd_spatial_weights,
     winograd_weights,
 )
+from .cudnn_conv import conv_frontend, cudnn_frontend_available
 from .wan_vae import (
     CACHE_T,
     AvgDown3D,
@@ -145,6 +146,16 @@ class VaeBlazeOptions:
     # output rounding and the F(2,3) error drops 15x) or "bf16" (the "cute" spatial kernel
     # needs it).
     winograd_slab_dtype: str = "fp16"
+    # Run the fused Winograd norm kernel compiled at run time by NVRTC (one instantiation per
+    # layout/mode, cached) instead of the prebuilt op.
+    winograd_norm_jit: bool = False
+    # Checklist item 39: the convs still on cuDNN (the frame-buffer 3D convs, the direct 3D
+    # convs) go through the cuDNN graph API with the fastest of every engine plan the
+    # heuristics offer for the shape (timed once per shape, remembered on disk). Measured on
+    # GB200: the encoder's 160/320/640-channel levels 1.12-1.29x over torch's engine choice;
+    # end to end 480p encode 184 -> 177 ms, the rest within noise. The plan search runs once
+    # per new shape (seconds) and is remembered on disk.
+    cudnn_frontend: bool = True
     # Checklist item 22: spatial Winograd F(2x2,3x3) on top of the temporal one. The four
     # 3x3 conv2d calls become an input transform, 64 cuBLAS batched GEMMs and an output
     # transform. Single-frame calls (the first frame of a clip, every image, and the
@@ -483,6 +494,7 @@ class BlazeRMSNorm(nn.Module):
             reference_rounding=self.options.norm_mode == "reference",
             order=self.options.temporal_order_for(frames),
             half_slabs=self.options.winograd_slab_dtype == "fp16",
+            jit=self.options.winograd_norm_jit,
         )
         slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d], d)
         return (
@@ -579,6 +591,7 @@ class BlazeCausalConv3d(nn.Conv3d):
         self.winograd_spatial_kernel = "cublas"
         self.winograd_spatial_kf_mode: str | None = None
         self.winograd_slab_dtype = torch.bfloat16
+        self.cudnn_frontend = False
         self.winograd_spatial_tile = 2
         self.winograd_spatial_single_tile = 2
         self.winograd_spatial_first_frame = False
@@ -676,11 +689,33 @@ class BlazeCausalConv3d(nn.Conv3d):
             y = torch.cat(parts, dim=2)
         else:
             window = slab[:, :, pos - 2 : pos + frames]
-            y = F.conv3d(
-                window, self.weight, bias, self.stride, self.padding, self.dilation, self.groups
-            )
+            y = self._conv3d(window, bias, self.padding)
         self._slab_pos = pos + frames
         return _channels_last_3d_if_needed(y)
+
+    def _conv3d(
+        self, x: torch.Tensor, bias: torch.Tensor | None, padding: tuple[int, int, int]
+    ) -> torch.Tensor:
+        """The direct 3D conv: cuDNN through torch, or through the graph API with the plan
+        selected for this shape when ``cudnn_frontend`` is on."""
+        if (
+            self.cudnn_frontend
+            and self.groups == 1
+            and x.shape[0] == 1
+            and cudnn_frontend_available()
+        ):
+            w = self.weight.detach()
+            if not w.is_contiguous(memory_format=torch.channels_last_3d):
+                w = w.contiguous(memory_format=torch.channels_last_3d)
+            return conv_frontend(
+                x.contiguous(memory_format=torch.channels_last_3d),
+                w,
+                bias,
+                tuple(self.stride),
+                tuple(padding),
+                tuple(self.dilation),
+            )
+        return F.conv3d(x, self.weight, bias, self.stride, padding, self.dilation, self.groups)
 
     def slab_eligible(self, x_like: torch.Tensor) -> bool:
         return (
@@ -907,7 +942,7 @@ class BlazeCausalConv3d(nn.Conv3d):
                 for t in range(0, total, per_call)
             ]
             return _channels_last_3d_if_needed(torch.cat(parts, dim=2))
-        x = F.conv3d(x, self.weight, bias, self.stride, padding, self.dilation, self.groups)
+        x = self._conv3d(x, bias, padding)
         return _channels_last_3d_if_needed(x)
 
 
@@ -1196,6 +1231,7 @@ class BlazeResidualBlock(nn.Module):
             conv.winograd_slab_dtype = (
                 torch.float16 if self.options.winograd_slab_dtype == "fp16" else torch.bfloat16
             )
+            conv.cudnn_frontend = self.options.cudnn_frontend
             conv.winograd_spatial_tile = self.options.winograd_spatial_tile
             conv.winograd_spatial_single_tile = self.options.winograd_spatial_single_tile
             conv.winograd_spatial_first_frame = self.options.winograd_spatial_first_frame
