@@ -49,6 +49,8 @@ from .blaze_kernels import (
     frames_view,
     images_to_pairs,
     interleave_bias_cuda,
+    kf_fused_eligible,
+    kf_fused_filters,
     kf_spatial_eligible,
     kf_spatial_filters,
     kf_wino_available,
@@ -66,6 +68,7 @@ from .blaze_kernels import (
     wino_spatial_conv_cuda,
     wino_spatial_conv_cute,
     wino_spatial_conv_frames,
+    wino_spatial_conv_fused,
     wino_spatial_conv_kf,
     winograd_spatial_taps_weights,
     winograd_spatial_weights,
@@ -146,16 +149,20 @@ class VaeBlazeOptions:
     # output rounding and the F(2,3) error drops 15x) or "bf16" (the "cute" spatial kernel
     # needs it).
     winograd_slab_dtype: str = "fp16"
-    # Run the fused Winograd norm kernel compiled at run time by NVRTC (one instantiation per
-    # layout/mode, cached) instead of the prebuilt op.
-    winograd_norm_jit: bool = False
+    # The position-walk kernel compiled at run time (one instantiation per layout/mode/stage,
+    # cached; jit_norm.py) in place of the prebuilt ops, per role: the plain norm (+ SiLU, +
+    # residual), the Winograd norm (slab producer / product consumer), the Winograd combine.
+    jit_norm: bool = False
+    jit_wino_norm: bool = False
+    jit_combine: bool = False
     # Checklist item 39: the convs still on cuDNN (the frame-buffer 3D convs, the direct 3D
     # convs) go through the cuDNN graph API with the fastest of every engine plan the
     # heuristics offer for the shape (timed once per shape, remembered on disk). Measured on
     # GB200: the encoder's 160/320/640-channel levels 1.12-1.29x over torch's engine choice;
     # end to end 480p encode 184 -> 177 ms, the rest within noise. The plan search runs once
-    # per new shape (seconds) and is remembered on disk.
-    cudnn_frontend: bool = True
+    # per new shape (seconds) and is remembered on disk. Off by default like every other
+    # option: the all-off model reproduces the native one bit for bit.
+    cudnn_frontend: bool = False
     # Checklist item 22: spatial Winograd F(2x2,3x3) on top of the temporal one. The four
     # 3x3 conv2d calls become an input transform, 64 cuBLAS batched GEMMs and an output
     # transform. Single-frame calls (the first frame of a clip, every image, and the
@@ -178,6 +185,9 @@ class VaeBlazeOptions:
     # per conv in isolation where the GPU is below its power cap; "wa0" / "wb0" the same
     # chunks as plain serialized launches; "wb1" the default spelled out.
     winograd_spatial_kf_mode: str | None = None
+    # The fused 1D-Winograd conv (Kernel Factory campaign 2) for the 256-output-channel convs
+    # under the "kf" kernel; off = those convs stay on cuDNN.
+    winograd_spatial_fused: bool = True
     # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (1.8x fewer GEMM FLOPs
     # and transformed bytes; fp16 storage keeps its error below the bf16 F2 path).
     winograd_spatial_tile: int = 4
@@ -330,6 +340,11 @@ class VaeBlazeOptions:
         return False
 
 
+# Whether PendingAdd's fused combine runs the runtime-compiled kernel; set by the model from its
+# options (a PendingAdd carries no options of its own).
+_COMBINE_JIT = [False]
+
+
 @dataclass
 class PendingAdd:
     """``(a + bias) + b`` not yet computed: the next fused norm adds it while reading.
@@ -379,7 +394,9 @@ class PendingAdd:
         x_f = frames_view(_channels_last_3d_if_needed(self.a)) if self.a is not None else None
         m_f = [images_to_pairs(mk) for mk in self.wino] if self.wino is not None else None
         r_f = frames_view(_channels_last_3d_if_needed(self.b)) if self.b is not None else None
-        return wino_combine_cuda(x_f, m_f, self.bias, r_f, self.frames, h, w, pad_h, pad_w)
+        return wino_combine_cuda(
+            x_f, m_f, self.bias, r_f, self.frames, h, w, pad_h, pad_w, jit=_COMBINE_JIT[0]
+        )
 
     def can_fuse(self) -> bool:
         src = self.a if self.a is not None else self.wino[0]
@@ -494,7 +511,7 @@ class BlazeRMSNorm(nn.Module):
             reference_rounding=self.options.norm_mode == "reference",
             order=self.options.temporal_order_for(frames),
             half_slabs=self.options.winograd_slab_dtype == "fp16",
-            jit=self.options.winograd_norm_jit,
+            jit=self.options.jit_wino_norm,
         )
         slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d], d)
         return (
@@ -519,6 +536,7 @@ class BlazeRMSNorm(nn.Module):
                 reference_rounding=reference,
                 in_bias=in_bias,
                 out=out,
+                jit=self.options.jit_norm,
             )
         x = apply_in_bias(x, in_bias)
         if can_fuse_rms_norm_silu(x):
@@ -553,6 +571,7 @@ class BlazeRMSNorm(nn.Module):
                 reference_rounding=reference,
                 in_bias=pending.bias,
                 out=out,
+                jit=self.options.jit_norm,
             )
         s = pending.materialize()
         return s, self.forward_silu(s, out)
@@ -590,6 +609,7 @@ class BlazeCausalConv3d(nn.Conv3d):
         self.winograd_spatial = "off"
         self.winograd_spatial_kernel = "cublas"
         self.winograd_spatial_kf_mode: str | None = None
+        self.winograd_spatial_fused = True
         self.winograd_slab_dtype = torch.bfloat16
         self.cudnn_frontend = False
         self.winograd_spatial_tile = 2
@@ -597,6 +617,7 @@ class BlazeCausalConv3d(nn.Conv3d):
         self.winograd_spatial_first_frame = False
         self._wino_u_nk: tuple[int, int, torch.Tensor] | None = None
         self._wino_u_kf: dict[int, tuple[int, int, torch.Tensor]] = {}
+        self._wino_u_fused: dict[int, tuple[int, int, list[torch.Tensor]]] = {}
         self._wino_u: dict[int, tuple[int, int, int, torch.Tensor]] = {}
         self._wino_u_taps: dict[int, tuple[int, int, torch.Tensor]] = {}
 
@@ -772,6 +793,24 @@ class BlazeCausalConv3d(nn.Conv3d):
             self._wino_u_kf[order] = cached
         return cached[2]
 
+    def _fused_filters(self, order: int = 2) -> list[torch.Tensor]:
+        key = (self.weight.data_ptr(), self.weight._version)
+        cached = self._wino_u_fused.get(order)
+        if cached is None or cached[:2] != key:
+            cached = (*key, kf_fused_filters(self._winograd_weights(order)))
+            self._wino_u_fused[order] = cached
+        return cached[2]
+
+    def _use_kf_fused(self, height: int, width: int) -> bool:
+        """The fused 1D-Winograd conv for the 256-output-channel level (Kernel Factory campaign 2):
+        1.3-1.5x over cuDNN per conv on GB200 with the multiplies cut, not rearranged."""
+        return (
+            self.winograd_spatial_kernel == "kf"
+            and self.winograd_spatial_fused
+            and kf_wino_available()
+            and kf_fused_eligible(self.in_channels, self.out_channels, height, width)
+        )
+
     def _use_kf_spatial(self, height: int, width: int) -> bool:
         return (
             self.winograd_spatial_kernel == "kf"
@@ -836,6 +875,9 @@ class BlazeCausalConv3d(nn.Conv3d):
         comps = len(slabs.d)
         order = comps - 2
         _, _, h, w = slabs.d[0].shape
+        if self.winograd_spatial != "off" and self._use_kf_fused(h, w):
+            m = wino_spatial_conv_fused(slabs.stacked, self._fused_filters(order), h, w)
+            return [pairs_to_images(m[k], h, w) for k in range(comps)]
         if self._use_kf_spatial(h, w) and self.spatial_eligible(h, w, kernel="kf"):
             m = wino_spatial_conv_kf(
                 slabs.stacked,
@@ -861,6 +903,21 @@ class BlazeCausalConv3d(nn.Conv3d):
             return [pairs_to_images(m[k], h, w) for k in range(comps)]
         g = self._winograd_weights(order)
         pad = (self.padding[1], self.padding[2])
+        if self.cudnn_frontend and cudnn_frontend_available():
+            # One stacked product buffer [comps, groups, H, W, Cout]: the consumer norm kernel
+            # reads the components at one stride, and the graph API writes into the slices.
+            groups, _, hh, ww = slabs.d[0].shape
+            out = torch.empty(
+                (comps, groups, hh, ww, self.out_channels),
+                dtype=slabs.d[0].dtype,
+                device=slabs.d[0].device,
+            )
+            views = [
+                out[k].permute(0, 3, 1, 2) for k in range(comps)
+            ]  # [groups, Cout, H, W] channels-last
+            for k in range(comps):
+                conv_frontend(slabs.d[k], g[k], None, (1, 1), pad, (1, 1), out=views[k])
+            return views
         return [F.conv2d(slabs.d[k], g[k], None, 1, pad) for k in range(comps)]
 
     def _current_frame_weight(self) -> torch.Tensor:
@@ -1228,6 +1285,7 @@ class BlazeResidualBlock(nn.Module):
             conv.winograd_spatial = spatial
             conv.winograd_spatial_kernel = self.options.winograd_spatial_kernel
             conv.winograd_spatial_kf_mode = self.options.winograd_spatial_kf_mode
+            conv.winograd_spatial_fused = self.options.winograd_spatial_fused
             conv.winograd_slab_dtype = (
                 torch.float16 if self.options.winograd_slab_dtype == "fp16" else torch.bfloat16
             )
@@ -1427,6 +1485,7 @@ class BlazeAttentionBlock(WanAttentionBlock):
             self.norm.gamma,
             None,
             self.norm.scale,
+            jit=self.options.jit_norm,
             reference_rounding=self.options.norm_mode == "reference",
             silu=False,
         )
@@ -1988,6 +2047,7 @@ class VaeBlaze(nn.Module):
             options = VaeBlazeOptions.from_dict(options)
         self.config = config
         self.options = options
+        _COMBINE_JIT[0] = options.jit_combine
         self.z_dim = config.z_dim
         self.temperal_downsample = config.temperal_downsample
         self.temperal_upsample = config.temperal_downsample[::-1]

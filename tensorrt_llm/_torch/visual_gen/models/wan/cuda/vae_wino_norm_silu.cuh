@@ -318,16 +318,24 @@ __device__ __forceinline__ void vaeWinoNormSiluBody(Ptrs<T, TD> const& ptrs, Vae
             }
         };
 
-        // Cross-frame prefetch (sliceDepth 2, i.e. K <= 3): slices 0 and 1 of the next frame
-        // are loaded while this frame is normalized, so a frame's load latency hides behind
-        // the previous frame's pass 2. The first frame of a position loads its own.
-        constexpr bool XF_PF = !FRAME_PF && sliceDepth<K>() == 2;
+        // Cross-frame prefetch (sliceDepth 2, i.e. K <= 3): the first XF_SLICES slices of the
+        // next frame are loaded while this frame is normalized, so a frame's load latency
+        // hides behind the previous frame's pass 2. The producer prefetches two slices (one
+        // vector each); the consumer holds up to five product vectors per slice, and more
+        // than XF_IN slices in flight across pass 2 spills. The first frame of a position
+        // loads its own.
+#ifndef VAEWINO_XF_IN
+#define VAEWINO_XF_IN 0
+#endif
+        constexpr int XF_SLICES = FRAME_PF || sliceDepth<K>() != 2 ? 0 : (IN_WINO ? VAEWINO_XF_IN : 2);
+        constexpr bool XF_PF = XF_SLICES > 0;
+        constexpr bool XF_TWO = XF_SLICES > 1 && K > 1;
         FrameSrc src = srcOf(cuda::std::integral_constant<int, 0>{}, 0);
         if constexpr (FRAME_PF || XF_PF)
         {
             loadSlice(cuda::std::integral_constant<int, 0>{}, inA, resA, src, 0);
         }
-        if constexpr (XF_PF && K > 1)
+        if constexpr (XF_TWO)
         {
             loadSlice(cuda::std::integral_constant<int, 0>{}, inB, resB, src, 1);
         }
@@ -442,7 +450,7 @@ __device__ __forceinline__ void vaeWinoNormSiluBody(Ptrs<T, TD> const& ptrs, Vae
 #pragma unroll
                 for (int k = 0; k < K; k += 2)
                 {
-                    if (k + 1 < K && !(XF_PF && k == 0))
+                    if (k + 1 < K && !(XF_TWO && k == 0))
                     {
                         loadSlice(termsIn, inB, resB, src, k + 1);
                     }
@@ -496,7 +504,7 @@ __device__ __forceinline__ void vaeWinoNormSiluBody(Ptrs<T, TD> const& ptrs, Vae
                 {
                     next = srcOf(termsNext, t + 1);
                     loadSlice(termsNext, inA, resA, next, 0);
-                    if constexpr (K > 1)
+                    if constexpr (XF_TWO)
                     {
                         loadSlice(termsNext, inB, resB, next, 1);
                     }

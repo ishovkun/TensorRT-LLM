@@ -141,13 +141,15 @@ def rms_norm_silu_cuda(
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     silu: bool = True,
+    jit: bool = False,
 ) -> torch.Tensor:
     """The CUDA op (``trtllm::vae_rms_norm_silu``); same contract as ``rms_norm_silu``.
     ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
     ``out`` is an optional channels-last destination of ``x``'s shape (a frame-buffer
-    window); the result is written there and returned.
+    window); the result is written there and returned. ``jit`` runs the runtime-compiled
+    position-walk kernel (:mod:`jit_norm`) in row mode instead of the prebuilt op.
     """
     rows = _channel_rows(x)
     if rows is None:
@@ -157,6 +159,20 @@ def rms_norm_silu_cuda(
         dst = _channel_rows(out)
         if dst is None:
             raise ValueError("out must be a channels-last CUDA tensor")
+    if jit:
+        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import rms_norm_silu_rows
+
+        _, out_rows = rms_norm_silu_rows(
+            rows,
+            gamma.reshape(-1),
+            bias.reshape(-1) if bias is not None else None,
+            float(scale),
+            reference_rounding=reference_rounding,
+            in_bias=in_bias.reshape(-1) if in_bias is not None else None,
+            out=dst,
+            silu=silu,
+        )
+        return out if out is not None else _rows_to_like(out_rows, x)
     out_rows = torch.ops.trtllm.vae_rms_norm_silu(
         rows,
         gamma.reshape(-1),
@@ -196,6 +212,7 @@ def add_rms_norm_silu_cuda(
     reference_rounding: bool = False,
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    jit: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns ``(s, act)``.
     ``out``: optional channels-last destination for the activation."""
@@ -206,6 +223,20 @@ def add_rms_norm_silu_cuda(
     dst = _channel_rows(out) if out is not None else None
     if out is not None and dst is None:
         raise ValueError("out must be a channels-last CUDA tensor")
+    if jit:
+        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import rms_norm_silu_rows
+
+        s_rows, a_rows = rms_norm_silu_rows(
+            rows,
+            gamma.reshape(-1),
+            bias.reshape(-1) if bias is not None else None,
+            float(scale),
+            reference_rounding=reference_rounding,
+            in_bias=in_bias.reshape(-1) if in_bias is not None else None,
+            residual=rrows,
+            out=dst,
+        )
+        return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
     s_rows, a_rows = torch.ops.trtllm.vae_add_rms_norm_silu(
         rows,
         rrows,
@@ -529,6 +560,28 @@ def kf_spatial_filters(g: list[torch.Tensor]) -> torch.Tensor:
     return filters(g)
 
 
+def kf_fused_eligible(cin: int, cout: int, height: int, width: int) -> bool:
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_kf import fused_eligible
+
+    return fused_eligible(cin, cout, height, width)
+
+
+def kf_fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_kf import fused_filters
+
+    return fused_filters(g)
+
+
+def wino_spatial_conv_fused(
+    d: torch.Tensor, filters: list[torch.Tensor], height: int, width: int
+) -> torch.Tensor:
+    """Same contract as :func:`wino_spatial_conv_cuda` for the 256-output-channel convs: the
+    fused 1D-Winograd kernel (Kernel Factory, CuTe DSL, sm100), filters from :func:`kf_fused_filters`."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_kf import wino_spatial_conv_fused as conv
+
+    return conv(d, filters, height, width)
+
+
 def wino_spatial_conv_kf(
     d: torch.Tensor, u: torch.Tensor, height: int, width: int, mode: str | None = None
 ) -> torch.Tensor:
@@ -611,11 +664,27 @@ def wino_combine_cuda(
     width: int,
     pad_h: int = 0,
     pad_w: int = 0,
+    jit: bool = False,
 ) -> torch.Tensor:
     """``(combine(m) | x) + bias + residual`` in frame layout ``[T, P, C]``, eager rounding order.
 
     With ``pad_h``/``pad_w`` the result is ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns
-    appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``)."""
+    appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``). ``jit``: the runtime-compiled
+    position-walk kernel in combine mode."""
+    if jit:
+        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import combine
+
+        return combine(
+            x,
+            m,
+            bias.reshape(-1).contiguous() if bias is not None else None,
+            residual,
+            frames,
+            height,
+            width,
+            pad_h,
+            pad_w,
+        )
     return torch.ops.trtllm.vae_wino_combine(
         x,
         m if m is not None else [],

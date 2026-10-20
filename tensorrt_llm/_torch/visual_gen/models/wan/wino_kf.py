@@ -210,3 +210,34 @@ def _run_wb(
         if k > 0:
             xform_out(k - 1, PDL_TRIGGER | PDL_WAIT_END)
     xform_out(comps - 1, PDL_WAIT_START)
+
+
+def fused_eligible(cin: int, cout: int, height: int, width: int) -> bool:
+    """Shapes the fused 1D-Winograd conv (``kf_wino.fused256``) covers: 256 output channels,
+    input channels in multiples of 32, 8-row and 32-pixel tiles."""
+    return cout == 256 and cin % 32 == 0 and height % 8 == 0 and width % 32 == 0
+
+
+def fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Transformed filters for :func:`wino_spatial_conv_fused`, one per component filter
+    ``g[k] [Cout, Cin, 3, 3]``."""
+    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import fused256
+
+    return [fused256.prepare(gk.contiguous().to(torch.bfloat16)) for gk in g]
+
+
+def wino_spatial_conv_fused(
+    d: torch.Tensor, filters: list[torch.Tensor], height: int, width: int
+) -> torch.Tensor:
+    """The fused 1D-Winograd 3x3 conv per component (Kernel Factory campaign 2): ``D [components,
+    pairs, H*W, Cin]`` (bf16 or fp16) -> ``M [components, pairs, H*W, 256]`` in ``D``'s dtype,
+    one stacked buffer (the consumer norm kernel reads the components at one stride)."""
+    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import fused256
+
+    comps, pairs, positions, cin = d.shape
+    cout = filters[0].shape[0]
+    y = torch.empty((comps, pairs, height, width, cout), dtype=d.dtype, device=d.device)
+    x = d.view(comps, pairs, height, width, cin)
+    for k in range(comps):
+        fused256.run_prepared(x[k], filters[k], y[k])
+    return y.view(comps, pairs, positions, cout)

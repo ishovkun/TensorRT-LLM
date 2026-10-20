@@ -90,6 +90,7 @@ class _Conv:
         device: int,
         x: torch.Tensor,
         w: torch.Tensor,
+        y: torch.Tensor,
         has_bias: bool,
         padding: tuple[int, ...],
         stride: tuple[int, ...],
@@ -113,6 +114,7 @@ class _Conv:
         self.w = self.graph.tensor(
             name="W", dim=list(w.shape), stride=list(w.stride()), data_type=dt
         )
+        y_out = y
         y = self.graph.conv_fprop(
             image=self.x,
             weight=self.w,
@@ -128,7 +130,9 @@ class _Conv:
                 name="B", dim=bias_dim, stride=self._bias_stride(bias_dim), data_type=dt
             )
             y = self.graph.bias(input=y, bias=self.b)
-        y.set_output(True).set_data_type(dt)
+        y.set_output(True).set_data_type(dt).set_dim(list(y_out.shape)).set_stride(
+            list(y_out.stride())
+        )
         self.y = y
         self.graph.validate()
         self.graph.build_operation_graph()
@@ -213,18 +217,34 @@ def conv_frontend(
     stride: tuple[int, ...],
     padding: tuple[int, ...],
     dilation: tuple[int, ...],
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``F.conv2d``/``F.conv3d`` (groups 1) through the cuDNN graph API with the fastest plan for
-    this shape. ``x`` and ``w`` channels-last; ``bias`` [Cout] or None."""
+    this shape. ``x`` and ``w`` channels-last; ``bias`` [Cout] or None; ``out`` an optional
+    destination of the output shape (any strides, e.g. one slice of a stacked buffer)."""
     dims = x.dim() - 2
     conv = F.conv2d if dims == 2 else F.conv3d
     device = x.device.index
+    out_shape = [x.shape[0], w.shape[0]] + [
+        (x.shape[2 + i] + 2 * padding[i] - dilation[i] * (w.shape[2 + i] - 1) - 1) // stride[i] + 1
+        for i in range(dims)
+    ]
+    if out is None:
+        memory_format = torch.channels_last if dims == 2 else torch.channels_last_3d
+        y = torch.empty(out_shape, dtype=x.dtype, device=x.device).contiguous(
+            memory_format=memory_format
+        )
+    else:
+        if list(out.shape) != out_shape or out.dtype != x.dtype:
+            raise ValueError("out must have the conv's output shape and dtype")
+        y = out
     key_t = (
         device,
         tuple(x.shape),
         tuple(x.stride()),
         tuple(w.shape),
         tuple(w.stride()),
+        tuple(y.stride()),
         x.dtype,
         bias is not None,
         stride,
@@ -232,17 +252,9 @@ def conv_frontend(
         dilation,
     )
     entry = _convs.get(key_t)
-    out_shape = [x.shape[0], w.shape[0]] + [
-        (x.shape[2 + i] + 2 * padding[i] - dilation[i] * (w.shape[2 + i] - 1) - 1) // stride[i] + 1
-        for i in range(dims)
-    ]
-    memory_format = torch.channels_last if dims == 2 else torch.channels_last_3d
-    y = torch.empty(out_shape, dtype=x.dtype, device=x.device).contiguous(
-        memory_format=memory_format
-    )
     b = bias.reshape([1, -1] + [1] * dims).contiguous() if bias is not None else None
     if entry is None:
-        entry = _Conv(device, x, w, bias is not None, padding, stride, dilation)
+        entry = _Conv(device, x, w, y, bias is not None, padding, stride, dilation)
         key = hashlib.sha256(
             ("|".join(map(str, key_t[1:])) + "|" + _device_key(device)).encode()
         ).hexdigest()[:24]
