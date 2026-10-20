@@ -25,70 +25,6 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-// y = (combine(m) | x) + bias + residual, frames as [T, P, C]; see vaeFrameOpsKernel.h.
-torch::Tensor vae_wino_combine(std::optional<torch::Tensor> const& x, std::vector<torch::Tensor> const& m,
-    std::optional<torch::Tensor> const& bias, std::optional<torch::Tensor> const& residual, int64_t frames,
-    int64_t height, int64_t width, int64_t pad_h, int64_t pad_w)
-{
-    TORCH_CHECK(x.has_value() != !m.empty(), "exactly one of x and m");
-    torch::Tensor const& src = x.has_value() ? x.value() : m.at(0);
-    TORCH_CHECK(src.dim() == 3, "frame tensors must be [T, P, C]");
-    bool const halfProducts = !x.has_value() && src.scalar_type() == torch::kHalf;
-    CHECK_INPUT(src, (halfProducts ? torch::kHalf : torch::kBFloat16));
-    int64_t const P = src.size(1);
-    int64_t const C = src.size(2);
-    TORCH_CHECK(C % 8 == 0, "channels must be a multiple of 8");
-
-    tensorrt_llm::kernels::VaeWinoCombinePointers ptrs{};
-    tensorrt_llm::kernels::VaeWinoCombineParams p{};
-    p.positions = P;
-    p.channels = static_cast<int>(C);
-    p.frames = static_cast<int>(frames);
-    TORCH_CHECK(height * width == P, "height * width must equal P");
-    p.height = static_cast<int>(height);
-    p.width = static_cast<int>(width);
-    p.padH = static_cast<int>(pad_h);
-    p.padW = static_cast<int>(pad_w);
-    if (x.has_value())
-    {
-        TORCH_CHECK(x->size(0) == frames, "x must be [T, P, C]");
-        ptrs.x = x->data_ptr();
-    }
-    else
-    {
-        int64_t const order = static_cast<int64_t>(m.size()) - 2;
-        TORCH_CHECK((order == 2 || order == 4) && frames % order == 0,
-            "m must hold order + 2 tensors (order 2 or 4) and T must be divisible by the order");
-        TORCH_CHECK(order == 2 || halfProducts, "order 4 products must be fp16");
-        p.order = static_cast<int>(order);
-        p.halfProducts = halfProducts;
-        for (int64_t k = 0; k < order + 2; ++k)
-        {
-            CHECK_INPUT(m.at(k), (halfProducts ? torch::kHalf : torch::kBFloat16));
-            TORCH_CHECK(m.at(k).size(0) == frames / order && m.at(k).size(1) == P && m.at(k).size(2) == C,
-                "m[k] must be [T/order, P, C]");
-            ptrs.m[k] = m.at(k).data_ptr();
-        }
-    }
-    if (bias.has_value())
-    {
-        CHECK_INPUT(bias.value(), torch::kBFloat16);
-        TORCH_CHECK(bias->numel() == C, "bias must have one value per channel");
-        ptrs.bias = bias->data_ptr();
-    }
-    if (residual.has_value())
-    {
-        CHECK_INPUT(residual.value(), torch::kBFloat16);
-        TORCH_CHECK(residual->size(0) == frames && residual->size(1) == P && residual->size(2) == C,
-            "residual must be [T, P, C]");
-        ptrs.residual = residual->data_ptr();
-    }
-    auto y = torch::empty({frames, (height + pad_h) * (width + pad_w), C}, src.options().dtype(torch::kBFloat16));
-    ptrs.y = y.data_ptr();
-    tensorrt_llm::kernels::launchVaeWinoCombine(ptrs, p, at::cuda::getCurrentCUDAStream(src.get_device()));
-    return y;
-}
-
 // y = x + AvgDown3D(r); x, y: [T', P', Cout]; r: [T, P, Cin]. See vaeFrameOpsKernel.h.
 torch::Tensor vae_avg_down_add(torch::Tensor const& x, torch::Tensor const& r, int64_t out_height, int64_t out_width,
     int64_t in_width, int64_t factor_t, int64_t factor_s, int64_t group_size, int64_t pad_t,
@@ -177,9 +113,6 @@ torch::Tensor vae_unpatchify_clamp(torch::Tensor const& chunk, torch::Tensor con
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("vae_unpatchify_clamp(Tensor chunk, Tensor(a!) out, int frame0, int patch) -> Tensor(a!)");
-    m.def(
-        "vae_wino_combine(Tensor? x, Tensor[] m, Tensor? bias, Tensor? residual, int frames, int height, int width, "
-        "int pad_h, int pad_w) -> Tensor");
     m.def("vae_interleave_bias(Tensor u, Tensor? bias) -> Tensor");
     m.def(
         "vae_avg_down_add(Tensor x, Tensor r, int out_height, int out_width, int in_width, int factor_t, int factor_s, "
@@ -188,7 +121,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("vae_wino_combine", &vae_wino_combine);
     m.impl("vae_interleave_bias", &vae_interleave_bias);
     m.impl("vae_unpatchify_clamp", &vae_unpatchify_clamp);
     m.impl("vae_avg_down_add", &vae_avg_down_add);

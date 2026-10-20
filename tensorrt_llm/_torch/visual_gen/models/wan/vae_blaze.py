@@ -41,7 +41,6 @@ from .blaze_kernels import (
     can_use_cuda_upsample_gather,
     cuda_frame_ops_available,
     cuda_op_available,
-    cuda_wino_available,
     cuda_wino_spatial_available,
     cute_spatial_filters,
     cute_wino_available,
@@ -104,8 +103,8 @@ class VaeBlazeOptions:
     # reproduces the eager path's intermediate roundings for a bitwise-style gate.
     fused_norm: bool = False
     norm_mode: str = "fp32"
-    # "cuda": the trtllm::vae_rms_norm_silu op (falls back to Triton when the op is not
-    # built or the shape is unsupported); "triton": the prototype kernel.
+    # "cuda": the runtime-compiled norm kernel (falls back to Triton when it cannot be
+    # compiled or the shape is unsupported); "triton": the prototype kernel.
     norm_kernel: str = "cuda"
     # Checklist item 2: a residual block hands its ``conv2 + residual`` add to the next
     # block's norm kernel instead of running it as a separate pass. Needs fused_norm and
@@ -149,12 +148,6 @@ class VaeBlazeOptions:
     # output rounding and the F(2,3) error drops 15x) or "bf16" (the "cute" spatial kernel
     # needs it).
     winograd_slab_dtype: str = "fp16"
-    # The position-walk kernel compiled at run time (one instantiation per layout/mode/stage,
-    # cached; jit_norm.py) in place of the prebuilt ops, per role: the plain norm (+ SiLU, +
-    # residual), the Winograd norm (slab producer / product consumer), the Winograd combine.
-    jit_norm: bool = False
-    jit_wino_norm: bool = False
-    jit_combine: bool = False
     # Checklist item 39: the convs still on cuDNN (the frame-buffer 3D convs, the direct 3D
     # convs) go through the cuDNN graph API with the fastest of every engine plan the
     # heuristics offer for the shape (timed once per shape, remembered on disk). Measured on
@@ -311,7 +304,7 @@ class VaeBlazeOptions:
             self.winograd_temporal
             and self.fused_norm
             and self.norm_kernel == "cuda"
-            and cuda_wino_available()
+            and cuda_op_available()
         )
 
     @property
@@ -338,11 +331,6 @@ class VaeBlazeOptions:
         if self.cudnn_benchmark == "auto":
             return encoder or frames == 1
         return False
-
-
-# Whether PendingAdd's fused combine runs the runtime-compiled kernel; set by the model from its
-# options (a PendingAdd carries no options of its own).
-_COMBINE_JIT = [False]
 
 
 @dataclass
@@ -394,9 +382,7 @@ class PendingAdd:
         x_f = frames_view(_channels_last_3d_if_needed(self.a)) if self.a is not None else None
         m_f = [images_to_pairs(mk) for mk in self.wino] if self.wino is not None else None
         r_f = frames_view(_channels_last_3d_if_needed(self.b)) if self.b is not None else None
-        return wino_combine_cuda(
-            x_f, m_f, self.bias, r_f, self.frames, h, w, pad_h, pad_w, jit=_COMBINE_JIT[0]
-        )
+        return wino_combine_cuda(x_f, m_f, self.bias, r_f, self.frames, h, w, pad_h, pad_w)
 
     def can_fuse(self) -> bool:
         src = self.a if self.a is not None else self.wino[0]
@@ -404,7 +390,7 @@ class PendingAdd:
             self.b is None or self.b.shape[0] == 1
         )
         dtype_ok = src.dtype == torch.bfloat16 or (self.a is None and src.dtype == torch.float16)
-        return cuda_frame_ops_available() and dtype_ok and src.is_cuda and batch_one
+        return cuda_op_available() and dtype_ok and src.is_cuda and batch_one
 
     def materialize_padded_2d(self) -> torch.Tensor:
         """The frames with one zero row and column appended, as ``[T, C, H+1, W+1]`` channels-last
@@ -511,7 +497,6 @@ class BlazeRMSNorm(nn.Module):
             reference_rounding=self.options.norm_mode == "reference",
             order=self.options.temporal_order_for(frames),
             half_slabs=self.options.winograd_slab_dtype == "fp16",
-            jit=self.options.jit_wino_norm,
         )
         slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d], d)
         return (
@@ -536,7 +521,6 @@ class BlazeRMSNorm(nn.Module):
                 reference_rounding=reference,
                 in_bias=in_bias,
                 out=out,
-                jit=self.options.jit_norm,
             )
         x = apply_in_bias(x, in_bias)
         if can_fuse_rms_norm_silu(x):
@@ -571,7 +555,6 @@ class BlazeRMSNorm(nn.Module):
                 reference_rounding=reference,
                 in_bias=pending.bias,
                 out=out,
-                jit=self.options.jit_norm,
             )
         s = pending.materialize()
         return s, self.forward_silu(s, out)
@@ -1485,7 +1468,6 @@ class BlazeAttentionBlock(WanAttentionBlock):
             self.norm.gamma,
             None,
             self.norm.scale,
-            jit=self.options.jit_norm,
             reference_rounding=self.options.norm_mode == "reference",
             silu=False,
         )
@@ -2047,7 +2029,6 @@ class VaeBlaze(nn.Module):
             options = VaeBlazeOptions.from_dict(options)
         self.config = config
         self.options = options
-        _COMBINE_JIT[0] = options.jit_combine
         self.z_dim = config.z_dim
         self.temperal_downsample = config.temperal_downsample
         self.temperal_upsample = config.temperal_downsample[::-1]

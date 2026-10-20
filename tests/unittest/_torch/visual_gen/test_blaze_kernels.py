@@ -93,7 +93,7 @@ def test_4d_images_layout() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CUDA op (trtllm::vae_rms_norm_silu) against the Triton prototype and eager
+# CUDA norm kernel against the Triton prototype and eager
 # ---------------------------------------------------------------------------
 
 from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
@@ -104,7 +104,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E
     rms_norm_silu_cuda,
 )
 
-cuda_op = pytest.mark.skipif(not cuda_op_available(), reason="trtllm::vae_rms_norm_silu not built")
+cuda_op = pytest.mark.skipif(not cuda_op_available(), reason="runtime compilation unavailable")
 CUDA_CHANNELS = [c for c in CHANNELS if c % 8 == 0]  # 7 and 12 take the Triton/eager path
 
 
@@ -374,46 +374,12 @@ def test_cuda_upsample_gather_with_shortcut(
 # Temporal Winograd norm kernel vs its eager reference
 # ---------------------------------------------------------------------------
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402  # noqa: E402
-    cuda_wino_available,
-    jit_norm_available,
+from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
     wino_norm_silu_cuda,
     wino_norm_silu_reference,
 )
 
-wino_op = pytest.mark.skipif(
-    not cuda_wino_available(), reason="trtllm::vae_wino_norm_silu not built"
-)
-
-
-@wino_op
-@pytest.mark.parametrize("C", [512, 1024, 160])
-@pytest.mark.parametrize("order_dtype", [(2, "bf16"), (4, "fp16")])
-@pytest.mark.parametrize("source", ["x", "m"])
-def test_wino_norm_silu_jit_matches_op(C: int, order_dtype: tuple[int, str], source: str) -> None:
-    """The runtime-compiled kernel and the prebuilt op run the same source: identical outputs."""
-    if not jit_norm_available():
-        pytest.skip("NVRTC not available")
-    order, slab = order_dtype
-    slab_dtype = torch.float16 if slab == "fp16" else torch.bfloat16
-    gen = torch.Generator(device="cuda").manual_seed(C)
-    T, P = 2 * order, 11 * 13
-    bf = torch.bfloat16
-    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
-    x = rnd(T, P, C) if source == "x" else None
-    m = [rnd(T // order, P, C).to(slab_dtype) for _ in range(order + 2)] if source == "m" else None
-    residual = rnd(T, P, C)
-    in_bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    cache = rnd(2, P, C)
-    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    bias = (0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    args = (x, m, residual, in_bias, cache, gamma, bias, C**0.5, T)
-    kw = dict(order=order, half_slabs=slab == "fp16")
-    s_op, tail_op, d_op = wino_norm_silu_cuda(*args, **kw)
-    s_jit, tail_jit, d_jit = wino_norm_silu_cuda(*args, jit=True, **kw)
-    assert torch.equal(s_op, s_jit)
-    assert torch.equal(tail_op, tail_jit)
-    assert torch.equal(d_op, d_jit)
+wino_op = cuda_op
 
 
 @wino_op
@@ -422,12 +388,9 @@ def test_wino_norm_silu_jit_matches_op(C: int, order_dtype: tuple[int, str], sou
 @pytest.mark.parametrize("source", ["x", "m"])
 @pytest.mark.parametrize("extras", ["plain", "residual_bias"])
 @pytest.mark.parametrize("order_dtype", [(2, "bf16"), (2, "fp16"), (4, "fp16")])
-@pytest.mark.parametrize("backend", ["op", "jit"])
 def test_wino_norm_silu_reference_mode_is_bitwise(
-    C: int, cache_frames: int, source: str, extras: str, order_dtype: tuple[int, str], backend: str
+    C: int, cache_frames: int, source: str, extras: str, order_dtype: tuple[int, str]
 ) -> None:
-    if backend == "jit" and not jit_norm_available():
-        pytest.skip("NVRTC not available")
     order, slab = order_dtype
     slab_dtype = torch.float16 if slab == "fp16" else torch.bfloat16
     gen = torch.Generator(device="cuda").manual_seed(C + cache_frames)
@@ -461,7 +424,6 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
         reference_rounding=True,
         order=order,
         half_slabs=slab == "fp16",
-        jit=backend == "jit",
     )
     assert d.dtype == slab_dtype and d.shape[0] == order + 2
     if residual is not None:
@@ -480,10 +442,7 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
 @wino_op
 @pytest.mark.parametrize("C", [256, 160])
 @pytest.mark.parametrize("order", [2, 4])
-@pytest.mark.parametrize("backend", ["op", "jit"])
-def test_wino_norm_silu_fp32_mode_close(C: int, order: int, backend: str) -> None:
-    if backend == "jit" and not jit_norm_available():
-        pytest.skip("NVRTC not available")
+def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
     gen = torch.Generator(device="cuda").manual_seed(C)
     T, P = (6 if order == 2 else 8), 20 * 20
     bf = torch.bfloat16
@@ -506,7 +465,6 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int, backend: str) -> Non
         T,
         order=order,
         half_slabs=order == 4,
-        jit=backend == "jit",
     )
     for a, b in [(tail, tail_ref), *zip(d, d_ref)]:
         rel = ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-6)).item()
@@ -571,11 +529,11 @@ from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E
 )
 
 frame_ops = pytest.mark.skipif(
-    not cuda_frame_ops_available(), reason="trtllm::vae_wino_combine not built"
+    not cuda_frame_ops_available(), reason="trtllm::vae_interleave_bias not built"
 )
 
 
-@frame_ops
+@cuda_op
 @pytest.mark.parametrize("C", [256, 160, 48])
 @pytest.mark.parametrize("source", ["x", "m2", "m2h", "m4h"])
 @pytest.mark.parametrize("extras", ["none", "bias", "residual", "bias_residual"])
@@ -1020,92 +978,6 @@ def test_cudnn_frontend_conv3d_matches_torch(
     # second call reuses the selected plan
     got2 = conv_frontend(x, w, b, (1, 1, 1), (0, 1, 1), (1, 1, 1))
     assert torch.equal(got, got2)
-
-
-@pytest.mark.parametrize("C", [256, 512, 1024, 160, 48])
-@pytest.mark.parametrize("extras", ["plain", "bias", "in_bias", "residual_bias", "no_silu"])
-@pytest.mark.parametrize("reference", [False, True])
-def test_norm_jit_rows_matches_op(C: int, extras: str, reference: bool) -> None:
-    """The unified runtime-compiled kernel in row mode against the prebuilt plain norm op."""
-    from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import rms_norm_silu_rows
-
-    if not jit_norm_available() or not cuda_op_available():
-        pytest.skip("runtime compilation or the norm op not available")
-    gen = torch.Generator(device="cuda").manual_seed(C)
-    N = 7 * 11 * 3
-    bf = torch.bfloat16
-    x = torch.randn(N, C, generator=gen, device="cuda").to(bf)
-    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    bias = (
-        (0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-        if extras in ("bias", "residual_bias")
-        else None
-    )
-    in_bias = (
-        (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-        if extras in ("in_bias", "residual_bias")
-        else None
-    )
-    residual = (
-        torch.randn(N, C, generator=gen, device="cuda").to(bf)
-        if extras == "residual_bias"
-        else None
-    )
-    silu = extras != "no_silu"
-    scale = C**0.5
-    if residual is None:
-        ref = torch.ops.trtllm.vae_rms_norm_silu(
-            x, gamma, bias, scale, reference, in_bias, None, silu
-        )
-        s_ref = None
-    else:
-        s_ref, ref = torch.ops.trtllm.vae_add_rms_norm_silu(
-            x, residual, gamma, bias, scale, reference, in_bias, None
-        )
-    s_got, got = rms_norm_silu_rows(
-        x,
-        gamma,
-        bias,
-        scale,
-        reference_rounding=reference,
-        in_bias=in_bias,
-        residual=residual,
-        silu=silu,
-    )
-    if s_ref is not None:
-        assert torch.equal(s_got, s_ref)
-    if reference:
-        assert torch.equal(got, ref)
-    else:
-        # fp32 mode: identical math, but the standalone kernel's reduction order may differ
-        rel = ((got.float() - ref.float()).norm() / ref.float().norm()).item()
-        assert rel < 2e-3, f"rel_l2={rel:.2e}"
-
-
-@pytest.mark.parametrize("C", [256, 160, 48])
-@pytest.mark.parametrize("source", ["x", "m2", "m4h"])
-@pytest.mark.parametrize("extras", ["none", "bias_residual"])
-@pytest.mark.parametrize("pad", [0, 1])
-def test_norm_jit_combine_matches_op(C: int, source: str, extras: str, pad: int) -> None:
-    """The unified runtime-compiled kernel in combine mode against the prebuilt combine op."""
-    from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import combine
-
-    if not jit_norm_available() or not cuda_frame_ops_available():
-        pytest.skip("runtime compilation or the combine op not available")
-    gen = torch.Generator(device="cuda").manual_seed(C)
-    order = 4 if source == "m4h" else 2
-    T, H, W = 2 * order, 7, 11
-    P = H * W
-    bf = torch.bfloat16
-    slab_dtype = torch.float16 if source == "m4h" else bf
-    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
-    x = rnd(T, P, C) if source == "x" else None
-    m = list(rnd(order + 2, T // order, P, C).to(slab_dtype).unbind(0)) if source != "x" else None
-    bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf) if "bias" in extras else None
-    residual = rnd(T, P, C) if "residual" in extras else None
-    ref = wino_combine_cuda(x, m, bias, residual, T, H, W, pad, pad)
-    got = combine(x, m, bias, residual, T, H, W, pad, pad)
-    assert torch.equal(got, ref)
 
 
 @spatial_op

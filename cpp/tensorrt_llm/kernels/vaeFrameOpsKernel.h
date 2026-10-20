@@ -29,35 +29,6 @@ namespace kernels
 // (a batch-1 channels-last video), 16-byte vectors, one bf16 rounding per add in the
 // eager order so results match the PyTorch chain bit for bit.
 
-// y[t] = ((src[t] + bias) + residual[t]) where src[t] is either x[t] or the Winograd
-// combine of the previous conv's m0..m3: frame 2p = (m0 + m1) + m2, frame 2p+1 =
-// (m1 - m2) - m3, each add rounded to bf16.
-// With padH/padW set, y is [T, (H+padH)*(W+padW), C]: the source frames (H x W) land in
-// the top-left corner and the extra rows/columns are zero (the downsampler's ZeroPad2d).
-struct VaeWinoCombineParams
-{
-    int64_t positions; // H * W of the source
-    int channels;
-    int frames;
-    int height;        // H (needed when padding)
-    int width;         // W
-    int padH;          // extra zero rows at the bottom (0 or 1)
-    int padW;          // extra zero columns at the right (0 or 1)
-    int order;         // temporal Winograd order of m (2 or 4); ignored with x
-    bool halfProducts; // m is fp16 (else bf16)
-};
-
-struct VaeWinoCombinePointers
-{
-    void const* x;        // [T, P, C] or null when m is used
-    void const* m[6];     // order + 2 tensors, each [T/order, P, C] (bf16 or fp16), or null
-    void const* bias;     // [C] or null
-    void const* residual; // [T, P, C] or null
-    void* y;              // [T, P, C]
-};
-
-void launchVaeWinoCombine(VaeWinoCombinePointers const& ptrs, VaeWinoCombineParams const& p, cudaStream_t stream);
-
 // Upsample3d time interleave with the time conv's bias: u is [T, P, 2C] (the C -> 2C
 // time conv output, bias not applied), y is [2T, P, C] with
 //   y[2t] = u[t, :, 0:C] + bias[0:C],  y[2t+1] = u[t, :, C:2C] + bias[C:2C].

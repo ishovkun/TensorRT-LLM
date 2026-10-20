@@ -151,9 +151,7 @@ add_th_common_family(
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
-  vaeRmsNormSiluOp.cpp
   vaeUpsampleGatherOp.cpp
-  vaeWinoNormSiluOp.cpp
   vaeFrameOpsOp.cpp
   vaeWinoSpatialOp.cpp)
 

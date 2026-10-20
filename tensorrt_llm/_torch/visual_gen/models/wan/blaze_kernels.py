@@ -11,43 +11,19 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import (
+    combine,
+    rms_norm_silu_rows,
+    wino_norm_silu,
+)
+
 _NORM_EPS = 1e-12  # F.normalize default
 _MAX_TILE_ELEMENTS = 4096
 
 
 def cuda_op_available() -> bool:
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_rms_norm_silu")
-
-
-# (lanes per row, 16-byte vectors per lane) layouts instantiated in vaeRmsNormSiluKernel.cu.
-_CUDA_LAYOUTS = {
-    (32, 1),
-    (32, 2),
-    (32, 4),
-    (4, 5),
-    (8, 5),
-    (16, 5),
-    (2, 3),
-    (4, 3),
-    (1, 1),
-    (2, 1),
-    (4, 1),
-    (8, 1),
-    (16, 1),
-    (1, 3),
-    (32, 3),
-}
-
-
-def _cuda_layout(channels: int) -> tuple[int, int] | None:
-    if channels % 8:
-        return None
-    nvec = channels // 8
-    lanes = 32
-    while nvec % lanes:
-        lanes //= 2
-    layout = (lanes, nvec // lanes)
-    return layout if layout in _CUDA_LAYOUTS else None
+    """The runtime-compiled norm / Winograd norm / combine kernel (:mod:`jit_norm`) can run."""
+    return jit_norm_available()
 
 
 def can_use_cuda_rms_norm_silu(x: torch.Tensor) -> bool:
@@ -55,7 +31,7 @@ def can_use_cuda_rms_norm_silu(x: torch.Tensor) -> bool:
         cuda_op_available()
         and x.is_cuda
         and x.dtype is torch.bfloat16
-        and _cuda_layout(x.shape[1]) is not None
+        and x.shape[1] % 8 == 0
         and _channel_rows(x) is not None
     )
 
@@ -141,15 +117,13 @@ def rms_norm_silu_cuda(
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     silu: bool = True,
-    jit: bool = False,
 ) -> torch.Tensor:
-    """The CUDA op (``trtllm::vae_rms_norm_silu``); same contract as ``rms_norm_silu``.
+    """The CUDA kernel (:mod:`jit_norm` in row mode); same contract as ``rms_norm_silu``.
     ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
     ``out`` is an optional channels-last destination of ``x``'s shape (a frame-buffer
-    window); the result is written there and returned. ``jit`` runs the runtime-compiled
-    position-walk kernel (:mod:`jit_norm`) in row mode instead of the prebuilt op.
+    window); the result is written there and returned.
     """
     rows = _channel_rows(x)
     if rows is None:
@@ -159,38 +133,17 @@ def rms_norm_silu_cuda(
         dst = _channel_rows(out)
         if dst is None:
             raise ValueError("out must be a channels-last CUDA tensor")
-    if jit:
-        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import rms_norm_silu_rows
-
-        _, out_rows = rms_norm_silu_rows(
-            rows,
-            gamma.reshape(-1),
-            bias.reshape(-1) if bias is not None else None,
-            float(scale),
-            reference_rounding=reference_rounding,
-            in_bias=in_bias.reshape(-1) if in_bias is not None else None,
-            out=dst,
-            silu=silu,
-        )
-        return out if out is not None else _rows_to_like(out_rows, x)
-    out_rows = torch.ops.trtllm.vae_rms_norm_silu(
+    _, out_rows = rms_norm_silu_rows(
         rows,
         gamma.reshape(-1),
         bias.reshape(-1) if bias is not None else None,
         float(scale),
-        reference_rounding,
-        in_bias.reshape(-1) if in_bias is not None else None,
-        dst,
-        silu,
+        reference_rounding=reference_rounding,
+        in_bias=in_bias.reshape(-1) if in_bias is not None else None,
+        out=dst,
+        silu=silu,
     )
-    if out is not None:
-        return out
-    # The op returns [rows, C]; view it back as the channels-last 4D/5D tensor.
-    if x.dim() == 5:
-        n, c, t, h, w = x.shape
-        return out_rows.view(n, t, h, w, c).permute(0, 4, 1, 2, 3)
-    n, c, h, w = x.shape
-    return out_rows.view(n, h, w, c).permute(0, 3, 1, 2)
+    return out if out is not None else _rows_to_like(out_rows, x)
 
 
 def _rows_to_like(rows: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
@@ -212,7 +165,6 @@ def add_rms_norm_silu_cuda(
     reference_rounding: bool = False,
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-    jit: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns ``(s, act)``.
     ``out``: optional channels-last destination for the activation."""
@@ -223,29 +175,15 @@ def add_rms_norm_silu_cuda(
     dst = _channel_rows(out) if out is not None else None
     if out is not None and dst is None:
         raise ValueError("out must be a channels-last CUDA tensor")
-    if jit:
-        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import rms_norm_silu_rows
-
-        s_rows, a_rows = rms_norm_silu_rows(
-            rows,
-            gamma.reshape(-1),
-            bias.reshape(-1) if bias is not None else None,
-            float(scale),
-            reference_rounding=reference_rounding,
-            in_bias=in_bias.reshape(-1) if in_bias is not None else None,
-            residual=rrows,
-            out=dst,
-        )
-        return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
-    s_rows, a_rows = torch.ops.trtllm.vae_add_rms_norm_silu(
+    s_rows, a_rows = rms_norm_silu_rows(
         rows,
-        rrows,
         gamma.reshape(-1),
         bias.reshape(-1) if bias is not None else None,
         float(scale),
-        reference_rounding,
-        in_bias.reshape(-1) if in_bias is not None else None,
-        dst,
+        reference_rounding=reference_rounding,
+        in_bias=in_bias.reshape(-1) if in_bias is not None else None,
+        residual=rrows,
+        out=dst,
     )
     return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
 
@@ -345,11 +283,7 @@ def rms_norm_silu_reference(
 # ---------------------------------------------------------------------------
 
 
-def cuda_wino_available() -> bool:
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_norm_silu")
-
-
-# Temporal Winograd F(order, 3) transforms, mirrored in vaeWinoTables.cuh. Order 2 is the
+# Temporal Winograd F(order, 3) transforms, mirrored in cuda/vae_wino_tables.cuh. Order 2 is the
 # classic F(2,3); order 4 uses the points (0, 1, -1, 2, -1/2, inf), whose output transform AT
 # holds only powers of two (exact products) and whose input transform BT holds multiples of
 # 1/2 (exact products of 16-bit values in fp32).
@@ -651,7 +585,8 @@ def images_to_pairs(m: torch.Tensor) -> torch.Tensor:
 
 
 def cuda_frame_ops_available() -> bool:
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_combine")
+    """The prebuilt frame ops (time interleave, AvgDown shortcut add)."""
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_interleave_bias")
 
 
 def wino_combine_cuda(
@@ -664,30 +599,14 @@ def wino_combine_cuda(
     width: int,
     pad_h: int = 0,
     pad_w: int = 0,
-    jit: bool = False,
 ) -> torch.Tensor:
     """``(combine(m) | x) + bias + residual`` in frame layout ``[T, P, C]``, eager rounding order.
 
     With ``pad_h``/``pad_w`` the result is ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns
-    appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``). ``jit``: the runtime-compiled
-    position-walk kernel in combine mode."""
-    if jit:
-        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import combine
-
-        return combine(
-            x,
-            m,
-            bias.reshape(-1).contiguous() if bias is not None else None,
-            residual,
-            frames,
-            height,
-            width,
-            pad_h,
-            pad_w,
-        )
-    return torch.ops.trtllm.vae_wino_combine(
+    appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``)."""
+    return combine(
         x,
-        m if m is not None else [],
+        m,
         bias.reshape(-1).contiguous() if bias is not None else None,
         residual,
         frames,
@@ -754,30 +673,11 @@ def wino_norm_silu_cuda(
     reference_rounding: bool = False,
     order: int = 2,
     half_slabs: bool = False,
-    jit: bool = False,
-) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
     ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
-    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16. ``jit`` runs
-    the NVRTC-compiled kernel (:mod:`jit_norm`) instead of the prebuilt op."""
-    if jit:
-        from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import wino_norm_silu as jit_norm
-
-        return jit_norm(
-            x,
-            m,
-            residual,
-            in_bias.reshape(-1) if in_bias is not None else None,
-            cache,
-            gamma.reshape(-1),
-            bias.reshape(-1) if bias is not None else None,
-            float(scale),
-            frames,
-            order=order,
-            half_slabs=half_slabs,
-            reference_rounding=reference_rounding,
-        )
-    s, y_tail, d = torch.ops.trtllm.vae_wino_norm_silu(
+    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16."""
+    return wino_norm_silu(
         x,
         m,
         residual,
@@ -786,12 +686,11 @@ def wino_norm_silu_cuda(
         gamma.reshape(-1),
         bias.reshape(-1) if bias is not None else None,
         float(scale),
-        reference_rounding,
         frames,
-        order,
-        half_slabs,
+        order=order,
+        half_slabs=half_slabs,
+        reference_rounding=reference_rounding,
     )
-    return (s if s.numel() else None), y_tail, d
 
 
 def wino_combine_reference(m: list[torch.Tensor]) -> torch.Tensor:

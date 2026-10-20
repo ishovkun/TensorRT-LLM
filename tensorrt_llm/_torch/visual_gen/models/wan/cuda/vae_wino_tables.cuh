@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Temporal Winograd F(R,3) tables (runtime-compiled copy of cpp/tensorrt_llm/kernels/vaeWinoTables.cuh).
+// Temporal Winograd F(R,3) tables, mirrored in blaze_kernels.TEMPORAL_WINO.
 
 #pragma once
 

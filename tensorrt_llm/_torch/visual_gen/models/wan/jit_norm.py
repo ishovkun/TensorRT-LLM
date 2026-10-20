@@ -368,7 +368,7 @@ def wino_norm_silu(
     half_slabs: bool = False,
     reference_rounding: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
-    """Same contract as ``trtllm::vae_wino_norm_silu``: frame layout ``[T, P, C]`` (``m``/``D`` as
+    """Temporal Winograd norm: frame layout ``[T, P, C]`` (``m``/``D`` as
     ``[T/order, P, C]``, cache ``[0..2, P, C]``). Returns ``(sum or None, y_tail, D)``."""
     if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
@@ -453,9 +453,9 @@ def rms_norm_silu_rows(
     out: torch.Tensor | None = None,
     silu: bool = True,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """Same contract as ``trtllm::vae_rms_norm_silu`` / ``vae_add_rms_norm_silu`` on rows
-    ``[N, C]`` bf16: returns ``(sum or None, y)``; ``sum = round(x (+ in_bias) + residual)`` is
-    written when a residual is given; ``out`` is an optional destination for ``y``."""
+    """RMSNorm (+ SiLU, + residual, + deferred bias) on rows ``[N, C]`` bf16: returns
+    ``(sum or None, y)``; ``sum = round(x (+ in_bias) + residual)`` is written when a residual
+    is given; ``out`` is an optional destination for ``y``."""
     rows, channels = x.shape
     if channels % _VEC:
         raise ValueError("channels must be a multiple of 8")
@@ -516,7 +516,7 @@ def combine(
     pad_h: int = 0,
     pad_w: int = 0,
 ) -> torch.Tensor:
-    """Same contract as ``trtllm::vae_wino_combine``: ``(combine(m) | x) + bias + residual`` as
+    """``(combine(m) | x) + bias + residual`` as
     bf16 frames ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns appended, every add
     rounded like the eager chain."""
     if (x is None) == (m is None):
