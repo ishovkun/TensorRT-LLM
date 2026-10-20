@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Temporal Winograd F(R,3) tables, mirrored in blaze_kernels.TEMPORAL_WINO.
+// Temporal Winograd F(R,3) tables, mirrored in wino_vae_kernels.TEMPORAL_WINO.
 
 #pragma once
 

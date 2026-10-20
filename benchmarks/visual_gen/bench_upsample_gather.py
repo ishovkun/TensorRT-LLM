@@ -20,7 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_wan_vae import _time_cupti  # noqa: E402
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     upsample_gather_cuda,
     upsample_gather_reference,
 )
@@ -50,8 +50,18 @@ def main() -> None:
         n = num_bytes // 4  # torch.add(x, 1) reads n and writes n bf16 elements
         cal = torch.empty(n, device="cuda", dtype=torch.bfloat16)
         gb = n * 4 / 1e9
-        t_add = _time_cupti(lambda: torch.add(cal, 1), args.warmup, args.iters, use_graph=True)["span"]["median_us"] / 1e3
-        t_copy = _time_cupti(lambda: cal.clone(), args.warmup, args.iters, use_graph=True)["span"]["median_us"] / 1e3
+        t_add = (
+            _time_cupti(lambda: torch.add(cal, 1), args.warmup, args.iters, use_graph=True)["span"][
+                "median_us"
+            ]
+            / 1e3
+        )
+        t_copy = (
+            _time_cupti(lambda: cal.clone(), args.warmup, args.iters, use_graph=True)["span"][
+                "median_us"
+            ]
+            / 1e3
+        )
         return max(gb / t_add, gb / t_copy)
 
     hdr = f"{'case':>9s} {'GB moved':>9s} | {'eager ms':>9s} {'cuda ms':>9s} {'cuda+sc ms':>10s} | {'achv TB/s':>9s} {'cuda TB/s':>9s} {'%achv':>6s} {'+sc TB/s':>9s} {'%achv':>6s}"
@@ -60,9 +70,13 @@ def main() -> None:
     for name, cout, cin, h, w, frames, factor_t in CASES:
         repeats = cout * factor_t * 4 // cin
         gen = torch.Generator(device="cuda").manual_seed(cout + h)
-        temp = torch.randn(frames, 4 * cout, h + 1, w + 1, generator=gen, device="cuda").to(torch.bfloat16)
+        temp = torch.randn(frames, 4 * cout, h + 1, w + 1, generator=gen, device="cuda").to(
+            torch.bfloat16
+        )
         temp = temp.contiguous(memory_format=torch.channels_last)
-        shortcut = torch.randn(1, cin, frames // factor_t, h, w, generator=gen, device="cuda").to(torch.bfloat16)
+        shortcut = torch.randn(1, cin, frames // factor_t, h, w, generator=gen, device="cuda").to(
+            torch.bfloat16
+        )
         shortcut = shortcut.contiguous(memory_format=torch.channels_last_3d)
 
         temp_b = temp.numel() * 2
@@ -81,8 +95,13 @@ def main() -> None:
             return upsample_gather_cuda(temp, shortcut, 1, frames, factor_t, repeats, 0)
 
         t_e = _time_cupti(eager, args.warmup, args.iters, use_graph=True)["span"]["median_us"] / 1e3
-        t_c = _time_cupti(cuda_plain, args.warmup, args.iters, use_graph=True)["span"]["median_us"] / 1e3
-        t_s = _time_cupti(cuda_sc, args.warmup, args.iters, use_graph=True)["span"]["median_us"] / 1e3
+        t_c = (
+            _time_cupti(cuda_plain, args.warmup, args.iters, use_graph=True)["span"]["median_us"]
+            / 1e3
+        )
+        t_s = (
+            _time_cupti(cuda_sc, args.warmup, args.iters, use_graph=True)["span"]["median_us"] / 1e3
+        )
         achv_plain = achievable_tbs(temp_b + out_b)
         achv_sc = achievable_tbs(temp_b + sc_b + out_b)
         bw_c = gb_plain / t_c
@@ -92,10 +111,23 @@ def main() -> None:
         )
         results.append(
             {
-                "case": name, "cout": cout, "cin": cin, "h": h, "w": w, "frames": frames, "factor_t": factor_t,
-                "repeats": repeats, "gb_plain": gb_plain, "gb_shortcut": gb_sc, "eager_ms": t_e, "cuda_ms": t_c,
-                "cuda_shortcut_ms": t_s, "achievable_plain_tbs": achv_plain, "achievable_shortcut_tbs": achv_sc,
-                "cuda_tbs": bw_c, "cuda_shortcut_tbs": bw_s,
+                "case": name,
+                "cout": cout,
+                "cin": cin,
+                "h": h,
+                "w": w,
+                "frames": frames,
+                "factor_t": factor_t,
+                "repeats": repeats,
+                "gb_plain": gb_plain,
+                "gb_shortcut": gb_sc,
+                "eager_ms": t_e,
+                "cuda_ms": t_c,
+                "cuda_shortcut_ms": t_s,
+                "achievable_plain_tbs": achv_plain,
+                "achievable_shortcut_tbs": achv_sc,
+                "cuda_tbs": bw_c,
+                "cuda_shortcut_tbs": bw_s,
             }
         )
     if args.out:

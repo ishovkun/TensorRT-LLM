@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused kernels for VaeBlaze. Triton prototypes; each has an exact PyTorch fallback."""
+"""Fused kernels for WinoVae. Triton prototypes; each has an exact PyTorch fallback."""
 
 from __future__ import annotations
 

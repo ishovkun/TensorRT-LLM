@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""VaeBlaze: optimized Wan VAE.
+"""WinoVae: optimized Wan VAE.
 
-``VaeBlaze`` mirrors ``WanVAE`` module for module and loads the same state
-dict. Every optimization is a flag in ``VaeBlazeOptions``; with all flags off
+``WinoVae`` mirrors ``WanVAE`` module for module and loads the same state
+dict. Every optimization is a flag in ``WinoVaeOptions``; with all flags off
 the computation is the unmodified native path, which is the baseline the
 benchmark compares against.
 """
@@ -32,7 +32,26 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
-from .blaze_kernels import (
+from .cudnn_conv import conv_frontend, cudnn_frontend_available
+from .wan_vae import (
+    CACHE_T,
+    AvgDown3D,
+    DupUp3D,
+    WanAttentionBlock,
+    WanConv2d,
+    WanUpsample,
+    WanVAEConfig,
+    _activation,
+    _causal_conv_with_cache,
+    _channels_last_2d_if_needed,
+    _channels_last_3d_if_needed,
+    _decode_chunk_slices,
+    _to_channels_last,
+    _to_device_if_needed,
+    patchify,
+    unpatchify,
+)
+from .wino_vae_kernels import (
     add_rms_norm_silu_cuda,
     apply_in_bias,
     avg_down_add_cuda,
@@ -73,29 +92,10 @@ from .blaze_kernels import (
     winograd_spatial_weights,
     winograd_weights,
 )
-from .cudnn_conv import conv_frontend, cudnn_frontend_available
-from .wan_vae import (
-    CACHE_T,
-    AvgDown3D,
-    DupUp3D,
-    WanAttentionBlock,
-    WanConv2d,
-    WanUpsample,
-    WanVAEConfig,
-    _activation,
-    _causal_conv_with_cache,
-    _channels_last_2d_if_needed,
-    _channels_last_3d_if_needed,
-    _decode_chunk_slices,
-    _to_channels_last,
-    _to_device_if_needed,
-    patchify,
-    unpatchify,
-)
 
 
 @dataclass
-class VaeBlazeOptions:
+class WinoVaeOptions:
     """Optimization switches. All off reproduces the native ``WanVAE`` exactly."""
 
     # RMSNorm + SiLU in one kernel (checklist item 1). ``norm_mode`` picks the
@@ -269,11 +269,11 @@ class VaeBlazeOptions:
             )
 
     @classmethod
-    def from_dict(cls, values: dict[str, Any]) -> "VaeBlazeOptions":
+    def from_dict(cls, values: dict[str, Any]) -> "WinoVaeOptions":
         valid = {field.name for field in fields(cls)}
         unknown = set(values) - valid
         if unknown:
-            raise ValueError(f"Unknown VaeBlazeOptions: {sorted(unknown)}; valid: {sorted(valid)}")
+            raise ValueError(f"Unknown WinoVaeOptions: {sorted(unknown)}; valid: {sorted(valid)}")
         return cls(**values)
 
     @property
@@ -433,14 +433,14 @@ def _tensor(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
     return x.materialize() if isinstance(x, PendingAdd) else x
 
 
-class BlazeRMSNorm(nn.Module):
+class WinoVaeRMSNorm(nn.Module):
     def __init__(
         self,
         dim: int,
         channel_first: bool = True,
         images: bool = True,
         bias: bool = False,
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ) -> None:
         super().__init__()
         broadcastable_dims = (1, 1, 1) if not images else (1, 1)
@@ -450,7 +450,7 @@ class BlazeRMSNorm(nn.Module):
         self.scale = dim**0.5
         self.gamma = nn.Parameter(torch.ones(shape))
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
-        self.options = options or VaeBlazeOptions()
+        self.options = options or WinoVaeOptions()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm_dim = 1 if self.channel_first else -1
@@ -560,7 +560,7 @@ class BlazeRMSNorm(nn.Module):
         return s, self.forward_silu(s, out)
 
 
-class BlazeCausalConv3d(nn.Conv3d):
+class WinoVaeCausalConv3d(nn.Conv3d):
     def __init__(
         self,
         in_channels: int,
@@ -581,10 +581,10 @@ class BlazeCausalConv3d(nn.Conv3d):
         # When set, forward() leaves the bias out; the caller hands it to the consumer kernel.
         self.defer_bias = False
         # When set, a stride-1 temporal conv runs on at most this many input frames per
-        # cuDNN call and concatenates the output frames (see VaeBlazeOptions.conv_out_frame_split).
+        # cuDNN call and concatenates the output frames (see WinoVaeOptions.conv_out_frame_split).
         self.max_in_frames: int | None = None
         # When set, a single-frame call with no cache runs as conv2d on the last temporal
-        # weight slice (see VaeBlazeOptions.first_frame_conv2d).
+        # weight slice (see WinoVaeOptions.first_frame_conv2d).
         self.first_frame_conv2d = False
         self._weight_2d: tuple[int, int, torch.Tensor] | None = None
         self._wino_w: dict[int, tuple[int, int, list[torch.Tensor]]] = {}
@@ -986,18 +986,18 @@ class BlazeCausalConv3d(nn.Conv3d):
         return _channels_last_3d_if_needed(x)
 
 
-class BlazeResample(nn.Module):
+class WinoVaeResample(nn.Module):
     def __init__(
         self,
         dim: int,
         mode: str,
         upsample_out_dim: int | None = None,
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.mode = mode
-        self.options = options or VaeBlazeOptions()
+        self.options = options or WinoVaeOptions()
         self._packed: tuple[int, int, torch.Tensor, torch.Tensor | None] | None = None
         # Downsample conv bias left out of the conv (fused_bias): the time conv absorbs it
         # (downsample3d) or the block's shortcut-add kernel adds it (downsample2d).
@@ -1016,7 +1016,7 @@ class BlazeResample(nn.Module):
                 WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
                 WanConv2d(dim, upsample_out_dim, 3, padding=1),
             )
-            self.time_conv = BlazeCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+            self.time_conv = WinoVaeCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
         elif mode == "downsample2d":
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)), WanConv2d(dim, dim, 3, stride=(2, 2))
@@ -1025,7 +1025,7 @@ class BlazeResample(nn.Module):
             self.resample = nn.Sequential(
                 nn.ZeroPad2d((0, 1, 0, 1)), WanConv2d(dim, dim, 3, stride=(2, 2))
             )
-            self.time_conv = BlazeCausalConv3d(dim, dim, (3, 1, 1), stride=(2, 1, 1))
+            self.time_conv = WinoVaeCausalConv3d(dim, dim, (3, 1, 1), stride=(2, 1, 1))
         else:
             self.resample = nn.Identity()
 
@@ -1238,27 +1238,27 @@ class BlazeResample(nn.Module):
         return x
 
 
-class BlazeResidualBlock(nn.Module):
+class WinoVaeResidualBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
         out_dim: int,
         dropout: float = 0.0,
         non_linearity: str = "silu",
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.options = options or VaeBlazeOptions()
+        self.options = options or WinoVaeOptions()
         self.nonlinearity = _activation(non_linearity)
-        self.norm1 = BlazeRMSNorm(in_dim, images=False, options=self.options)
-        self.conv1 = BlazeCausalConv3d(in_dim, out_dim, 3, padding=1)
-        self.norm2 = BlazeRMSNorm(out_dim, images=False, options=self.options)
+        self.norm1 = WinoVaeRMSNorm(in_dim, images=False, options=self.options)
+        self.conv1 = WinoVaeCausalConv3d(in_dim, out_dim, 3, padding=1)
+        self.norm2 = WinoVaeRMSNorm(out_dim, images=False, options=self.options)
         self.dropout = nn.Dropout(dropout)
-        self.conv2 = BlazeCausalConv3d(out_dim, out_dim, 3, padding=1)
+        self.conv2 = WinoVaeCausalConv3d(out_dim, out_dim, 3, padding=1)
         self.conv_shortcut = (
-            BlazeCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
+            WinoVaeCausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
         )
         self._merged_bias: tuple[int, int, torch.Tensor] | None = None
         # Spatial Winograd applies to both convs on every path (frame pairs, cached single
@@ -1336,7 +1336,7 @@ class BlazeResidualBlock(nn.Module):
             x, h = self.norm1.forward_silu_pending(x)
         else:
             h = self.norm1.forward_silu(x)
-        has_shortcut_conv = isinstance(self.conv_shortcut, BlazeCausalConv3d)
+        has_shortcut_conv = isinstance(self.conv_shortcut, WinoVaeCausalConv3d)
         defer_shortcut = defer_out and has_shortcut_conv and self.options.norm_mode != "reference"
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
@@ -1381,7 +1381,7 @@ class BlazeResidualBlock(nn.Module):
             x, _ = self.norm1.forward_silu_pending(x, out=win1)
         else:
             self.norm1.forward_silu(x, out=win1)
-        has_shortcut_conv = isinstance(self.conv_shortcut, BlazeCausalConv3d)
+        has_shortcut_conv = isinstance(self.conv_shortcut, WinoVaeCausalConv3d)
         defer_shortcut = defer_out and has_shortcut_conv and self.options.norm_mode != "reference"
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
@@ -1424,7 +1424,7 @@ class BlazeResidualBlock(nn.Module):
             x_in = s
         else:
             x_in = x
-        has_shortcut_conv = isinstance(self.conv_shortcut, BlazeCausalConv3d)
+        has_shortcut_conv = isinstance(self.conv_shortcut, WinoVaeCausalConv3d)
         defer_shortcut = has_shortcut_conv and self.options.norm_mode != "reference"
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
@@ -1442,12 +1442,12 @@ class BlazeResidualBlock(nn.Module):
         return (out, x_in) if return_input else out
 
 
-class BlazeAttentionBlock(WanAttentionBlock):
+class WinoVaeAttentionBlock(WanAttentionBlock):
     """The mid-block attention with the norm, projections and residual add fused."""
 
-    def __init__(self, dim: int, options: VaeBlazeOptions | None = None) -> None:
+    def __init__(self, dim: int, options: WinoVaeOptions | None = None) -> None:
         super().__init__(dim)
-        self.options = options or VaeBlazeOptions()
+        self.options = options or WinoVaeOptions()
 
     def forward(self, x: "torch.Tensor | PendingAdd") -> "torch.Tensor | PendingAdd":  # type: ignore[override]
         x = _tensor(x)
@@ -1518,21 +1518,21 @@ def _run_resnets(
     return x, entry
 
 
-class BlazeMidBlock(nn.Module):
+class WinoVaeMidBlock(nn.Module):
     def __init__(
         self,
         dim: int,
         dropout: float = 0.0,
         non_linearity: str = "silu",
         num_layers: int = 1,
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
-        resnets = [BlazeResidualBlock(dim, dim, dropout, non_linearity, options)]
+        resnets = [WinoVaeResidualBlock(dim, dim, dropout, non_linearity, options)]
         attentions = []
         for _ in range(num_layers):
-            attentions.append(BlazeAttentionBlock(dim, options))
-            resnets.append(BlazeResidualBlock(dim, dim, dropout, non_linearity, options))
+            attentions.append(WinoVaeAttentionBlock(dim, options))
+            resnets.append(WinoVaeResidualBlock(dim, dim, dropout, non_linearity, options))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.gradient_checkpointing = False
@@ -1552,7 +1552,7 @@ class BlazeMidBlock(nn.Module):
         return x
 
 
-class BlazeResidualDownBlock(nn.Module):
+class WinoVaeResidualDownBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -1561,7 +1561,7 @@ class BlazeResidualDownBlock(nn.Module):
         num_res_blocks: int,
         temperal_downsample: bool = False,
         down_flag: bool = False,
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         self.avg_shortcut = AvgDown3D(
@@ -1572,13 +1572,13 @@ class BlazeResidualDownBlock(nn.Module):
         )
         resnets = []
         for _ in range(num_res_blocks):
-            resnets.append(BlazeResidualBlock(in_dim, out_dim, dropout, options=options))
+            resnets.append(WinoVaeResidualBlock(in_dim, out_dim, dropout, options=options))
             in_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
         self.downsampler = None
         if down_flag:
             mode = "downsample3d" if temperal_downsample else "downsample2d"
-            self.downsampler = BlazeResample(out_dim, mode=mode, options=options)
+            self.downsampler = WinoVaeResample(out_dim, mode=mode, options=options)
 
     def forward(
         self,
@@ -1632,7 +1632,7 @@ class BlazeResidualDownBlock(nn.Module):
         return _channels_last_3d_if_needed(x + dup(residual))
 
 
-class BlazeEncoder3d(nn.Module):
+class WinoVaeEncoder3d(nn.Module):
     def __init__(
         self,
         in_channels: int = 3,
@@ -1645,10 +1645,10 @@ class BlazeEncoder3d(nn.Module):
         dropout: float = 0.0,
         non_linearity: str = "silu",
         is_residual: bool = False,
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
-        self.options = options or VaeBlazeOptions()
+        self.options = options or WinoVaeOptions()
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         attn_scales = [] if attn_scales is None else attn_scales
         temperal_downsample = (
@@ -1658,12 +1658,12 @@ class BlazeEncoder3d(nn.Module):
 
         dims = [dim * value for value in [1] + dim_mult]
         scale = 1.0
-        self.conv_in = BlazeCausalConv3d(in_channels, dims[0], 3, padding=1)
+        self.conv_in = WinoVaeCausalConv3d(in_channels, dims[0], 3, padding=1)
         self.down_blocks = nn.ModuleList([])
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             if is_residual:
                 self.down_blocks.append(
-                    BlazeResidualDownBlock(
+                    WinoVaeResidualDownBlock(
                         in_dim,
                         out_dim,
                         dropout,
@@ -1678,24 +1678,24 @@ class BlazeEncoder3d(nn.Module):
             else:
                 for _ in range(num_res_blocks):
                     self.down_blocks.append(
-                        BlazeResidualBlock(in_dim, out_dim, dropout, options=options)
+                        WinoVaeResidualBlock(in_dim, out_dim, dropout, options=options)
                     )
                     if scale in attn_scales:
                         self.down_blocks.append(WanAttentionBlock(out_dim))
                     in_dim = out_dim
                 if i != len(dim_mult) - 1:
                     mode = "downsample3d" if temperal_downsample[i] else "downsample2d"
-                    self.down_blocks.append(BlazeResample(out_dim, mode=mode, options=options))
+                    self.down_blocks.append(WinoVaeResample(out_dim, mode=mode, options=options))
                     scale /= 2.0
 
-        self.mid_block = BlazeMidBlock(
+        self.mid_block = WinoVaeMidBlock(
             out_dim, dropout, non_linearity, num_layers=1, options=options
         )
-        self.norm_out = BlazeRMSNorm(out_dim, images=False, options=options)
-        self.conv_out = BlazeCausalConv3d(out_dim, z_dim, 3, padding=1)
+        self.norm_out = WinoVaeRMSNorm(out_dim, images=False, options=options)
+        self.conv_out = WinoVaeCausalConv3d(out_dim, z_dim, 3, padding=1)
         # A replacement for conv_out for the duration of one encode (the folded encoder
         # tail); not a submodule, so the state dict is untouched.
-        self.conv_out_override: BlazeCausalConv3d | None = None
+        self.conv_out_override: WinoVaeCausalConv3d | None = None
         self.gradient_checkpointing = False
 
     def forward(
@@ -1716,7 +1716,7 @@ class BlazeEncoder3d(nn.Module):
             x = PendingAdd(x, None, self.conv_in.bias)
 
         for layer in self.down_blocks:
-            if not isinstance(layer, (BlazeResidualBlock, BlazeResidualDownBlock)):
+            if not isinstance(layer, (WinoVaeResidualBlock, WinoVaeResidualDownBlock)):
                 x = _tensor(x)
             if feat_cache is not None:
                 x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
@@ -1751,7 +1751,7 @@ class BlazeEncoder3d(nn.Module):
         return _channels_last_3d_if_needed(x)
 
 
-class BlazeResidualUpBlock(nn.Module):
+class WinoVaeResidualUpBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -1761,7 +1761,7 @@ class BlazeResidualUpBlock(nn.Module):
         temperal_upsample: bool = False,
         up_flag: bool = False,
         non_linearity: str = "silu",
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         self.avg_shortcut = None
@@ -1774,7 +1774,7 @@ class BlazeResidualUpBlock(nn.Module):
         resnets = []
         for _ in range(num_res_blocks + 1):
             resnets.append(
-                BlazeResidualBlock(current_dim, out_dim, dropout, non_linearity, options)
+                WinoVaeResidualBlock(current_dim, out_dim, dropout, non_linearity, options)
             )
             current_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
@@ -1782,7 +1782,7 @@ class BlazeResidualUpBlock(nn.Module):
         self.upsampler = None
         if up_flag:
             mode = "upsample3d" if temperal_upsample else "upsample2d"
-            self.upsampler = BlazeResample(
+            self.upsampler = WinoVaeResample(
                 out_dim, mode=mode, upsample_out_dim=out_dim, options=options
             )
         self.gradient_checkpointing = False
@@ -1814,7 +1814,7 @@ class BlazeResidualUpBlock(nn.Module):
         return x if isinstance(x, PendingAdd) else _channels_last_3d_if_needed(x)
 
 
-class BlazeUpBlock(nn.Module):
+class WinoVaeUpBlock(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -1823,21 +1823,21 @@ class BlazeUpBlock(nn.Module):
         dropout: float = 0.0,
         upsample_mode: str | None = None,
         non_linearity: str = "silu",
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         current_dim = in_dim
         resnets = []
         for _ in range(num_res_blocks + 1):
             resnets.append(
-                BlazeResidualBlock(current_dim, out_dim, dropout, non_linearity, options)
+                WinoVaeResidualBlock(current_dim, out_dim, dropout, non_linearity, options)
             )
             current_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
         self.upsamplers = None
         if upsample_mode is not None:
             self.upsamplers = nn.ModuleList(
-                [BlazeResample(out_dim, mode=upsample_mode, options=options)]
+                [WinoVaeResample(out_dim, mode=upsample_mode, options=options)]
             )
         self.gradient_checkpointing = False
 
@@ -1857,7 +1857,7 @@ class BlazeUpBlock(nn.Module):
         return x if isinstance(x, PendingAdd) else _channels_last_3d_if_needed(x)
 
 
-class BlazeDecoder3d(nn.Module):
+class WinoVaeDecoder3d(nn.Module):
     def __init__(
         self,
         dim: int = 128,
@@ -1870,18 +1870,18 @@ class BlazeDecoder3d(nn.Module):
         non_linearity: str = "silu",
         out_channels: int = 3,
         is_residual: bool = False,
-        options: VaeBlazeOptions | None = None,
+        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
-        self.options = options or VaeBlazeOptions()
+        self.options = options or WinoVaeOptions()
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         del attn_scales
         temperal_upsample = [False, True, True] if temperal_upsample is None else temperal_upsample
         self.nonlinearity = _activation(non_linearity)
 
         dims = [dim * value for value in [dim_mult[-1]] + dim_mult[::-1]]
-        self.conv_in = BlazeCausalConv3d(z_dim, dims[0], 3, padding=1)
-        self.mid_block = BlazeMidBlock(
+        self.conv_in = WinoVaeCausalConv3d(z_dim, dims[0], 3, padding=1)
+        self.mid_block = WinoVaeMidBlock(
             dims[0], dropout, non_linearity, num_layers=1, options=options
         )
         self.up_blocks = nn.ModuleList([])
@@ -1896,7 +1896,7 @@ class BlazeDecoder3d(nn.Module):
                 upsample_mode = "upsample2d"
 
             if is_residual:
-                up_block = BlazeResidualUpBlock(
+                up_block = WinoVaeResidualUpBlock(
                     in_dim=in_dim,
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
@@ -1907,7 +1907,7 @@ class BlazeDecoder3d(nn.Module):
                     options=options,
                 )
             else:
-                up_block = BlazeUpBlock(
+                up_block = WinoVaeUpBlock(
                     in_dim=in_dim,
                     out_dim=out_dim,
                     num_res_blocks=num_res_blocks,
@@ -1918,8 +1918,8 @@ class BlazeDecoder3d(nn.Module):
                 )
             self.up_blocks.append(up_block)
 
-        self.norm_out = BlazeRMSNorm(out_dim, images=False, options=options)
-        self.conv_out = BlazeCausalConv3d(out_dim, out_channels, 3, padding=1)
+        self.norm_out = WinoVaeRMSNorm(out_dim, images=False, options=options)
+        self.conv_out = WinoVaeCausalConv3d(out_dim, out_channels, 3, padding=1)
         self.gradient_checkpointing = False
 
     def forward(
@@ -2005,7 +2005,7 @@ class LazyDiagonalGaussianDistribution(DiagonalGaussianDistribution):
         return self._var
 
 
-class VaeBlaze(nn.Module):
+class WinoVae(nn.Module):
     """Optimized Wan VAE; state-dict compatible with ``WanVAE`` and ``AutoencoderKLWan``.
 
     Beyond the ``AutoencoderKLWan`` interface: ``encode_mode(x)`` returns the posterior mean
@@ -2016,7 +2016,7 @@ class VaeBlaze(nn.Module):
     def __init__(
         self,
         config: WanVAEConfig | dict[str, Any] | None = None,
-        options: VaeBlazeOptions | dict[str, Any] | None = None,
+        options: WinoVaeOptions | dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if config is None:
@@ -2024,16 +2024,16 @@ class VaeBlaze(nn.Module):
         if isinstance(config, dict):
             config = WanVAEConfig.from_dict(config)
         if options is None:
-            options = VaeBlazeOptions()
+            options = WinoVaeOptions()
         if isinstance(options, dict):
-            options = VaeBlazeOptions.from_dict(options)
+            options = WinoVaeOptions.from_dict(options)
         self.config = config
         self.options = options
         self.z_dim = config.z_dim
         self.temperal_downsample = config.temperal_downsample
         self.temperal_upsample = config.temperal_downsample[::-1]
 
-        self.encoder = BlazeEncoder3d(
+        self.encoder = WinoVaeEncoder3d(
             in_channels=config.in_channels,
             dim=config.base_dim,
             z_dim=config.z_dim * 2,
@@ -2045,9 +2045,9 @@ class VaeBlaze(nn.Module):
             is_residual=config.is_residual,
             options=options,
         )
-        self.quant_conv = BlazeCausalConv3d(config.z_dim * 2, config.z_dim * 2, 1)
-        self.post_quant_conv = BlazeCausalConv3d(config.z_dim, config.z_dim, 1)
-        self.decoder = BlazeDecoder3d(
+        self.quant_conv = WinoVaeCausalConv3d(config.z_dim * 2, config.z_dim * 2, 1)
+        self.post_quant_conv = WinoVaeCausalConv3d(config.z_dim, config.z_dim, 1)
+        self.decoder = WinoVaeDecoder3d(
             dim=config.decoder_base_dim,
             z_dim=config.z_dim,
             dim_mult=config.dim_mult,
@@ -2064,17 +2064,17 @@ class VaeBlaze(nn.Module):
             if module is not self:
                 _to_channels_last(module)
         for module in self.modules():
-            if isinstance(module, BlazeCausalConv3d):
+            if isinstance(module, WinoVaeCausalConv3d):
                 module.first_frame_conv2d = options.first_frame_conv2d
         self._cached_conv_counts = {
             "decoder": sum(
-                isinstance(module, BlazeCausalConv3d) for module in self.decoder.modules()
+                isinstance(module, WinoVaeCausalConv3d) for module in self.decoder.modules()
             ),
             "encoder": sum(
-                isinstance(module, BlazeCausalConv3d) for module in self.encoder.modules()
+                isinstance(module, WinoVaeCausalConv3d) for module in self.encoder.modules()
             ),
         }
-        self._folded_tail: dict[int | None, tuple[tuple, BlazeCausalConv3d]] = {}
+        self._folded_tail: dict[int | None, tuple[tuple, WinoVaeCausalConv3d]] = {}
         self._post_quant_folded: tuple[torch.Tensor, torch.Tensor] | None = None
         self.clear_cache()
 
@@ -2103,7 +2103,7 @@ class VaeBlaze(nn.Module):
     def _use_folded_tail(self) -> bool:
         return self.options.fold_encoder_tail and self.options.norm_mode != "reference"
 
-    def _folded_tail_conv(self, rows: int | None) -> BlazeCausalConv3d:
+    def _folded_tail_conv(self, rows: int | None) -> WinoVaeCausalConv3d:
         """conv_out with quant_conv folded in: ``W' = Q A``, ``b' = Q a + q`` (composed in
         fp32, rounded once to the model dtype); ``rows`` keeps only the first output
         channels (the posterior mean) or all of them."""
@@ -2127,8 +2127,8 @@ class VaeBlaze(nn.Module):
 
     @staticmethod
     def _build_folded_tail(
-        conv_out: BlazeCausalConv3d, quant: BlazeCausalConv3d, rows: int | None
-    ) -> BlazeCausalConv3d:
+        conv_out: WinoVaeCausalConv3d, quant: WinoVaeCausalConv3d, rows: int | None
+    ) -> WinoVaeCausalConv3d:
         q = quant.weight.detach().float().flatten(1)  # [2z, 2z]
         qb = quant.bias.detach().float() if quant.bias is not None else torch.zeros_like(q[:, 0])
         a = conv_out.weight.detach().float()  # [2z, Cin, 3, 3, 3]
@@ -2141,7 +2141,7 @@ class VaeBlaze(nn.Module):
             q, qb = q[:rows], qb[:rows]
         w = torch.einsum("om,mikhw->oikhw", q, a)
         b = q @ ab + qb
-        folded = BlazeCausalConv3d(
+        folded = WinoVaeCausalConv3d(
             conv_out.in_channels, w.shape[0], conv_out.kernel_size, padding=conv_out.padding[1]
         ).to(device=a.device, dtype=conv_out.weight.dtype)
         folded.weight.copy_(w)

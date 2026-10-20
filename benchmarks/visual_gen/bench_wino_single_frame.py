@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_wan_vae import _time_cupti  # noqa: E402
 
 import tensorrt_llm  # noqa: E402,F401  (trtllm::vae_wino_spatial_in)
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     wino_spatial_conv_frames,
     winograd_spatial_taps_weights,
 )

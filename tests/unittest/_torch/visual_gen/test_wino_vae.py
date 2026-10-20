@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""VaeBlaze component tests: baseline equals the native WanVAE; each option stays within tolerance."""
+"""WinoVae component tests: baseline equals the native WanVAE; each option stays within tolerance."""
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.wan.vae_blaze import VaeBlaze, VaeBlazeOptions
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import WinoVae, WinoVaeOptions
 
 # Cosmos3-shaped (residual blocks, patch 2, 12 in/out channels) but tiny.
 SMALL_CONFIG = {
@@ -30,10 +30,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
 
-def _pair(options: VaeBlazeOptions | None = None) -> tuple[WanVAE, VaeBlaze]:
+def _pair(options: WinoVaeOptions | None = None) -> tuple[WanVAE, WinoVae]:
     torch.manual_seed(0)
     native = WanVAE(SMALL_CONFIG)
-    fast = VaeBlaze(SMALL_CONFIG, options)
+    fast = WinoVae(SMALL_CONFIG, options)
     fast.load_state_dict(native.state_dict(), strict=True)
     return (
         native.to(device=DEVICE, dtype=DTYPE).eval(),
@@ -51,7 +51,7 @@ def _inputs(frames: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @pytest.mark.parametrize("frames", [1, 5, 9])
-def test_vae_blaze_baseline_matches_native_exactly(frames: int) -> None:
+def test_wino_vae_baseline_matches_native_exactly(frames: int) -> None:
     native, fast = _pair()
     pixels, latents = _inputs(frames)
     with torch.inference_mode():
@@ -65,14 +65,14 @@ def test_vae_blaze_baseline_matches_native_exactly(frames: int) -> None:
         )
 
 
-def test_vae_blaze_state_dict_keys_match_native() -> None:
+def test_wino_vae_state_dict_keys_match_native() -> None:
     native, fast = _pair()
     assert native.state_dict().keys() == fast.state_dict().keys()
 
 
-def test_vae_blaze_options_reject_unknown() -> None:
-    with pytest.raises(ValueError, match="Unknown VaeBlazeOptions"):
-        VaeBlazeOptions.from_dict({"nope": True})
+def test_wino_vae_options_reject_unknown() -> None:
+    with pytest.raises(ValueError, match="Unknown WinoVaeOptions"):
+        WinoVaeOptions.from_dict({"nope": True})
 
 
 OPTION_SETS = [
@@ -225,7 +225,7 @@ OPTION_SETS = [
 )
 @pytest.mark.parametrize("frames", [1, 9])
 def test_each_option_stays_close_to_native(option: dict, frames: int) -> None:
-    native, fast = _pair(VaeBlazeOptions(**option))
+    native, fast = _pair(WinoVaeOptions(**option))
     pixels, latents = _inputs(frames)
     with torch.inference_mode():
         for actual, expected in (
@@ -243,12 +243,12 @@ def test_each_option_stays_close_to_native(option: dict, frames: int) -> None:
             assert torch.isfinite(actual.float()).all()
             # Both modes drift from native only through last-bit effects (fp32 mode: fewer
             # roundings; reference mode: fp32 reduction order), amplified by the random-weight
-            # network. Bitwise equality of the kernel itself is checked in test_blaze_kernels.
+            # network. Bitwise equality of the kernel itself is checked in test_wino_vae_kernels.
             assert rel_l2.item() < 2e-2, f"{option}: rel_l2={rel_l2.item():.3e}"
 
 
 def test_encode_mode_matches_posterior_mode() -> None:
-    _, fast = _pair(VaeBlazeOptions(fold_encoder_tail=True))
+    _, fast = _pair(WinoVaeOptions(fold_encoder_tail=True))
     pixels, _ = _inputs(9)
     with torch.inference_mode():
         mean_only = fast.encode_mode(pixels)
@@ -260,7 +260,7 @@ def test_encode_mode_matches_posterior_mode() -> None:
 
 
 def test_fold_latent_affine_matches_eager() -> None:
-    _, fast = _pair(VaeBlazeOptions())
+    _, fast = _pair(WinoVaeOptions())
     _, latents = _inputs(5)
     z = SMALL_CONFIG["z_dim"]
     gen = torch.Generator().manual_seed(3)

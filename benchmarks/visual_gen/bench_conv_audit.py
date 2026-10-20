@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Per-shape cuDNN convolution audit for the Wan VAE (VaeBlaze).
+"""Per-shape cuDNN convolution audit for the Wan VAE (WinoVae).
 
 Records every conv2d/conv3d call made by one decode chunk and one encode chunk
 (steady state and first chunk), then times each distinct shape standalone under
@@ -24,9 +24,14 @@ from torch.overrides import TorchFunctionMode
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_wan_vae import COSMOS_VAE_CONFIG, _reference_state_dict, _time_cupti  # noqa: E402
 
-from tensorrt_llm._torch.visual_gen.models.wan.vae_blaze import VaeBlaze, VaeBlazeOptions  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import WinoVae, WinoVaeOptions  # noqa: E402
 
-BLAZE_OPTS = {"fused_norm": True, "fused_residual": True, "fused_upsample": True, "fused_bias": True}
+WINOVAE_OPTS = {
+    "fused_norm": True,
+    "fused_residual": True,
+    "fused_upsample": True,
+    "fused_bias": True,
+}
 # GB200 dense BF16 tensor-core peak (no sparsity); override with --peak-tflops.
 DEFAULT_PEAK_TFLOPS = 2250.0
 
@@ -48,10 +53,25 @@ class ConvRecorder(TorchFunctionMode):
             nd = w.dim() - 2
             stride = tuple(stride) if isinstance(stride, (tuple, list)) else (stride,) * nd
             padding = tuple(padding) if isinstance(padding, (tuple, list)) else (padding,) * nd
-            layout = "channels_last" if (
-                x.is_contiguous(memory_format=torch.channels_last_3d if nd == 3 else torch.channels_last)
-            ) else ("contiguous" if x.is_contiguous() else "strided")
-            key = (nd, tuple(x.shape), tuple(w.shape), stride, padding, bias is not None, layout, str(x.dtype))
+            layout = (
+                "channels_last"
+                if (
+                    x.is_contiguous(
+                        memory_format=torch.channels_last_3d if nd == 3 else torch.channels_last
+                    )
+                )
+                else ("contiguous" if x.is_contiguous() else "strided")
+            )
+            key = (
+                nd,
+                tuple(x.shape),
+                tuple(w.shape),
+                stride,
+                padding,
+                bias is not None,
+                layout,
+                str(x.dtype),
+            )
             e = self.calls.setdefault(key, {"count": 0})
             e["count"] += 1
         return func(*args, **kwargs)
@@ -96,7 +116,9 @@ def _make_tensors(key):
     return x, w, b, stride, padding
 
 
-def record_model_convs(model: VaeBlaze, shape_name: str, latent, pixels) -> "OrderedDict[tuple, dict]":
+def record_model_convs(
+    model: WinoVae, shape_name: str, latent, pixels
+) -> "OrderedDict[tuple, dict]":
     rec = ConvRecorder()
     with torch.inference_mode(), rec:
         model.decode(latent, return_dict=False, temporal_chunk_size=1)
@@ -111,8 +133,17 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=15)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--peak-tflops", type=float, default=DEFAULT_PEAK_TFLOPS)
-    parser.add_argument("--latent-frames", type=int, default=3, help="latent frames for the decode pass (chunk size 1)")
-    parser.add_argument("--benchmark-mode", action="store_true", help="also time with torch.backends.cudnn.benchmark=True")
+    parser.add_argument(
+        "--latent-frames",
+        type=int,
+        default=3,
+        help="latent frames for the decode pass (chunk size 1)",
+    )
+    parser.add_argument(
+        "--benchmark-mode",
+        action="store_true",
+        help="also time with torch.backends.cudnn.benchmark=True",
+    )
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
     atexit.register(lambda: __import__("cupti.cupti", fromlist=["cupti"]).finalize())
@@ -120,7 +151,7 @@ def main() -> None:
     gpu = torch.cuda.get_device_name(0)
     print(f"GPU: {gpu}  cuDNN {torch.backends.cudnn.version()}  torch {torch.__version__}")
     sd = _reference_state_dict(1234)
-    model = VaeBlaze(COSMOS_VAE_CONFIG, VaeBlazeOptions(**BLAZE_OPTS)).cuda()
+    model = WinoVae(COSMOS_VAE_CONFIG, WinoVaeOptions(**WINOVAE_OPTS)).cuda()
     model.load_state_dict(sd, strict=True)
     model = model.to(torch.bfloat16).eval().requires_grad_(False)
 
@@ -149,15 +180,34 @@ def main() -> None:
         names = [k["name"] for k in top]
         kernel_us = {k["name"]: k["us"] for k in top}
         short = [f"{n[:60]} ({kernel_us[n]:.0f}us)" for n in names[:3]]
-        extra = [n for n in names if any(tok in n.lower() for tok in ("nchw", "nhwc", "transpose", "copy", "elementwise"))]
+        extra = [
+            n
+            for n in names
+            if any(tok in n.lower() for tok in ("nchw", "nhwc", "transpose", "copy", "elementwise"))
+        ]
         row = {
-            "nd": nd, "input": list(xs), "weight": list(ws), "stride": list(stride), "padding": list(padding),
-            "bias": has_bias, "layout": layout, "dtype": dtype, "calls_per_pass": e["count"], "ms": ms,
-            "tflops": tflops, "pct_peak": 100 * tflops / args.peak_tflops,
-            "out_gbs": _out_bytes(key) / (ms / 1e3) / 1e9, "kernels": top[:6], "side_kernels": extra, "kernels_per_iter": t["kernels_per_iter"],
+            "nd": nd,
+            "input": list(xs),
+            "weight": list(ws),
+            "stride": list(stride),
+            "padding": list(padding),
+            "bias": has_bias,
+            "layout": layout,
+            "dtype": dtype,
+            "calls_per_pass": e["count"],
+            "ms": ms,
+            "tflops": tflops,
+            "pct_peak": 100 * tflops / args.peak_tflops,
+            "out_gbs": _out_bytes(key) / (ms / 1e3) / 1e9,
+            "kernels": top[:6],
+            "side_kernels": extra,
+            "kernels_per_iter": t["kernels_per_iter"],
         }
         results.append(row)
-        print(f"{i:3d} {nd:2d} {str(list(xs)):>26s} {str(list(ws)):>20s} {str(stride):>5s} {layout:>13s} {e['count']:5d} | {ms:8.3f} {tflops:8.1f} {row['pct_peak']:5.1f}% {row['out_gbs']:8.0f} | {'; '.join(short)}" + (f"  !! side: {len(extra)}" if extra else ""))
+        print(
+            f"{i:3d} {nd:2d} {str(list(xs)):>26s} {str(list(ws)):>20s} {str(stride):>5s} {layout:>13s} {e['count']:5d} | {ms:8.3f} {tflops:8.1f} {row['pct_peak']:5.1f}% {row['out_gbs']:8.0f} | {'; '.join(short)}"
+            + (f"  !! side: {len(extra)}" if extra else "")
+        )
 
     if args.benchmark_mode:
         torch.backends.cudnn.benchmark = True
@@ -172,7 +222,17 @@ def main() -> None:
             print(f"{i:3d} {ms:8.3f} ms  ({results[i]['ms'] / ms:.2f}x vs default)")
 
     if args.out:
-        Path(args.out).write_text(json.dumps({"gpu": gpu, "cudnn": torch.backends.cudnn.version(), "peak_tflops": args.peak_tflops, "results": results}, indent=1))
+        Path(args.out).write_text(
+            json.dumps(
+                {
+                    "gpu": gpu,
+                    "cudnn": torch.backends.cudnn.version(),
+                    "peak_tflops": args.peak_tflops,
+                    "results": results,
+                },
+                indent=1,
+            )
+        )
 
 
 if __name__ == "__main__":

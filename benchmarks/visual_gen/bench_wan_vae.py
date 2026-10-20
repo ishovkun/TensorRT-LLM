@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Wan VAE component benchmark: Diffusers vs vLLM-Omni fast path vs native WanVAE vs VaeBlaze.
+"""Wan VAE component benchmark: Diffusers vs vLLM-Omni fast path vs native WanVAE vs WinoVae.
 
 Random weights (seeded, shared by all backends), random inputs at Cosmos3
 default shapes, CUDA-graph replay timed with CUPTI kernel timestamps, L2
-flushed between replays. Writes one JSON per run; ``plot_vae_blaze_ladder.py``
+flushed between replays. Writes one JSON per run; ``plot_wino_vae_ladder.py``
 merges runs into the optimization ladder.
 """
 
@@ -147,7 +147,7 @@ def _build(
     backend: str,
     state_dict: dict[str, torch.Tensor],
     dtype: torch.dtype,
-    blaze_opts: dict[str, Any],
+    winovae_opts: dict[str, Any],
 ) -> torch.nn.Module:
     if backend == "diffusers" or backend in VLLM_BACKENDS:
         from diffusers import AutoencoderKLWan
@@ -157,10 +157,10 @@ def _build(
         from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 
         model = WanVAE(COSMOS_VAE_CONFIG)
-    elif backend == "blaze":
-        from tensorrt_llm._torch.visual_gen.models.wan.vae_blaze import VaeBlaze
+    elif backend == "winovae":
+        from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import WinoVae
 
-        model = VaeBlaze(COSMOS_VAE_CONFIG, blaze_opts)
+        model = WinoVae(COSMOS_VAE_CONFIG, winovae_opts)
     else:
         raise ValueError(backend)
     model.load_state_dict(state_dict, strict=True)
@@ -401,7 +401,7 @@ def _metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 
-def _parse_blaze_opts(text: str) -> dict[str, Any]:
+def _parse_winovae_opts(text: str) -> dict[str, Any]:
     opts: dict[str, Any] = {}
     for item in filter(None, (s.strip() for s in text.split(","))):
         key, _, value = item.partition("=")
@@ -425,7 +425,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--backends",
-        default="native,blaze,diffusers,vllm_lossless,vllm_channels_last",
+        default="native,winovae,diffusers,vllm_lossless,vllm_channels_last",
         help="native runs first so every other backend gets a vs_native accuracy row",
     )
     parser.add_argument("--shapes", default=",".join(SHAPES))
@@ -437,12 +437,12 @@ def main() -> None:
         choices=["float32", "none"],
         help="Diffusers accuracy reference dtype; none skips",
     )
-    parser.add_argument("--blaze-opts", default="", help="comma list, e.g. fused_norm=1")
+    parser.add_argument("--winovae-opts", default="", help="comma list, e.g. fused_norm=1")
     parser.add_argument(
         "--decode-chunk",
         type=int,
         default=0,
-        help="temporal_chunk_size for native/blaze decode (0: per-shape default, 1 unless the shape says otherwise)",
+        help="temporal_chunk_size for native/winovae decode (0: per-shape default, 1 unless the shape says otherwise)",
     )
     parser.add_argument(
         "--step-latency",
@@ -487,9 +487,11 @@ def main() -> None:
         sys.exit(subprocess.call(cmd))
     dist_rank, parallel = _init_parallel(args.world_size, args.split_dim)
     if parallel is not None:
-        unsupported = [b for b in args.backends.split(",") if b in ("blaze",) or b in VLLM_BACKENDS]
+        unsupported = [
+            b for b in args.backends.split(",") if b in ("winovae",) or b in VLLM_BACKENDS
+        ]
         if unsupported:
-            # VaeBlaze has no halo-exchange wrapper yet (its fused norm/slab path would have to
+            # WinoVae has no halo-exchange wrapper yet (its fused norm/slab path would have to
             # exchange borders), and the vLLM-Omni fast path refuses sharded modules.
             print(
                 f"[parallel] world_size={args.world_size}: skipping {unsupported} (no parallel wrapper)",
@@ -502,7 +504,7 @@ def main() -> None:
     backends = args.backends.split(",")
     shapes = args.shapes.split(",")
     ops = args.ops.split(",")
-    blaze_opts = _parse_blaze_opts(args.blaze_opts)
+    winovae_opts = _parse_winovae_opts(args.winovae_opts)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -535,7 +537,7 @@ def main() -> None:
         "cudnn": torch.backends.cudnn.version(),
         "diffusers": diffusers.__version__,
         "dtype": args.dtype,
-        "blaze_opts": blaze_opts,
+        "winovae_opts": winovae_opts,
         "decode_chunk": args.decode_chunk or "per-shape",
         "iters": args.iters,
         "warmup": args.warmup,
@@ -580,7 +582,9 @@ def main() -> None:
 
             for backend in backends:
                 t_start = time.time()
-                model = _build(backend, state_dict, dtype, blaze_opts if backend == "blaze" else {})
+                model = _build(
+                    backend, state_dict, dtype, winovae_opts if backend == "winovae" else {}
+                )
                 if parallel is not None:
                     model = parallel(model)
                 run_fn = _make_op(model, backend, op, inp, decode_chunk)

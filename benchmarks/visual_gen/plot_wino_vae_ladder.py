@@ -14,7 +14,7 @@ SERIES = (
     ("diffusers", "diffusers"),
     ("native", "trt-llm native"),
     ("vllm_channels_last", "vllm"),
-    ("blaze", "WinoVae"),
+    ("winovae", "WinoVae"),
 )
 # Plot columns: per op the bench shape, the row field drawn, and the panel title (frames and
 # resolution as in SHAPES of bench_wan_vae.py). The bimanual-sim column shows what the sim
@@ -49,6 +49,14 @@ COLUMNS: dict[str, dict[str, tuple[str, str, str]]] = {
 
 def _load_runs(run_dir: Path) -> list[dict]:
     runs = [json.loads(p.read_text()) for p in sorted(run_dir.glob("run_*.json"))]
+    # Runs written before the rename call the backend "blaze".
+    for run in runs:
+        meta = run["meta"]
+        if "blaze_opts" in meta:
+            meta["winovae_opts"] = meta.pop("blaze_opts")
+        for r in run["results"]:
+            if r["backend"] == "blaze":
+                r["backend"] = "winovae"
     runs.sort(key=lambda r: r["meta"]["timestamp"])
     return runs
 
@@ -59,7 +67,7 @@ def _median_ms(row: dict) -> float:
 
 def _ladder_rows(runs: list[dict]) -> list[dict]:
     # Reference timings (diffusers/native) come from the most recent run that measured them,
-    # so a blaze-only ladder step is still expressed relative to the baseline.
+    # so a winovae-only ladder step is still expressed relative to the baseline.
     latest_ref: dict[tuple[str, str, str], dict] = {}
     for run in runs:
         for r in run["results"]:
@@ -82,7 +90,7 @@ def _ladder_rows(runs: list[dict]) -> list[dict]:
                     "gpu": meta["gpu_short"],
                     "world_size": meta["world_size"],
                     "backend": backend,
-                    "blaze_opts": meta["blaze_opts"] if backend == "blaze" else {},
+                    "winovae_opts": meta["winovae_opts"] if backend == "winovae" else {},
                     "shape": shape,
                     "op": op,
                     "graph": r["timing"]["graph"],

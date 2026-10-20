@@ -2038,7 +2038,7 @@ def _main_fused(args) -> None:
     from bench_wan_vae import _time_cupti  # noqa: E402
 
     import tensorrt_llm  # noqa: F401  (trtllm::vae_wino_spatial_in)
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         winograd_spatial_weights,
         winograd_weights,
     )
@@ -2173,7 +2173,7 @@ def _main_fused(args) -> None:
         f"cuBLAS bmm   : {t_bmm / 1e3:8.3f} ms  {wino_flops / (t_bmm * 1e-6) / 1e12:6.0f} TF/s (GEMMs alone)"
     )
     if args.pass2:
-        from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
             cute_spatial_filters,
             wino_spatial_conv_cuda,
             wino_spatial_conv_cute,

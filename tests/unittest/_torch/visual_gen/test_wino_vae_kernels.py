@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
     can_fuse_rms_norm_silu,
     rms_norm_silu,
     rms_norm_silu_reference,
@@ -96,7 +96,7 @@ def test_4d_images_layout() -> None:
 # CUDA norm kernel against the Triton prototype and eager
 # ---------------------------------------------------------------------------
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     add_rms_norm_silu_cuda,
     add_rms_norm_silu_reference,
     can_use_cuda_rms_norm_silu,
@@ -257,13 +257,13 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
 
 import torch.nn.functional as F  # noqa: E402
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     cuda_upsample_available,
     pack_upsample_weights,
     upsample_gather_cuda,
     upsample_gather_reference,
 )
-from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D  # noqa: E402
 
 upsample_op = pytest.mark.skipif(
     not cuda_upsample_available(), reason="trtllm::vae_upsample_gather not built"
@@ -374,7 +374,7 @@ def test_cuda_upsample_gather_with_shortcut(
 # Temporal Winograd norm kernel vs its eager reference
 # ---------------------------------------------------------------------------
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     wino_norm_silu_cuda,
     wino_norm_silu_reference,
 )
@@ -476,7 +476,7 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
 def test_wino_norm_slabs_reproduce_conv3d(order: int) -> None:
     """Slabs from the kernel, one conv2d per component filter, combine: the causal 3x3x3 conv
     of the normalized frames (fp32 reference on the same 16-bit inputs)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         TEMPORAL_WINO,
         rms_norm_silu_reference,
         winograd_weights,
@@ -520,7 +520,7 @@ def test_wino_norm_slabs_reproduce_conv3d(order: int) -> None:
 # Frame ops: Winograd combine (+ bias + residual) and the time interleave (+ bias)
 # ---------------------------------------------------------------------------
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     cuda_frame_ops_available,
     interleave_bias_cuda,
     interleave_bias_reference,
@@ -576,8 +576,10 @@ def test_interleave_bias_is_bitwise(C: int, with_bias: bool) -> None:
     assert torch.equal(interleave_bias_cuda(u, bias), interleave_bias_reference(u, bias))
 
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import avg_down_add_cuda  # noqa: E402
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import AvgDown3D  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
+    avg_down_add_cuda,
+)
 
 
 @frame_ops
@@ -626,7 +628,9 @@ def test_avg_down_add_matches_eager(
     assert torch.equal(got, ref), "group size 4 means the mean is exact: bitwise with eager"
 
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import rms_norm_reference  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
+    rms_norm_reference,
+)
 
 
 @cuda_op
@@ -756,7 +760,7 @@ def test_spatial_winograd_transforms(
 def test_spatial_winograd_conv_matches_conv2d(
     cin_cout: tuple[int, int], hw: tuple[int, int], tile: int
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         wino_spatial_conv_cuda,
         winograd_spatial_weights,
         winograd_weights,
@@ -790,7 +794,7 @@ def test_spatial_winograd_frames_matches_conv3d(
 ) -> None:
     """One output frame of a causal 3x3x3 conv by spatial Winograd alone: the current frame
     (zero history) or the three tap frames summed inside the GEMM."""
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         wino_spatial_conv_frames,
         winograd_spatial_taps_weights,
     )
@@ -815,7 +819,7 @@ def test_spatial_winograd_frames_matches_conv3d(
 @spatial_op
 @pytest.mark.parametrize("cin_cout_hw", [(64, 128, 6, 10), (128, 256, 9, 13), (64, 512, 30, 52)])
 def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, int, int]) -> None:
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         cute_spatial_filters,
         cute_wino_available,
         wino_spatial_conv_cuda,
@@ -847,7 +851,7 @@ def test_spatial_winograd_conv_frame_dtypes(
     frame_dtype: torch.dtype, comps: int, cin_cout_hw_pairs: tuple[int, int, int, int, int]
 ) -> None:
     """The portable path on bf16 and fp16 frames with four or six temporal components."""
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         wino_spatial_conv_cuda,
         winograd_spatial_weights,
         winograd_weights,
@@ -882,7 +886,7 @@ def test_spatial_winograd_conv_frame_dtypes(
 def test_spatial_winograd_kf_matches_reference(
     mode: str | None, cin_cout_hw_pairs: tuple[int, int, int, int, int]
 ) -> None:
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         kf_spatial_filters,
         kf_wino_available,
         wino_spatial_conv_kf,
@@ -914,7 +918,7 @@ def test_spatial_winograd_kf_matches_reference(
 @spatial_op
 @pytest.mark.parametrize("mode", ["wb", "wb1", None])
 def test_spatial_winograd_kf_fp16_six_components(mode: str | None) -> None:
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         kf_spatial_filters,
         kf_wino_available,
         wino_spatial_conv_kf,
@@ -987,7 +991,7 @@ def test_spatial_winograd_fused_matches_reference(
     dtype: torch.dtype, cin_comps: tuple[int, int]
 ) -> None:
     """The fused 1D-Winograd 256-channel conv (Kernel Factory campaign 2) against fp32 conv2d."""
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         kf_fused_eligible,
         kf_fused_filters,
         kf_wino_available,
@@ -1029,8 +1033,8 @@ frame_ops_op = pytest.mark.skipif(
 @pytest.mark.parametrize("patch", [1, 2])
 @pytest.mark.parametrize("shape", [(3, 5, 7, 3), (4, 6, 10, 3), (2, 3, 4, 5)])
 def test_unpatchify_clamp_into_matches_eager(patch: int, shape: tuple[int, int, int, int]) -> None:
-    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import unpatchify_clamp_into
     from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import unpatchify
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import unpatchify_clamp_into
 
     t, h, w, c = shape
     torch.manual_seed(4)

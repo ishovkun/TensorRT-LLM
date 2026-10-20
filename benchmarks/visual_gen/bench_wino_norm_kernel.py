@@ -22,7 +22,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bench_wan_vae import _time_cupti  # noqa: E402
 
-from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
     wino_norm_silu_cuda,  # noqa: E402
 )
 

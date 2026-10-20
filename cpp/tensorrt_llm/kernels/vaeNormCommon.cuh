@@ -159,7 +159,7 @@ __device__ __forceinline__ float normElement(float x, float denom, float invDeno
 }
 
 // The lane layouts the kernels are instantiated for: (L, K) for the Wan VAE widths,
-// the small powers of two and a few generic ones. Mirrored in blaze_kernels.py.
+// the small powers of two and a few generic ones. Mirrored in wino_vae_kernels.py.
 #define VAE_NORM_FOR_EACH_LAYOUT(X)                                                                                    \
     X(32, 1)                                                                                                           \
     X(32, 2)                                                                                                           \
