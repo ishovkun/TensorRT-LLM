@@ -40,20 +40,26 @@ void const* optionalPtr(std::optional<torch::Tensor> const& t, c10::IntArrayRef 
 }
 } // namespace
 
-// RMSNorm + SiLU with the temporal Winograd transforms (see vaeWinoNormSiluKernel.h).
-// x: [T, P, C] frames, or m: four [T/2, P, C] tensors from the previous Winograd conv.
+// RMSNorm + SiLU with the temporal Winograd F(order,3) transforms (see vaeWinoNormSiluKernel.h).
+// x: [T, P, C] frames, or m: order + 2 tensors [T/order, P, C] from the previous Winograd conv,
+// in the slab dtype (fp16 when half_slabs, else bf16).
 // Returns (sum [T, P, C] (the pre-norm frames; empty when the input is a plain x with
-// neither bias nor residual), y_tail [2, P, C], d: four [T/2, P, C]).
+// neither bias nor residual), y_tail [2, P, C], d: [order + 2, T/order, P, C] slabs).
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> vae_wino_norm_silu(std::optional<torch::Tensor> const& x,
     std::optional<std::vector<torch::Tensor>> const& m, std::optional<torch::Tensor> const& residual,
     std::optional<torch::Tensor> const& in_bias, std::optional<torch::Tensor> const& cache, torch::Tensor const& gamma,
-    std::optional<torch::Tensor> const& bias, double scale, bool reference_rounding, int64_t frames)
+    std::optional<torch::Tensor> const& bias, double scale, bool reference_rounding, int64_t frames, int64_t order,
+    bool half_slabs)
 {
     TORCH_CHECK(x.has_value() != m.has_value(), "exactly one of x and m");
-    TORCH_CHECK(frames >= 2 && frames % 2 == 0, "frames must be even and >= 2");
+    TORCH_CHECK(order == 2 || order == 4, "order must be 2 or 4");
+    TORCH_CHECK(order == 2 || half_slabs, "order 4 needs fp16 slabs");
+    TORCH_CHECK(frames >= order && frames % order == 0, "frames must be a positive multiple of order");
+    int64_t const comps = order + 2;
+    auto const slabType = half_slabs ? torch::kHalf : torch::kBFloat16;
     torch::Tensor const& shapeSrc = x.has_value() ? x.value() : m->at(0);
     TORCH_CHECK(shapeSrc.dim() == 3, "frame tensors must be [T, P, C]");
-    CHECK_INPUT(shapeSrc, torch::kBFloat16);
+    CHECK_INPUT(shapeSrc, (x.has_value() ? torch::kBFloat16 : slabType));
     int64_t const P = shapeSrc.size(1);
     int64_t const C = shapeSrc.size(2);
     TORCH_CHECK(C % 8 == 0 && C <= tensorrt_llm::kernels::kVaeRmsNormSiluMaxChannels, "unsupported channel count ", C);
@@ -65,12 +71,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> vae_wino_norm_silu(std::
     p.positions = P;
     p.channels = static_cast<int>(C);
     p.frames = static_cast<int>(frames);
+    p.order = static_cast<int>(order);
+    p.halfSlabs = half_slabs;
     p.scale = static_cast<float>(scale);
     p.eps = 1e-12f;
     p.referenceRounding = reference_rounding;
 
     std::vector<int64_t> const frameShape{frames, P, C};
-    std::vector<int64_t> const pairShape{frames / 2, P, C};
+    std::vector<int64_t> const groupShape{frames / order, P, C};
     if (x.has_value())
     {
         TORCH_CHECK(x->sizes() == c10::IntArrayRef(frameShape), "x must be [T, P, C]");
@@ -78,11 +86,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> vae_wino_norm_silu(std::
     }
     else
     {
-        TORCH_CHECK(m->size() == 4, "m must hold four tensors");
-        for (int k = 0; k < 4; ++k)
+        TORCH_CHECK(static_cast<int64_t>(m->size()) == comps, "m must hold order + 2 tensors");
+        for (int64_t k = 0; k < comps; ++k)
         {
-            CHECK_INPUT(m->at(k), torch::kBFloat16);
-            TORCH_CHECK(m->at(k).sizes() == c10::IntArrayRef(pairShape), "m[k] must be [T/2, P, C]");
+            CHECK_INPUT(m->at(k), slabType);
+            TORCH_CHECK(m->at(k).sizes() == c10::IntArrayRef(groupShape), "m[k] must be [T/order, P, C]");
             ptrs.m[k] = m->at(k).data_ptr();
         }
     }
@@ -100,13 +108,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> vae_wino_norm_silu(std::
         ptrs.cache = cache->data_ptr();
     }
 
-    auto opts = shapeSrc.options();
+    auto opts = gamma.options();
     bool const wantSum = residual.has_value() || in_bias.has_value() || !x.has_value();
     torch::Tensor sum = wantSum ? torch::empty(frameShape, opts) : torch::empty({0}, opts);
     torch::Tensor yTail = torch::empty({2, P, C}, opts);
-    // The four slabs share one buffer, so a consumer can also read them as [4 * pairs, P, C].
-    torch::Tensor d = torch::empty({4, pairShape[0], pairShape[1], pairShape[2]}, opts);
-    for (int k = 0; k < 4; ++k)
+    // The slabs share one buffer, so a consumer can also read them as [comps * groups, P, C].
+    torch::Tensor d = torch::empty({comps, groupShape[0], groupShape[1], groupShape[2]}, opts.dtype(slabType));
+    for (int64_t k = 0; k < comps; ++k)
     {
         ptrs.d[k] = d[k].data_ptr();
     }
@@ -122,7 +130,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "vae_wino_norm_silu(Tensor? x, Tensor[]? m, Tensor? residual, Tensor? in_bias, Tensor? cache, Tensor gamma, "
-        "Tensor? bias, float scale, bool reference_rounding, int frames) -> (Tensor, Tensor, Tensor)");
+        "Tensor? bias, float scale, bool reference_rounding, int frames, int order=2, bool half_slabs=False) -> "
+        "(Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

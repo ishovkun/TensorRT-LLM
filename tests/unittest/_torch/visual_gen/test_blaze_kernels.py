@@ -390,15 +390,18 @@ wino_op = pytest.mark.skipif(
 @pytest.mark.parametrize("cache_frames", [0, 1, 2])
 @pytest.mark.parametrize("source", ["x", "m"])
 @pytest.mark.parametrize("extras", ["plain", "residual_bias"])
+@pytest.mark.parametrize("order_dtype", [(2, "bf16"), (2, "fp16"), (4, "fp16")])
 def test_wino_norm_silu_reference_mode_is_bitwise(
-    C: int, cache_frames: int, source: str, extras: str
+    C: int, cache_frames: int, source: str, extras: str, order_dtype: tuple[int, str]
 ) -> None:
+    order, slab = order_dtype
+    slab_dtype = torch.float16 if slab == "fp16" else torch.bfloat16
     gen = torch.Generator(device="cuda").manual_seed(C + cache_frames)
-    T, P = 4, 9 * 13
+    T, P = (4 if order == 2 else 8), 9 * 13
     bf = torch.bfloat16
     rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
     x = rnd(T, P, C) if source == "x" else None
-    m = [rnd(T // 2, P, C) for _ in range(4)] if source == "m" else None
+    m = [rnd(T // order, P, C).to(slab_dtype) for _ in range(order + 2)] if source == "m" else None
     residual = rnd(T, P, C) if extras == "residual_bias" else None
     in_bias = (
         (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
@@ -409,16 +412,31 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
     scale = C**0.5
     s_ref, tail_ref, d_ref = wino_norm_silu_reference(
-        x, m, residual, in_bias, cache, gamma, 0.0, scale
+        x, m, residual, in_bias, cache, gamma, 0.0, scale, order, slab_dtype
     )
     s, tail, d = wino_norm_silu_cuda(
-        x, m, residual, in_bias, cache, gamma, None, scale, T, reference_rounding=True
+        x,
+        m,
+        residual,
+        in_bias,
+        cache,
+        gamma,
+        None,
+        scale,
+        T,
+        reference_rounding=True,
+        order=order,
+        half_slabs=slab == "fp16",
     )
+    assert d.dtype == slab_dtype and d.shape[0] == order + 2
     if residual is not None:
         assert torch.equal(s, s_ref), "sum must be bit-identical to the eager adds"
     # The normalized frames (cache) and the slabs match eager up to the fp32 reduction
     # order of the sum of squares: at most 1 bf16 ulp on a tiny fraction of elements.
-    for name, a, b in [("cache", tail, tail_ref), *((f"D{k}", d[k], d_ref[k]) for k in range(4))]:
+    for name, a, b in [
+        ("cache", tail, tail_ref),
+        *((f"D{k}", d[k], d_ref[k]) for k in range(order + 2)),
+    ]:
         diff = (a.float() - b.float()).abs()
         ulp = b.float().abs().clamp_min(1e-3) * 2**-7
         assert (diff > ulp).float().mean().item() < 1e-3, f"{name} differs from the eager form"
@@ -426,18 +444,69 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
 
 @wino_op
 @pytest.mark.parametrize("C", [256, 160])
-def test_wino_norm_silu_fp32_mode_close(C: int) -> None:
+@pytest.mark.parametrize("order", [2, 4])
+def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
     gen = torch.Generator(device="cuda").manual_seed(C)
-    T, P = 6, 20 * 20
+    T, P = (6 if order == 2 else 8), 20 * 20
     bf = torch.bfloat16
     x = torch.randn(T, P, C, generator=gen, device="cuda").to(bf)
     cache = torch.randn(2, P, C, generator=gen, device="cuda").to(bf)
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    _, tail_ref, d_ref = wino_norm_silu_reference(x, None, None, None, cache, gamma, 0.0, C**0.5)
-    _, tail, d = wino_norm_silu_cuda(x, None, None, None, cache, gamma, None, C**0.5, T)
+    slab_dtype = torch.float16 if order == 4 else torch.bfloat16
+    _, tail_ref, d_ref = wino_norm_silu_reference(
+        x, None, None, None, cache, gamma, 0.0, C**0.5, order, slab_dtype
+    )
+    _, tail, d = wino_norm_silu_cuda(
+        x, None, None, None, cache, gamma, None, C**0.5, T, order=order, half_slabs=order == 4
+    )
     for a, b in [(tail, tail_ref), *zip(d, d_ref)]:
         rel = ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-6)).item()
         assert rel < 1e-2, rel
+
+
+@wino_op
+@pytest.mark.parametrize("order", [2, 4])
+def test_wino_norm_slabs_reproduce_conv3d(order: int) -> None:
+    """Slabs from the kernel, one conv2d per component filter, combine: the causal 3x3x3 conv
+    of the normalized frames (fp32 reference on the same 16-bit inputs)."""
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        TEMPORAL_WINO,
+        rms_norm_silu_reference,
+        winograd_weights,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(order)
+    C, Co, H, W = 64, 48, 6, 10
+    T = 2 * order
+    x = torch.randn(T, H * W, C, generator=gen, device="cuda").to(torch.bfloat16)
+    cache = torch.randn(2, H * W, C, generator=gen, device="cuda").to(torch.bfloat16)
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(torch.bfloat16)
+    weight = (0.1 * torch.randn(Co, C, 3, 3, 3, generator=gen, device="cuda")).to(torch.bfloat16)
+    _, _, d = wino_norm_silu_cuda(
+        x, None, None, None, cache, gamma, None, C**0.5, T, order=order, half_slabs=order == 4
+    )
+    g = winograd_weights(weight, order, torch.float32)
+    comps = order + 2
+    m = torch.stack(
+        [
+            F.conv2d(d[k].float().view(T // order, H, W, C).permute(0, 3, 1, 2), g[k], None, 1, 1)
+            for k in range(comps)
+        ]
+    )  # [comps, groups, Co, H, W]
+    at = torch.tensor(TEMPORAL_WINO[order]["AT"], dtype=torch.float32, device="cuda")
+    y = torch.einsum("jk,kgchw->gjchw", at, m).reshape(T, Co, H, W)
+    # direct conv of the normalized frames (bf16, as the kernel's ring holds them) with the cache
+    y_norm = rms_norm_silu_reference(x.permute(0, 2, 1), gamma.reshape(1, -1, 1), 0.0, C**0.5)
+    frames = torch.cat([cache.float(), y_norm.permute(0, 2, 1).float()], 0)  # [T+2, P, C]
+    ref = F.conv3d(
+        frames.view(T + 2, H, W, C).permute(3, 0, 1, 2).unsqueeze(0),
+        weight.float(),
+        None,
+        1,
+        (0, 1, 1),
+    )[0].permute(1, 0, 2, 3)  # [T, Co, H, W]
+    rel = ((y - ref).norm() / ref.norm()).item()
+    assert rel < 2e-2, f"rel_l2={rel:.2e}"
 
 
 # ---------------------------------------------------------------------------
@@ -459,15 +528,17 @@ frame_ops = pytest.mark.skipif(
 
 @frame_ops
 @pytest.mark.parametrize("C", [256, 160, 48])
-@pytest.mark.parametrize("source", ["x", "m"])
+@pytest.mark.parametrize("source", ["x", "m2", "m2h", "m4h"])
 @pytest.mark.parametrize("extras", ["none", "bias", "residual", "bias_residual"])
 def test_wino_combine_is_bitwise(C: int, source: str, extras: str) -> None:
     gen = torch.Generator(device="cuda").manual_seed(C)
-    T, P = 4, 7 * 11
+    order = 4 if source == "m4h" else 2
+    T, P = 2 * order, 7 * 11
     bf = torch.bfloat16
+    slab_dtype = torch.float16 if source.endswith("h") else bf
     rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
     x = rnd(T, P, C) if source == "x" else None
-    m = [rnd(T // 2, P, C) for _ in range(4)] if source == "m" else None
+    m = [rnd(T // order, P, C).to(slab_dtype) for _ in range(order + 2)] if source != "x" else None
     bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf) if "bias" in extras else None
     residual = rnd(T, P, C) if "residual" in extras else None
     ref = x if x is not None else wino_combine_reference(m)
@@ -762,6 +833,41 @@ def test_spatial_winograd_cute_matches_cublas_path(cin_cout_hw: tuple[int, int, 
 
 
 @spatial_op
+@pytest.mark.parametrize("frame_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("comps", [4, 6])
+@pytest.mark.parametrize("cin_cout_hw_pairs", [(64, 128, 6, 10, 3), (128, 256, 9, 13, 2)])
+def test_spatial_winograd_conv_frame_dtypes(
+    frame_dtype: torch.dtype, comps: int, cin_cout_hw_pairs: tuple[int, int, int, int, int]
+) -> None:
+    """The portable path on bf16 and fp16 frames with four or six temporal components."""
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        wino_spatial_conv_cuda,
+        winograd_spatial_weights,
+        winograd_weights,
+    )
+
+    torch.manual_seed(comps)
+    cin, cout, h, w, pairs = cin_cout_hw_pairs
+    order = comps - 2
+    weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
+    d = torch.randn(comps, pairs, h * w, cin, device="cuda").to(frame_dtype)
+    u = winograd_spatial_weights(weight, 4, order)
+    got = wino_spatial_conv_cuda(d, u, h, w)
+    assert got.dtype == frame_dtype
+    g = winograd_weights(weight, order, torch.float32)
+    ref = torch.stack(
+        [
+            F.conv2d(d[k].float().view(pairs, h, w, cin).permute(0, 3, 1, 2), g[k], None, 1, 1)
+            .permute(0, 2, 3, 1)
+            .reshape(pairs, h * w, cout)
+            for k in range(comps)
+        ]
+    )
+    rel = ((got.float() - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@spatial_op
 @pytest.mark.parametrize("mode", ["wa", "wb", "wa0", "wb0", "wb1", None])
 @pytest.mark.parametrize(
     "cin_cout_hw_pairs", [(64, 256, 6, 12, 4), (128, 256, 9, 16, 2), (512, 512, 24, 40, 2)]
@@ -795,6 +901,39 @@ def test_spatial_winograd_kf_matches_reference(
     )
     got = wino_spatial_conv_kf(d, kf_spatial_filters(g), h, w, mode).float()
     rel = ((got - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@spatial_op
+@pytest.mark.parametrize("mode", ["wb", "wb1", None])
+def test_spatial_winograd_kf_fp16_six_components(mode: str | None) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan.blaze_kernels import (
+        kf_spatial_filters,
+        kf_wino_available,
+        wino_spatial_conv_kf,
+        winograd_weights,
+    )
+
+    if not kf_wino_available():
+        pytest.skip("Kernel Factory spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    torch.manual_seed(6)
+    cin, cout, h, w, pairs = 128, 256, 12, 16, 1
+    weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
+    d = torch.randn(6, pairs, h * w, cin, device="cuda").to(torch.float16)
+    g = winograd_weights(weight, 4, torch.float16)
+    ref = torch.stack(
+        [
+            F.conv2d(
+                d[k].view(pairs, h, w, cin).permute(0, 3, 1, 2).float(), g[k].float(), None, 1, 1
+            )
+            .permute(0, 2, 3, 1)
+            .reshape(pairs, h * w, cout)
+            for k in range(6)
+        ]
+    )
+    got = wino_spatial_conv_kf(d, kf_spatial_filters(g), h, w, mode)
+    assert got.dtype == torch.float16
+    rel = ((got.float() - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
 
 

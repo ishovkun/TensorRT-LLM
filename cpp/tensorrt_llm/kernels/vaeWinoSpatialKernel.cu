@@ -34,14 +34,15 @@ using common::PackedAligned;
 using namespace vae_norm;
 
 constexpr int kThreads = 256;
-using T = __nv_bfloat16; // frames
-using TS = __half;       // transformed data (V, M): fp16 keeps three more mantissa bits than bf16
+// Frames are bf16 or fp16 (template parameter T); the transformed data (V, M) is fp16, which keeps
+// three more mantissa bits than bf16 through the GEMMs.
+using TS = __half;
 
 // Channels per thread: 4 (8-byte vectors) for m = 2; 2 (one bf16x2 / fp16x2 pair) for m = 4,
 // whose 6x6 window would otherwise not fit in registers (measured: 4 channels per thread
 // costs 175 registers and is no faster; 8 channels for m = 2 cost 165 registers, one block
 // per SM).
-template <int M>
+template <typename T, int M>
 struct Lanes
 {
     static constexpr int V = M == 2 ? 4 : 2;
@@ -163,15 +164,15 @@ struct WinoMath<4>
 
 // V = B^T d B for one (m+2) x (m+2) window and V channels, written as (m+2)^2 vectors; one
 // coordinate row at a time so the register footprint stays bounded.
-template <int M>
+template <typename T, int M>
 __global__ void __launch_bounds__(kThreads)
     vaeWinoSpatialInputKernel(T const* __restrict__ frames, TS* __restrict__ v, VaeWinoSpatialParams p)
 {
     using W = WinoMath<M>;
     constexpr int A = W::A;
-    constexpr int V = Lanes<M>::V;
-    using Vec = typename Lanes<M>::Vec;
-    using VecS = typename Lanes<M>::VecS;
+    constexpr int V = Lanes<T, M>::V;
+    using Vec = typename Lanes<T, M>::Vec;
+    using VecS = typename Lanes<T, M>::VecS;
     Geometry const g = geometry<M>(p);
     int const C = p.channels;
     int const cvec = C / V;
@@ -265,7 +266,7 @@ constexpr int kStagedTiles = 8;
 constexpr int kStagedChannels = 64;
 static_assert(kStagedTiles * (kStagedChannels / 2) == kThreads, "one thread per (tile, channel pair)");
 
-template <int M>
+template <typename T, int M>
 __global__ void __launch_bounds__(kThreads)
     vaeWinoSpatialInputStagedKernel(T const* __restrict__ frames, TS* __restrict__ v, VaeWinoSpatialParams p)
 {
@@ -273,7 +274,7 @@ __global__ void __launch_bounds__(kThreads)
     constexpr int A = W::A;
     constexpr int Cols = M * kStagedTiles + 2;
     constexpr int CH = kStagedChannels;
-    using PairS = PackedAligned<TS, 2>; // one channel pair per thread, whatever Lanes<M>::V is
+    using PairS = PackedAligned<TS, 2>; // one channel pair per thread, whatever Lanes<T, M>::V is
     __shared__ __align__(16) T win[A][Cols][CH];
 
     Geometry const g = geometry<M>(p);
@@ -357,15 +358,15 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // y = A^T M A for one tile and V channels: (m+2)^2 vectors in, m x m output pixels out.
-template <int M>
+template <typename T, int M>
 __global__ void __launch_bounds__(kThreads) vaeWinoSpatialOutputKernel(
     TS const* __restrict__ m, T* __restrict__ frames, T const* __restrict__ bias, VaeWinoSpatialParams p)
 {
     using W = WinoMath<M>;
     constexpr int A = W::A;
-    constexpr int V = Lanes<M>::V;
-    using Vec = typename Lanes<M>::Vec;
-    using VecS = typename Lanes<M>::VecS;
+    constexpr int V = Lanes<T, M>::V;
+    using Vec = typename Lanes<T, M>::Vec;
+    using VecS = typename Lanes<T, M>::VecS;
     Geometry const g = geometry<M>(p);
     int const C = p.channels;
     int const cvec = C / V;
@@ -444,7 +445,7 @@ __global__ void __launch_bounds__(kThreads) vaeWinoSpatialOutputKernel(
 
 dim3 gridFor(VaeWinoSpatialParams const& p)
 {
-    int const lanes = p.tile == 2 ? Lanes<2>::V : Lanes<4>::V;
+    int const lanes = p.tile == 2 ? Lanes<__nv_bfloat16, 2>::V : Lanes<__nv_bfloat16, 4>::V;
     int const cvec = p.channels / lanes;
     int const tiles = (p.row1 - p.row0) * ((p.width + p.tile - 1) / p.tile);
     TLLM_CHECK_WITH_INFO(tiles <= 65535 && p.frames <= 65535, "vaeWinoSpatial: too many tiles or frames for the grid");
@@ -462,39 +463,65 @@ void check(VaeWinoSpatialParams const& p)
         "vaeWinoSpatial: bad tile-row range");
 }
 
-} // namespace
-
-template <int M>
+template <typename T, int M>
 void launchInputStaged(T const* frames, TS* v, VaeWinoSpatialParams const& p, cudaStream_t stream)
 {
     int const tw = (p.width + M - 1) / M;
     int const groups = (p.row1 - p.row0) * ((tw + kStagedTiles - 1) / kStagedTiles);
     TLLM_CHECK_WITH_INFO(groups <= 65535 && p.frames <= 65535, "vaeWinoSpatial: too many tiles or frames for the grid");
     dim3 const grid(p.channels / kStagedChannels, groups, p.frames);
-    vaeWinoSpatialInputStagedKernel<M><<<grid, kThreads, 0, stream>>>(frames, v, p);
+    vaeWinoSpatialInputStagedKernel<T, M><<<grid, kThreads, 0, stream>>>(frames, v, p);
 }
 
-void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream)
+template <typename T>
+void launchInputTyped(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream)
 {
-    check(p);
     T const* f = static_cast<T const*>(frames);
     TS* out = static_cast<TS*>(v);
     if (p.channels % kStagedChannels == 0)
     {
-        p.tile == 2 ? launchInputStaged<2>(f, out, p, stream) : launchInputStaged<4>(f, out, p, stream);
+        p.tile == 2 ? launchInputStaged<T, 2>(f, out, p, stream) : launchInputStaged<T, 4>(f, out, p, stream);
     }
     else
     {
         dim3 const grid = gridFor(p);
         if (p.tile == 2)
         {
-            vaeWinoSpatialInputKernel<2><<<grid, kThreads, 0, stream>>>(f, out, p);
+            vaeWinoSpatialInputKernel<T, 2><<<grid, kThreads, 0, stream>>>(f, out, p);
         }
         else
         {
-            vaeWinoSpatialInputKernel<4><<<grid, kThreads, 0, stream>>>(f, out, p);
+            vaeWinoSpatialInputKernel<T, 4><<<grid, kThreads, 0, stream>>>(f, out, p);
         }
     }
+}
+
+template <typename T>
+void launchOutputTyped(
+    void const* m, void* frames, void const* bias, VaeWinoSpatialParams const& p, cudaStream_t stream)
+{
+    dim3 const grid = gridFor(p);
+    if (p.tile == 2)
+    {
+        vaeWinoSpatialOutputKernel<T, 2><<<grid, kThreads, 0, stream>>>(
+            static_cast<TS const*>(m), static_cast<T*>(frames), static_cast<T const*>(bias), p);
+    }
+    else
+    {
+        vaeWinoSpatialOutputKernel<T, 4><<<grid, kThreads, 0, stream>>>(
+            static_cast<TS const*>(m), static_cast<T*>(frames), static_cast<T const*>(bias), p);
+    }
+}
+
+} // namespace
+
+void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream)
+{
+    check(p);
+    if (p.halfFrames)
+        launchInputTyped<__half>(frames, v, p, stream);
+    else
+        launchInputTyped<__nv_bfloat16>(frames, v, p, stream);
     sync_check_cuda_error(stream);
 }
 
@@ -503,17 +530,10 @@ void launchVaeWinoSpatialOutput(
 {
     check(p);
     TLLM_CHECK_WITH_INFO(!p.stackFrames, "vaeWinoSpatial: the output transform has no stacked-frame layout");
-    dim3 const grid = gridFor(p);
-    if (p.tile == 2)
-    {
-        vaeWinoSpatialOutputKernel<2><<<grid, kThreads, 0, stream>>>(
-            static_cast<TS const*>(m), static_cast<T*>(frames), static_cast<T const*>(bias), p);
-    }
+    if (p.halfFrames)
+        launchOutputTyped<__half>(m, frames, bias, p, stream);
     else
-    {
-        vaeWinoSpatialOutputKernel<4><<<grid, kThreads, 0, stream>>>(
-            static_cast<TS const*>(m), static_cast<T*>(frames), static_cast<T const*>(bias), p);
-    }
+        launchOutputTyped<__nv_bfloat16>(m, frames, bias, p, stream);
     sync_check_cuda_error(stream);
 }
 

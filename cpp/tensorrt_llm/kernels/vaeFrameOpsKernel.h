@@ -39,16 +39,18 @@ struct VaeWinoCombineParams
     int64_t positions; // H * W of the source
     int channels;
     int frames;
-    int height; // H (needed when padding)
-    int width;  // W
-    int padH;   // extra zero rows at the bottom (0 or 1)
-    int padW;   // extra zero columns at the right (0 or 1)
+    int height;        // H (needed when padding)
+    int width;         // W
+    int padH;          // extra zero rows at the bottom (0 or 1)
+    int padW;          // extra zero columns at the right (0 or 1)
+    int order;         // temporal Winograd order of m (2 or 4); ignored with x
+    bool halfProducts; // m is fp16 (else bf16)
 };
 
 struct VaeWinoCombinePointers
 {
     void const* x;        // [T, P, C] or null when m is used
-    void const* m[4];     // each [T/2, P, C], or null
+    void const* m[6];     // order + 2 tensors, each [T/order, P, C] (bf16 or fp16), or null
     void const* bias;     // [C] or null
     void const* residual; // [T, P, C] or null
     void* y;              // [T, P, C]

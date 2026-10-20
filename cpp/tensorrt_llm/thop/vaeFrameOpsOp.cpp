@@ -33,7 +33,8 @@ torch::Tensor vae_wino_combine(std::optional<torch::Tensor> const& x, std::vecto
     TORCH_CHECK(x.has_value() != !m.empty(), "exactly one of x and m");
     torch::Tensor const& src = x.has_value() ? x.value() : m.at(0);
     TORCH_CHECK(src.dim() == 3, "frame tensors must be [T, P, C]");
-    CHECK_INPUT(src, torch::kBFloat16);
+    bool const halfProducts = !x.has_value() && src.scalar_type() == torch::kHalf;
+    CHECK_INPUT(src, (halfProducts ? torch::kHalf : torch::kBFloat16));
     int64_t const P = src.size(1);
     int64_t const C = src.size(2);
     TORCH_CHECK(C % 8 == 0, "channels must be a multiple of 8");
@@ -55,12 +56,17 @@ torch::Tensor vae_wino_combine(std::optional<torch::Tensor> const& x, std::vecto
     }
     else
     {
-        TORCH_CHECK(m.size() == 4 && frames % 2 == 0, "m must hold four tensors and T must be even");
-        for (int k = 0; k < 4; ++k)
+        int64_t const order = static_cast<int64_t>(m.size()) - 2;
+        TORCH_CHECK((order == 2 || order == 4) && frames % order == 0,
+            "m must hold order + 2 tensors (order 2 or 4) and T must be divisible by the order");
+        TORCH_CHECK(order == 2 || halfProducts, "order 4 products must be fp16");
+        p.order = static_cast<int>(order);
+        p.halfProducts = halfProducts;
+        for (int64_t k = 0; k < order + 2; ++k)
         {
-            CHECK_INPUT(m.at(k), torch::kBFloat16);
-            TORCH_CHECK(m.at(k).size(0) == frames / 2 && m.at(k).size(1) == P && m.at(k).size(2) == C,
-                "m[k] must be [T/2, P, C]");
+            CHECK_INPUT(m.at(k), (halfProducts ? torch::kHalf : torch::kBFloat16));
+            TORCH_CHECK(m.at(k).size(0) == frames / order && m.at(k).size(1) == P && m.at(k).size(2) == C,
+                "m[k] must be [T/order, P, C]");
             ptrs.m[k] = m.at(k).data_ptr();
         }
     }
@@ -77,7 +83,7 @@ torch::Tensor vae_wino_combine(std::optional<torch::Tensor> const& x, std::vecto
             "residual must be [T, P, C]");
         ptrs.residual = residual->data_ptr();
     }
-    auto y = torch::empty({frames, (height + pad_h) * (width + pad_w), C}, src.options());
+    auto y = torch::empty({frames, (height + pad_h) * (width + pad_w), C}, src.options().dtype(torch::kBFloat16));
     ptrs.y = y.data_ptr();
     tensorrt_llm::kernels::launchVaeWinoCombine(ptrs, p, at::cuda::getCurrentCUDAStream(src.get_device()));
     return y;

@@ -25,7 +25,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// Spatial Winograd F(m x m, 3x3) transforms, m = 2 or 4, for channels-last bf16 frames; the
+// Spatial Winograd F(m x m, 3x3) transforms, m = 2 or 4, for channels-last bf16 or fp16 frames; the
 // transformed data (V, M) is fp16, which keeps three more mantissa bits than bf16 through
 // the GEMMs.
 //
@@ -55,10 +55,11 @@ struct VaeWinoSpatialParams
     int row1;        // one past the last tile row
     int tile;        // output tile side m: 2 (F(2x2, 3x3)) or 4 (F(4x4, 3x3))
     int stackFrames; // input transform only: V layout [(m+2)^2, ntilesStrip, N * C]
+    int halfFrames;  // frames (and the output transform's bias) are fp16 instead of bf16
 };
 
 void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream);
-// `bias` (bf16 [C], may be null) is added to every output pixel before rounding.
+// `bias` ([C] in the frames' dtype, may be null) is added to every output pixel before rounding.
 void launchVaeWinoSpatialOutput(
     void const* m, void* frames, void const* bias, VaeWinoSpatialParams const& p, cudaStream_t stream);
 

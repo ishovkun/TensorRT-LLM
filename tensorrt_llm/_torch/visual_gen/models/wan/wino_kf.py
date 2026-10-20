@@ -72,6 +72,8 @@ def wino_spatial_conv_kf(
     y = torch.empty((comps * pairs, height, width, cout), dtype=d.dtype, device=d.device)
     mode = mode or _pick_mode(pairs, height, width, cin)
     if mode in ("wa", "wa0"):
+        if d.dtype != torch.bfloat16:
+            raise ValueError("the tile-row layouts ('wa', 'wa0') read bf16 frames only")
         _run_wa(x, u, y, comps, pairs, pdl=mode == "wa")
     elif mode in ("wb", "wb0"):
         _run_wb(x, u, y, comps, pairs, chunked=True, pdl=mode == "wb")
@@ -118,6 +120,24 @@ def _run_wa(
     out_last(m[comps - 1].view(-1).view(torch.int32), ys[comps - 1])
 
 
+_xform_compiled: dict = {}
+
+
+def _xform_kernel(name: str, jit_fn, tensors: list[torch.Tensor], consts: tuple):
+    """Compile-once launcher for the static-layout transform kernels (the layouts and the
+    element types are baked into the code, so the key carries shapes, strides and dtypes)."""
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream
+
+    key = (name, *((tuple(t.shape), t.stride(), t.dtype) for t in tensors), *consts)
+    args = [from_dlpack(t, assumed_align=16) for t in tensors]
+    fn = _xform_compiled.get(key)
+    if fn is None:
+        fn = cute.compile(jit_fn, *args, *consts, make_fake_stream())
+        _xform_compiled[key] = fn
+    return lambda stream: fn(*args, stream)
+
+
 def _run_wb(
     x: torch.Tensor,
     u: torch.Tensor,
@@ -148,15 +168,15 @@ def _run_wb(
 
     def xform_in(k: int, flags: int) -> None:
         x_, v_ = x[k * pairs : (k + 1) * pairs], v[:, k * tiles : (k + 1) * tiles]
-        wb._xform_kernel("in", wino.in_xform, [x_, v_], (pairs, height, width, cin, 4, 4, flags))(
+        _xform_kernel("in", wino.in_xform, [x_, v_], (pairs, height, width, cin, 4, 4, flags))(
             stream
         )
 
     def xform_out(k: int, flags: int) -> None:
         m_, y_ = m[:, k * tiles : (k + 1) * tiles], y[k * pairs : (k + 1) * pairs]
-        wb._xform_kernel(
-            "out", wino.out_xform, [m_, y_], (pairs, height, width, cout, 4, 4, flags)
-        )(stream)
+        _xform_kernel("out", wino.out_xform, [m_, y_], (pairs, height, width, cout, 4, 4, flags))(
+            stream
+        )
 
     def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pdl: bool) -> None:
         # M = Cout, N = tiles, K = Cin, batched over the 36 coordinates (x components)
@@ -166,16 +186,14 @@ def _run_wb(
         wb._gemm_kernel(a, b, c, n_tile, pdl)(a, b, c, stream)
 
     if not chunked:
-        wb._xform_kernel("in", wino.in_xform, [x, v], (frames, height, width, cin, 4, 4, 0))(stream)
+        _xform_kernel("in", wino.in_xform, [x, v], (frames, height, width, cin, 4, 4, 0))(stream)
         gemm(
             u.view(36 * comps, cout, cin),
             v.view(36 * comps, tiles, cin),
             m.view(36 * comps, tiles, cout),
             False,
         )
-        wb._xform_kernel("out", wino.out_xform, [m, y], (frames, height, width, cout, 4, 4, 0))(
-            stream
-        )
+        _xform_kernel("out", wino.out_xform, [m, y], (frames, height, width, cout, 4, 4, 0))(stream)
         return
     if not pdl:
         for k in range(comps):

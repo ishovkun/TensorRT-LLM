@@ -318,12 +318,54 @@ def cuda_wino_available() -> bool:
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_norm_silu")
 
 
-def winograd_weights(weight: torch.Tensor) -> list[torch.Tensor]:
-    """``[Cout, Cin, 3, kh, kw]`` -> four ``[Cout, Cin, kh, kw]`` channels-last filters
-    ``G0 = g0, G1 = (g0 + g1 + g2) / 2, G2 = (g0 - g1 + g2) / 2, G3 = g2`` (summed in fp32)."""
-    g0, g1, g2 = (weight[:, :, i].detach().float() for i in range(3))
-    gs = [g0, (g0 + g1 + g2) / 2, (g0 - g1 + g2) / 2, g2]
-    return [g.to(weight.dtype).contiguous(memory_format=torch.channels_last) for g in gs]
+# Temporal Winograd F(order, 3) transforms, mirrored in vaeWinoTables.cuh. Order 2 is the
+# classic F(2,3); order 4 uses the points (0, 1, -1, 2, -1/2, inf), whose output transform AT
+# holds only powers of two (exact products) and whose input transform BT holds multiples of
+# 1/2 (exact products of 16-bit values in fp32).
+TEMPORAL_WINO: dict[int, dict[str, list[list[float]]]] = {
+    2: dict(
+        BT=[[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]],
+        G=[[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]],
+        AT=[[1, 1, 1, 0], [0, 1, -1, -1]],
+    ),
+    4: dict(
+        BT=[
+            [1, 1.5, -2, -1.5, 1, 0],
+            [0, -1, -2.5, -0.5, 1, 0],
+            [0, 1, 0.5, -2.5, 1, 0],
+            [0, -0.5, -1, 0.5, 1, 0],
+            [0, 2, -1, -2, 1, 0],
+            [0, 1, 1.5, -2, -1.5, 1],
+        ],
+        G=[
+            [1, 0, 0],
+            [-1 / 3, -1 / 3, -1 / 3],
+            [1 / 3, -1 / 3, 1 / 3],
+            [1 / 15, 2 / 15, 4 / 15],
+            [-16 / 15, 8 / 15, -4 / 15],
+            [0, 0, 1],
+        ],
+        AT=[
+            [1, 1, 1, 1, 1, 0],
+            [0, 1, -1, 2, -0.5, 0],
+            [0, 1, 1, 4, 0.25, 0],
+            [0, 1, -1, 8, -0.125, 1],
+        ],
+    ),
+}
+
+
+def winograd_weights(
+    weight: torch.Tensor, order: int = 2, dtype: torch.dtype | None = None
+) -> list[torch.Tensor]:
+    """``[Cout, Cin, 3, kh, kw]`` -> ``order + 2`` channels-last filters ``[Cout, Cin, kh, kw]``,
+    ``G_k = sum_i G[k][i] g_i`` over the temporal taps (fp32 math, rounded once to ``dtype``,
+    the weight's dtype by default). Order 2: ``g0, (g0+g1+g2)/2, (g0-g1+g2)/2, g2``."""
+    taps = weight.detach().float()  # [Cout, Cin, 3, kh, kw]
+    gm = torch.tensor(TEMPORAL_WINO[order]["G"], dtype=torch.float32, device=weight.device)
+    gs = torch.einsum("kt,oitab->koiab", gm, taps)  # [comps, Cout, Cin, kh, kw]
+    out_dtype = weight.dtype if dtype is None else dtype
+    return [g.to(out_dtype).contiguous(memory_format=torch.channels_last) for g in gs]
 
 
 # Spatial filter transforms G of F(2x2, 3x3) and F(4x4, 3x3) (Lavin & Gray; points 0, +-1, +-2
@@ -344,18 +386,19 @@ _WINO_G = {
 }
 
 
-def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2) -> torch.Tensor:
-    """``[Cout, Cin, 3, 3, 3]`` -> ``U [4 * (tile+2)^2, Cin, Cout]`` fp16: the four temporal
+def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2, order: int = 2) -> torch.Tensor:
+    """``[Cout, Cin, 3, 3, 3]`` -> ``U [(order+2) * (tile+2)^2, Cin, Cout]`` fp16: the temporal
     components of :func:`winograd_weights`, each transformed as ``G g G^T`` for spatial
     F(tile x tile, 3x3), ordered ``component * (tile+2)^2 + row * (tile+2) + col`` to match
     ``trtllm::vae_wino_spatial_in``. The transformed data is fp16 end to end (V, U, M)."""
-    g0, g1, g2 = (weight[:, :, i].detach().double() for i in range(3))
-    comps = torch.stack([g0, (g0 + g1 + g2) / 2, (g0 - g1 + g2) / 2, g2])  # [4, Cout, Cin, 3, 3]
+    taps = weight.detach().double()  # [Cout, Cin, 3, 3, 3]
+    gt = torch.tensor(TEMPORAL_WINO[order]["G"], dtype=torch.float64, device=weight.device)
+    comps = torch.einsum("kt,oitab->koiab", gt, taps)  # [comps, Cout, Cin, 3, 3]
     gm = _WINO_G[tile].to(weight.device)
-    u = torch.einsum("xa,noiab,yb->nxyoi", gm, comps, gm)  # [4, a, a, Cout, Cin]
+    u = torch.einsum("xa,noiab,yb->nxyoi", gm, comps, gm)  # [comps, a, a, Cout, Cin]
     cout, cin = weight.shape[:2]
     coords = (tile + 2) ** 2
-    return u.reshape(4 * coords, cout, cin).transpose(1, 2).contiguous().to(torch.float16)
+    return u.reshape((order + 2) * coords, cout, cin).transpose(1, 2).contiguous().to(torch.float16)
 
 
 def winograd_spatial_taps_weights(weight: torch.Tensor, tile: int, taps: int) -> torch.Tensor:
@@ -623,9 +666,12 @@ def wino_norm_silu_cuda(
     frames: int,
     *,
     reference_rounding: bool = False,
+    order: int = 2,
+    half_slabs: bool = False,
 ) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
-    """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/2, P, C]``, cache ``[0..2, P, C]``).
-    Returns ``(sum or None, y_tail [2, P, C], D [4, T/2, P, C])``; ``D[k]`` is slab k."""
+    """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
+    ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
+    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16."""
     s, y_tail, d = torch.ops.trtllm.vae_wino_norm_silu(
         x,
         m,
@@ -637,15 +683,26 @@ def wino_norm_silu_cuda(
         float(scale),
         reference_rounding,
         frames,
+        order,
+        half_slabs,
     )
     return (s if s.numel() else None), y_tail, d
 
 
 def wino_combine_reference(m: list[torch.Tensor]) -> torch.Tensor:
-    """``m[k] [pairs, P, C]`` -> frames ``[2*pairs, P, C]``: even = (m0 + m1) + m2, odd = (m1 - m2) - m3."""
-    even = (m[0] + m[1]) + m[2]
-    odd = (m[1] - m[2]) - m[3]
-    return torch.stack([even, odd], dim=1).reshape(2 * m[0].shape[0], *m[0].shape[1:])
+    """``m[k] [groups, P, C]`` (``order + 2`` of them) -> bf16 frames ``[order*groups, P, C]``:
+    frame j of a group is ``sum_k AT[j][k] m_k`` in index order with bf16 rounding after every
+    add (the products are exact: powers of two)."""
+    order = len(m) - 2
+    at = TEMPORAL_WINO[order]["AT"]
+    frames = []
+    for row in at:
+        terms = [(c, m[k]) for k, c in enumerate(row) if c != 0]
+        acc = (terms[0][0] * terms[0][1].float()).to(torch.bfloat16)
+        for c, mk in terms[1:]:
+            acc = (acc.float() + c * mk.float()).to(torch.bfloat16)
+        frames.append(acc)
+    return torch.stack(frames, dim=1).reshape(order * m[0].shape[0], *m[0].shape[1:])
 
 
 def wino_norm_silu_reference(
@@ -657,8 +714,11 @@ def wino_norm_silu_reference(
     gamma: torch.Tensor,
     bias: torch.Tensor | float,
     scale: float,
+    order: int = 2,
+    slab_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
-    """Eager form of the kernel, same rounding points (bf16 after every add)."""
+    """Eager form of the kernel, same rounding points (bf16 after every add of the combine,
+    the slabs formed in fp32 and rounded once to ``slab_dtype``)."""
     if x is None:
         assert m is not None
         x = wino_combine_reference(m)
@@ -676,13 +736,11 @@ def wino_norm_silu_reference(
     cache_frames = cache.shape[0] if cache is not None else 0
     pad = torch.zeros(2 - cache_frames, p, c, dtype=x.dtype, device=x.device)
     hist = torch.cat([pad, cache], 0) if cache is not None and cache_frames else pad
-    f = torch.cat([hist, y], 0)  # frames -2 .. T-1
-    d = [[], [], [], []]
-    for pr in range(t // 2):
-        f0, f1, f2, f3 = f[2 * pr], f[2 * pr + 1], f[2 * pr + 2], f[2 * pr + 3]
-        for k, v in enumerate((f0 - f2, f1 + f2, f2 - f1, f1 - f3)):
-            d[k].append(v)
-    return s, y[-2:].contiguous(), [torch.stack(dk) for dk in d]
+    f = torch.cat([hist, y], 0).float()  # frames -2 .. T-1
+    bt = torch.tensor(TEMPORAL_WINO[order]["BT"], dtype=torch.float32, device=x.device)
+    groups = f.unfold(0, order + 2, order)  # [groups, P, C, order+2]
+    d = torch.einsum("ki,gpci->kgpc", bt, groups).to(slab_dtype)
+    return s, y[-2:].contiguous(), [d[k] for k in range(order + 2)]
 
 
 # ---------------------------------------------------------------------------

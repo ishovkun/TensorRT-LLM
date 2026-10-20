@@ -19,7 +19,9 @@
 #include "tensorrt_llm/common/packedVector.cuh"
 #include "vaeFrameOpsKernel.h"
 #include "vaeNormCommon.cuh"
+#include "vaeWinoTables.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -32,6 +34,7 @@ namespace
 
 using common::PackedAligned;
 using namespace vae_norm;
+using namespace vae_wino;
 
 constexpr int kThreads = 256;
 using T = __nv_bfloat16;
@@ -43,12 +46,69 @@ __device__ __forceinline__ float2 roundPair(float2 v)
     return Elem<T>::toFloat2(Elem<T>::fromFloat2(v));
 }
 
-// One thread per 16-byte output vector; grid-stride. The m pointers are selected
-// with a branch on the frame parity (never indexed at runtime).
-template <bool IN_WINO, bool HAS_BIAS, bool HAS_RESIDUAL>
-__global__ void __launch_bounds__(kThreads) vaeWinoCombineKernel(T const* __restrict__ x, T const* __restrict__ m0,
-    T const* __restrict__ m1, T const* __restrict__ m2, T const* __restrict__ m3, T const* __restrict__ bias,
-    T const* __restrict__ residual, T* __restrict__ y, VaeWinoCombineParams p)
+template <int I, typename TD>
+__device__ __forceinline__ TD const* pick(
+    TD const* m0, TD const* m1, TD const* m2, TD const* m3, TD const* m4, TD const* m5)
+{
+    if constexpr (I == 0)
+        return m0;
+    else if constexpr (I == 1)
+        return m1;
+    else if constexpr (I == 2)
+        return m2;
+    else if constexpr (I == 3)
+        return m3;
+    else if constexpr (I == 4)
+        return m4;
+    else
+        return m5;
+}
+
+// Output frame j of a group: sum_k AT[j][k] m_k in index order, rounded to bf16 after every
+// add (the products are exact: every AT entry is a power of two).
+template <typename TD, int R, int J>
+__device__ __forceinline__ Vec combineRow(
+    TD const* m0, TD const* m1, TD const* m2, TD const* m3, TD const* m4, TD const* m5, int64_t mIdx)
+{
+    using W = Wino<R>;
+    using VecD = PackedAligned<TD, V>;
+    constexpr int n = numTerms<R>(J);
+    VecD in[n];
+    in[0] = *reinterpret_cast<VecD const*>(pick<termIndex<R>(J, 0)>(m0, m1, m2, m3, m4, m5) + mIdx * V);
+    if constexpr (n > 1)
+        in[1] = *reinterpret_cast<VecD const*>(pick<termIndex<R>(J, 1)>(m0, m1, m2, m3, m4, m5) + mIdx * V);
+    if constexpr (n > 2)
+        in[2] = *reinterpret_cast<VecD const*>(pick<termIndex<R>(J, 2)>(m0, m1, m2, m3, m4, m5) + mIdx * V);
+    if constexpr (n > 3)
+        in[3] = *reinterpret_cast<VecD const*>(pick<termIndex<R>(J, 3)>(m0, m1, m2, m3, m4, m5) + mIdx * V);
+    if constexpr (n > 4)
+        in[4] = *reinterpret_cast<VecD const*>(pick<termIndex<R>(J, 4)>(m0, m1, m2, m3, m4, m5) + mIdx * V);
+    Vec out;
+    constexpr float c0 = W::at(J, termIndex<R>(J, 0));
+#pragma unroll
+    for (int i = 0; i < V / 2; ++i)
+    {
+        float2 const a = pairAt(in[0], i);
+        float2 v = make_float2(c0 * a.x, c0 * a.y);
+#pragma unroll
+        for (int q = 1; q < n; ++q)
+        {
+            float const cq = W::at(J, termIndex<R>(J, q)); // constant after unrolling
+            float2 const mq = pairAt(in[q], i);
+            v = roundPair(make_float2(v.x + cq * mq.x, v.y + cq * mq.y));
+        }
+        setPair(out, i, v);
+    }
+    return out;
+}
+
+// One thread per 16-byte output vector; grid-stride. With IN_WINO the frames are the
+// temporal Winograd combine of the order + 2 products (TD: their dtype).
+template <typename TD, int R, bool IN_WINO, bool HAS_BIAS, bool HAS_RESIDUAL>
+__global__ void __launch_bounds__(kThreads)
+    vaeWinoCombineKernel(T const* __restrict__ x, TD const* __restrict__ m0, TD const* __restrict__ m1,
+        TD const* __restrict__ m2, TD const* __restrict__ m3, TD const* __restrict__ m4, TD const* __restrict__ m5,
+        T const* __restrict__ bias, T const* __restrict__ residual, T* __restrict__ y, VaeWinoCombineParams p)
 {
     int const C = p.channels;
     int const cvec = C / V;
@@ -75,19 +135,24 @@ __global__ void __launch_bounds__(kThreads) vaeWinoCombineKernel(T const* __rest
         Vec out;
         if constexpr (IN_WINO)
         {
-            int64_t const mIdx = static_cast<int64_t>(t >> 1) * rowVecs + inFrame;
-            bool const odd = (t & 1) != 0;
-            Vec const a = *reinterpret_cast<Vec const*>((odd ? m1 : m0) + mIdx * V);
-            Vec const b = *reinterpret_cast<Vec const*>((odd ? m2 : m1) + mIdx * V);
-            Vec const c = *reinterpret_cast<Vec const*>((odd ? m3 : m2) + mIdx * V);
-            float const sgn = odd ? -1.0f : 1.0f;
-#pragma unroll
-            for (int i = 0; i < V / 2; ++i)
+            int64_t const mIdx = static_cast<int64_t>(t / R) * rowVecs + inFrame;
+            switch (t % R)
             {
-                float2 const fa = pairAt(a, i), fb = pairAt(b, i), fc = pairAt(c, i);
-                float2 v = roundPair(make_float2(fa.x + sgn * fb.x, fa.y + sgn * fb.y));
-                v = roundPair(make_float2(v.x + sgn * fc.x, v.y + sgn * fc.y));
-                setPair(out, i, v);
+            case 0: out = combineRow<TD, R, 0>(m0, m1, m2, m3, m4, m5, mIdx); break;
+            case 1: out = combineRow<TD, R, 1>(m0, m1, m2, m3, m4, m5, mIdx); break;
+            default:
+                if constexpr (R == 4)
+                {
+                    if (t % R == 2)
+                        out = combineRow<TD, R, 2>(m0, m1, m2, m3, m4, m5, mIdx);
+                    else
+                        out = combineRow<TD, R, 3>(m0, m1, m2, m3, m4, m5, mIdx);
+                }
+                else
+                {
+                    out = combineRow<TD, R, 1>(m0, m1, m2, m3, m4, m5, mIdx);
+                }
+                break;
             }
         }
         else
@@ -119,8 +184,8 @@ __global__ void __launch_bounds__(kThreads) vaeWinoCombineKernel(T const* __rest
 }
 
 // One thread per (output pixel, 8 output channels): y = x + mean over the group.
-__global__ void __launch_bounds__(kThreads) vaeAvgDownAddKernel(T const* __restrict__ x, T const* __restrict__ r,
-    T const* __restrict__ bias, T* __restrict__ y, VaeAvgDownParams p)
+__global__ void __launch_bounds__(kThreads) vaeAvgDownAddKernel(
+    T const* __restrict__ x, T const* __restrict__ r, T const* __restrict__ bias, T* __restrict__ y, VaeAvgDownParams p)
 {
     int const cvec = p.cout / V;
     int64_t const total = static_cast<int64_t>(p.outFrames) * p.outPositions * cvec;
@@ -246,22 +311,35 @@ unsigned gridFor(int64_t total)
     return static_cast<unsigned>(blocks < cap ? blocks : cap);
 }
 
-template <bool IN_WINO, bool HAS_BIAS>
+template <typename TD, int R, bool IN_WINO, bool HAS_BIAS>
 void launchCombineRes(
     VaeWinoCombinePointers const& in, VaeWinoCombineParams const& p, unsigned blocks, cudaStream_t stream)
 {
     auto const* x = static_cast<T const*>(in.x);
-    auto const* m0 = static_cast<T const*>(in.m[0]);
-    auto const* m1 = static_cast<T const*>(in.m[1]);
-    auto const* m2 = static_cast<T const*>(in.m[2]);
-    auto const* m3 = static_cast<T const*>(in.m[3]);
+    TD const* m[6];
+    for (int k = 0; k < 6; ++k)
+    {
+        m[k] = static_cast<TD const*>(in.m[k]);
+    }
     auto const* b = static_cast<T const*>(in.bias);
     auto const* r = static_cast<T const*>(in.residual);
     auto* y = static_cast<T*>(in.y);
     if (in.residual != nullptr)
-        vaeWinoCombineKernel<IN_WINO, HAS_BIAS, true><<<blocks, kThreads, 0, stream>>>(x, m0, m1, m2, m3, b, r, y, p);
+        vaeWinoCombineKernel<TD, R, IN_WINO, HAS_BIAS, true>
+            <<<blocks, kThreads, 0, stream>>>(x, m[0], m[1], m[2], m[3], m[4], m[5], b, r, y, p);
     else
-        vaeWinoCombineKernel<IN_WINO, HAS_BIAS, false><<<blocks, kThreads, 0, stream>>>(x, m0, m1, m2, m3, b, r, y, p);
+        vaeWinoCombineKernel<TD, R, IN_WINO, HAS_BIAS, false>
+            <<<blocks, kThreads, 0, stream>>>(x, m[0], m[1], m[2], m[3], m[4], m[5], b, r, y, p);
+}
+
+template <typename TD, int R, bool IN_WINO>
+void launchCombineBias(
+    VaeWinoCombinePointers const& in, VaeWinoCombineParams const& p, unsigned blocks, cudaStream_t stream)
+{
+    if (in.bias != nullptr)
+        launchCombineRes<TD, R, IN_WINO, true>(in, p, blocks, stream);
+    else
+        launchCombineRes<TD, R, IN_WINO, false>(in, p, blocks, stream);
 }
 
 } // namespace
@@ -270,8 +348,10 @@ void launchVaeWinoCombine(VaeWinoCombinePointers const& in, VaeWinoCombineParams
 {
     TLLM_CHECK_WITH_INFO(p.channels > 0 && p.channels % V == 0, "vaeWinoCombine: channels must be a multiple of %d", V);
     TLLM_CHECK_WITH_INFO((in.x == nullptr) != (in.m[0] == nullptr), "vaeWinoCombine: exactly one of x and m");
+    bool const wino = in.x == nullptr;
+    TLLM_CHECK_WITH_INFO(!wino || p.order == 2 || p.order == 4, "vaeWinoCombine: order must be 2 or 4");
     TLLM_CHECK_WITH_INFO(
-        in.x != nullptr || p.frames % 2 == 0, "vaeWinoCombine: Winograd input needs an even frame count");
+        !wino || p.frames % p.order == 0, "vaeWinoCombine: Winograd input needs a frame count divisible by the order");
     TLLM_CHECK_WITH_INFO(
         static_cast<int64_t>(p.height) * p.width == p.positions, "vaeWinoCombine: height*width must equal positions");
     int64_t const total = static_cast<int64_t>(p.frames) * (p.height + p.padH) * (p.width + p.padW) * (p.channels / V);
@@ -280,17 +360,14 @@ void launchVaeWinoCombine(VaeWinoCombinePointers const& in, VaeWinoCombineParams
         return;
     }
     unsigned const blocks = gridFor(total);
-    bool const wino = in.x == nullptr;
-    bool const hasBias = in.bias != nullptr;
-    if (wino && hasBias)
-        launchCombineRes<true, true>(in, p, blocks, stream);
-    else if (wino)
-        launchCombineRes<true, false>(in, p, blocks, stream);
-    else if (hasBias)
-        launchCombineRes<false, true>(in, p, blocks, stream);
+    if (!wino)
+        launchCombineBias<T, 2, false>(in, p, blocks, stream);
+    else if (p.order == 4)
+        launchCombineBias<__half, 4, true>(in, p, blocks, stream); // order 4 products are fp16
+    else if (p.halfProducts)
+        launchCombineBias<__half, 2, true>(in, p, blocks, stream);
     else
-        launchCombineRes<false, false>(in, p, blocks, stream);
-    sync_check_cuda_error(stream);
+        launchCombineBias<T, 2, true>(in, p, blocks, stream);
 }
 
 void launchVaeAvgDownAdd(
@@ -303,8 +380,8 @@ void launchVaeAvgDownAdd(
     {
         return;
     }
-    vaeAvgDownAddKernel<<<gridFor(total), kThreads, 0, stream>>>(static_cast<T const*>(x), static_cast<T const*>(r),
-        static_cast<T const*>(bias), static_cast<T*>(y), p);
+    vaeAvgDownAddKernel<<<gridFor(total), kThreads, 0, stream>>>(
+        static_cast<T const*>(x), static_cast<T const*>(r), static_cast<T const*>(bias), static_cast<T*>(y), p);
     sync_check_cuda_error(stream);
 }
 

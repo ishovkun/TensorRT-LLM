@@ -33,8 +33,10 @@ tensorrt_llm::kernels::VaeWinoSpatialParams params(
     torch::Tensor const& frames, int64_t components, int64_t row0, int64_t row1, int64_t tile)
 {
     TORCH_CHECK(frames.dim() == 4, "frames must be [N, H, W, C]");
-    CHECK_INPUT(frames, torch::kBFloat16);
+    bool const half = frames.scalar_type() == torch::kHalf;
+    CHECK_INPUT(frames, (half ? torch::kHalf : torch::kBFloat16));
     tensorrt_llm::kernels::VaeWinoSpatialParams p{};
+    p.halfFrames = half ? 1 : 0;
     p.frames = static_cast<int>(frames.size(0));
     p.height = static_cast<int>(frames.size(1));
     p.width = static_cast<int>(frames.size(2));
@@ -47,7 +49,7 @@ tensorrt_llm::kernels::VaeWinoSpatialParams params(
 }
 } // namespace
 
-// V = B^T d B for tile rows [row0, row1): frames [N, H, W, C] bf16 -> fp16
+// V = B^T d B for tile rows [row0, row1): frames [N, H, W, C] bf16 or fp16 -> fp16
 // [components*(tile+2)^2, (N/components)*ntiles, C], or with stack_frames (components == 1)
 // [(tile+2)^2, ntiles, N*C]: the frames side by side along the GEMM's K axis.
 torch::Tensor vae_wino_spatial_in(
@@ -75,7 +77,7 @@ torch::Tensor vae_wino_spatial_out(torch::Tensor const& m, torch::Tensor const& 
     void const* biasPtr = nullptr;
     if (bias.has_value())
     {
-        CHECK_INPUT(bias.value(), torch::kBFloat16);
+        CHECK_INPUT(bias.value(), frames.scalar_type());
         TORCH_CHECK(bias->dim() == 1 && bias->size(0) == p.channels, "bias must be [C]");
         biasPtr = bias->data_ptr();
     }

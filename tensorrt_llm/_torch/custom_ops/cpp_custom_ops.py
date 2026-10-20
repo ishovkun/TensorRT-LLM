@@ -208,23 +208,44 @@ def _register_fake():
                                2 * (temp.shape[3] - 1)))
 
     @torch.library.register_fake("trtllm::vae_wino_norm_silu")
-    def _(x, m, residual, in_bias, cache, gamma, bias, scale,
-          reference_rounding, frames):
+    def _(x,
+          m,
+          residual,
+          in_bias,
+          cache,
+          gamma,
+          bias,
+          scale,
+          reference_rounding,
+          frames,
+          order=2,
+          half_slabs=False):
         src = x if x is not None else m[0]
-        pair = (frames // 2, src.shape[1], src.shape[2])
+        group = (frames // order, src.shape[1], src.shape[2])
         full = (frames, src.shape[1], src.shape[2])
-        return (src.new_empty(full if residual is not None else (0, )),
-                src.new_empty((2, ) + full[1:]), src.new_empty((4, ) + pair))
+        slab_dtype = torch.float16 if half_slabs else torch.bfloat16
+        return (gamma.new_empty(full if residual is not None else (0, )),
+                gamma.new_empty((2, ) + full[1:]),
+                gamma.new_empty((order + 2, ) + group, dtype=slab_dtype))
 
     @torch.library.register_fake("trtllm::vae_wino_combine")
     def _(x, m, bias, residual, frames, height, width, pad_h, pad_w):
         src = x if x is not None else m[0]
         return src.new_empty(
-            (frames, (height + pad_h) * (width + pad_w), src.shape[2]))
+            (frames, (height + pad_h) * (width + pad_w), src.shape[2]),
+            dtype=torch.bfloat16)
 
     @torch.library.register_fake("trtllm::vae_avg_down_add")
-    def _(x, r, out_height, out_width, in_width, factor_t, factor_s, group_size,
-          pad_t, bias=None):
+    def _(x,
+          r,
+          out_height,
+          out_width,
+          in_width,
+          factor_t,
+          factor_s,
+          group_size,
+          pad_t,
+          bias=None):
         return x.new_empty(x.shape)
 
     @torch.library.register_fake("trtllm::vae_unpatchify_clamp")
