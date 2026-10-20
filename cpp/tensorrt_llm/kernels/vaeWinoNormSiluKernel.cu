@@ -67,11 +67,13 @@ __device__ __forceinline__ float addR(float a, float b)
 
 // Resident blocks per SM the register budget is sized for. Per-thread state is bounded
 // independently of K: the row being normalized (K vectors) plus two vector slices of
-// inputs in flight; the frame history lives in shared memory.
-template <int K, bool IN_WINO>
+// inputs in flight; the frame history lives in shared memory. Order 4 holds up to five
+// products per slice and emits five slabs from one frame: at the order-2 budgets it spills
+// (measured: 11-19 M local loads per launch, DRAM 44-62%), so it runs two blocks per SM.
+template <int K, bool IN_WINO, int R>
 constexpr int blocksPerSm()
 {
-    if (K >= 4)
+    if (K >= 4 || R == 4)
     {
         return 2;                        // ~110 registers; bytes in flight come from the deeper slice pipeline
     }
@@ -110,7 +112,7 @@ __device__ __forceinline__ int ringSlot(int frame)
 // D0..D4 by the group's third frame, D5 by its fourth).
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
     bool HAS_RESIDUAL, bool IN_WINO>
-__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
+__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R>())
     vaeWinoNormSiluKernel(Ptrs<T, TD> ptrs, VaeWinoNormParams p)
 {
     using Vec = PackedAligned<T, V>;
@@ -496,17 +498,24 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
                     setPair(yk, i, r);
                 }
                 storeVec(ySlot, k, yk);
-                Vec hist[J + 2];
-#pragma unroll
-                for (int i = 0; i < J + 2; ++i)
-                {
-                    hist[i] = loadVec(slotPtr(ringSlot<R>(t0 - 2 + i)), k);
-                }
                 auto emit = [&](auto sTag)
                 {
                     constexpr int s = decltype(sTag)::value;
                     if constexpr (s < W::kComps && lastFrameOf<R>(s) == J + 2)
                     {
+                        // Each slab reloads the ring frames it reads (the barrier stops the
+                        // compiler from hoisting them across slabs): a few extra LDS keep the
+                        // live set small enough not to spill.
+                        asm volatile("" ::: "memory");
+                        Vec hs[J + 2];
+#pragma unroll
+                        for (int fi = 0; fi < J + 2; ++fi)
+                        {
+                            if (W::bt(s, fi) != 0.0f)
+                            {
+                                hs[fi] = loadVec(slotPtr(ringSlot<R>(t0 - 2 + fi)), k);
+                            }
+                        }
                         VecD o;
 #pragma unroll
                         for (int i = 0; i < V / 2; ++i)
@@ -522,7 +531,7 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO>())
                                 if (coef != 0.0f)
                                 {
                                     float2 const fv
-                                        = (fi == J + 2) ? pairAt(yk, i) : pairAt(hist[fi < J + 2 ? fi : 0], i);
+                                        = (fi == J + 2) ? pairAt(yk, i) : pairAt(hs[fi < J + 2 ? fi : 0], i);
                                     if (first)
                                     {
                                         acc = make_float2(coef * fv.x, coef * fv.y);
@@ -616,7 +625,7 @@ void launchConfig(Ptrs<T, TD> const& ptrs, VaeWinoNormParams const& p, cudaStrea
     int sms = 0;
     TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
     int64_t const steps = (p.positions + kPosPerBlock - 1) / kPosPerBlock;
-    int64_t const persistent = static_cast<int64_t>(sms) * blocksPerSm<K, IN_WINO>();
+    int64_t const persistent = static_cast<int64_t>(sms) * blocksPerSm<K, IN_WINO, R>();
     unsigned const blocks = static_cast<unsigned>(steps < persistent ? steps : persistent);
     kernel<<<blocks, kThreads, smem, stream>>>(ptrs, p);
 }
