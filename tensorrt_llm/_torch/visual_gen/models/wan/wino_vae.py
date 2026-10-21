@@ -1819,10 +1819,20 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
         """The eager attention on the whole frame: gather the ranks' slices, run, keep ours."""
         shard = self.shard
         dim = 3 if shard.axis == "h" else 4
-        parts = [torch.empty_like(x) for _ in range(shard.world_size)]
-        torch.distributed.all_gather(parts, x.contiguous(), group=shard.pg)
-        full = super().forward(torch.cat(parts, dim=dim))
-        return torch.narrow(full, dim, shard.rank * x.shape[dim], x.shape[dim])
+        extents = shard.output_extents(x.shape[dim])
+        widest = max(extents)
+        send = x.contiguous()
+        if x.shape[dim] != widest:
+            shape = list(x.shape)
+            shape[dim] = widest
+            send = x.new_zeros(shape)
+            send.narrow(dim, 0, x.shape[dim]).copy_(x)
+        parts = [torch.empty_like(send) for _ in range(shard.world_size)]
+        torch.distributed.all_gather(parts, send, group=shard.pg)
+        full = super().forward(
+            torch.cat([p.narrow(dim, 0, e) for p, e in zip(parts, extents)], dim=dim)
+        )
+        return torch.narrow(full, dim, sum(extents[: shard.rank]), x.shape[dim])
 
     def forward(self, x: "torch.Tensor | PendingAdd") -> "torch.Tensor | PendingAdd":  # type: ignore[override]
         x = _tensor(x)
@@ -1860,8 +1870,17 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
             )
             all_rows = self.shard.gather_rows(normed_rows)
             kv = torch.addmm(self.to_qkv.bias[channels:], all_rows, w_qkv[channels:].t())
-            kv = kv.view(self.shard.world_size, frames, positions, 2 * channels)
-            kv = kv.permute(1, 0, 2, 3).reshape(frames, 1, -1, 2 * channels)
+            if self.shard.uneven:
+                # Rank-major rows of unequal counts: per rank [T, P_r, 2C], joined along P.
+                counts = self.shard.row_counts(normed_rows.shape[0])
+                per_rank = [
+                    part.view(frames, n // frames, 2 * channels)
+                    for part, n in zip(kv.split(counts), counts)
+                ]
+                kv = torch.cat(per_rank, dim=1).unsqueeze(1)
+            else:
+                kv = kv.view(self.shard.world_size, frames, positions, 2 * channels)
+                kv = kv.permute(1, 0, 2, 3).reshape(frames, 1, -1, 2 * channels)
             k, v = kv.chunk(2, dim=-1)
         attn = F.scaled_dot_product_attention(q, k, v)  # [T, 1, HW, C]
         attn_rows = attn.reshape(frames * positions, channels)

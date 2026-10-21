@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import shard_extents
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import WinoVae, WinoVaeOptions
 from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
@@ -133,7 +134,13 @@ def _rel_l2(got: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def _check(
-    got: torch.Tensor, single: torch.Tensor, ref32: torch.Tensor, split_dim: str, what: str
+    got: torch.Tensor,
+    single: torch.Tensor,
+    ref32: torch.Tensor,
+    split_dim: str,
+    what: str,
+    in_size: int,
+    align: int = 1,
 ) -> None:
     """The sharded result must sit as close to the fp32 reference as the single-GPU one
     (different conv algorithms and Winograd tile phases change the bf16 rounding, so the two
@@ -150,19 +157,31 @@ def _check(
     line = err.mean(dim=dims)
     n = line.shape[0]
     world = dist.get_world_size()
-    seam = max(line[b - 1 : b + 1].max().item() for b in range(n // world, n, n // world))
+    # Rank boundaries in output lines: the input-side shard extents (``in_size`` along the
+    # split axis, in units of ``align``) scaled to the output resolution.
+    units = shard_extents(in_size, world, align)
+    bounds = [sum(units[:r]) * n // in_size for r in range(1, world)]
+    seam = max(line[b - 1 : b + 1].max().item() for b in bounds)
     assert seam <= 2.5 * line.median().item() + 1e-4, (
         f"{what}: error at the rank boundary {seam:.3e} vs median line {line.median().item():.3e}"
     )
 
 
-def _logic_decode(rank: int, world_size: int, split_dim: str, option_set: str, frames: int):
+def _logic_decode(
+    rank: int,
+    world_size: int,
+    split_dim: str,
+    option_set: str,
+    frames: int,
+    latent_hw: tuple[int, int] = (8, 12),
+):
     device = f"cuda:{rank}"
     options = OPTION_SETS[option_set]
     model, native = _model(device, options)
     gen = torch.Generator().manual_seed(1)
-    # Latent 8 x 12: divisible by two along either axis; pixels 128 x 192.
-    latent = torch.randn(1, SMALL_CONFIG["z_dim"], frames, 8, 12, generator=gen).to(
+    # Latent 8 x 12 (pixels 128 x 192) divides by two and four along either axis; 9 x 13
+    # divides along neither, exercising unequal shards.
+    latent = torch.randn(1, SMALL_CONFIG["z_dim"], frames, *latent_hw, generator=gen).to(
         device, torch.bfloat16
     )
     with torch.inference_mode():
@@ -170,21 +189,43 @@ def _logic_decode(rank: int, world_size: int, split_dim: str, option_set: str, f
         single = model.decode(latent, return_dict=False)[0].clone()
         parallel = _parallel(model, world_size, split_dim)
         got = parallel.decode(latent, return_dict=False)[0]
-    _check(got, single, ref32, split_dim, f"rank {rank}: decode {split_dim} {option_set}")
+    _check(
+        got,
+        single,
+        ref32,
+        split_dim,
+        f"rank {rank}: decode {split_dim} {option_set}",
+        latent_hw[0 if split_dim == "height" else 1],
+    )
 
 
-def _logic_encode(rank: int, world_size: int, split_dim: str, option_set: str, frames: int):
+def _logic_encode(
+    rank: int,
+    world_size: int,
+    split_dim: str,
+    option_set: str,
+    frames: int,
+    pixel_hw: tuple[int, int] = (128, 192),
+):
     device = f"cuda:{rank}"
     options = OPTION_SETS[option_set]
     model, native = _model(device, options)
     gen = torch.Generator().manual_seed(2)
-    pixels = (torch.rand(1, 3, frames, 128, 192, generator=gen) * 2 - 1).to(device, torch.bfloat16)
+    pixels = (torch.rand(1, 3, frames, *pixel_hw, generator=gen) * 2 - 1).to(device, torch.bfloat16)
     with torch.inference_mode():
         ref32 = native.encode(pixels.float(), return_dict=False)[0].mode()
         single = model.encode(pixels, return_dict=False)[0].mode().clone()
         parallel = _parallel(model, world_size, split_dim)
         got = parallel.encode(pixels, return_dict=False)[0].mode()
-    _check(got, single, ref32, split_dim, f"rank {rank}: encode {split_dim} {option_set}")
+    _check(
+        got,
+        single,
+        ref32,
+        split_dim,
+        f"rank {rank}: encode {split_dim} {option_set}",
+        pixel_hw[0 if split_dim == "height" else 1],
+        SMALL_CONFIG["scale_factor_spatial"],
+    )
 
 
 class TestParallelWinoVaeDecode:
@@ -201,6 +242,12 @@ class TestParallelWinoVaeDecode:
     def test_decode_4gpu(self, split_dim: str, option_set: str) -> None:
         _run(4, _logic_decode, split_dim, option_set, 5)
 
+    # Unequal shards: a 9 x 13 latent over four ranks is 3/2/2/2 rows or 4/3/3/3 columns.
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    @pytest.mark.parametrize("option_set", ["all_on", "all_off"])
+    def test_decode_4gpu_uneven(self, split_dim: str, option_set: str) -> None:
+        _run(4, _logic_decode, split_dim, option_set, 5, (9, 13))
+
 
 class TestParallelWinoVaeEncode:
     @pytest.mark.parametrize("split_dim", ["height", "width"])
@@ -210,6 +257,22 @@ class TestParallelWinoVaeEncode:
 
     def test_encode_4gpu(self) -> None:
         _run(4, _logic_encode, "width", "all_on", 9)
+
+    # Unequal shards in 16-pixel units: 144 x 208 pixels is 9 x 13 units over four ranks.
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    def test_encode_4gpu_uneven(self, split_dim: str) -> None:
+        _run(4, _logic_encode, split_dim, "all_on", 9, (144, 208))
+
+
+def test_shard_extents() -> None:
+    assert shard_extents(80, 8) == [10] * 8
+    assert shard_extents(52, 8) == [7, 7, 7, 7, 6, 6, 6, 6]
+    assert shard_extents(13, 4) == [4, 3, 3, 3]
+    assert shard_extents(208, 4, align=16) == [64, 48, 48, 48]
+    with pytest.raises(ValueError):
+        shard_extents(200, 4, align=16)  # not a multiple of the unit
+    with pytest.raises(ValueError):
+        shard_extents(48, 4, align=16)  # fewer units than ranks
 
 
 if __name__ == "__main__":

@@ -63,6 +63,28 @@ class Shard:
         # dropped right after is a race inside a captured CUDA graph (the allocator may hand
         # its block to a later allocation with no graph edge to the pending transfer).
         self._buffers: dict[tuple, torch.Tensor] = {}
+        # Every rank's extent along the split axis in latent units (set by the wrapper at each
+        # split); None means equal shards.
+        self.extents: list[int] | None = None
+
+    def set_extents(self, extents: list[int]) -> None:
+        self.extents = None if len(set(extents)) == 1 else list(extents)
+
+    @property
+    def uneven(self) -> bool:
+        return self.extents is not None
+
+    def output_extents(self, local: int) -> list[int]:
+        """Every rank's extent of a tensor whose local extent along the split axis is
+        ``local`` (the latent-unit extents scaled to that tensor's resolution)."""
+        if self.extents is None:
+            return [local] * self.world_size
+        mine = self.extents[self.rank]
+        if local % mine:
+            raise ValueError(
+                f"a local extent of {local} is not a multiple of the shard's {mine} units"
+            )
+        return [e * (local // mine) for e in self.extents]
 
     @property
     def first(self) -> bool:
@@ -204,10 +226,23 @@ class Shard:
         if recv_right is not None:
             self._line(phys, n).copy_(recv_right)
 
+    def row_counts(self, rows: int) -> list[int]:
+        """Every rank's row count when this rank holds ``rows`` (rows scale with the extent)."""
+        return self.output_extents(rows) if self.extents is not None else [rows] * self.world_size
+
     def gather_rows(self, rows: torch.Tensor) -> torch.Tensor:
         """All ranks' ``rows [N, C]`` concatenated (rank order; the attention keys and values
-        do not depend on the order)."""
-        staged = self._staged("gather_in", rows)
-        out = self._buffer("gather_out", rows.new_empty((self.world_size, *rows.shape)))
+        do not depend on the order). Unequal shards gather into slots of the largest row
+        count and keep each rank's valid rows."""
+        counts = self.row_counts(rows.shape[0])
+        most = max(counts)
+        if most == rows.shape[0]:
+            staged = self._staged("gather_in", rows)
+        else:
+            staged = self._buffer("gather_in", rows.new_empty((most, rows.shape[1])))
+            staged[: rows.shape[0]].copy_(rows)
+        out = self._buffer("gather_out", rows.new_empty((self.world_size, most, rows.shape[1])))
         dist.all_gather(list(out.unbind(0)), staged, group=self.pg)
-        return out.view(-1, rows.shape[-1])
+        if self.extents is None:
+            return out.view(-1, rows.shape[-1])
+        return torch.cat([slot[:n] for slot, n in zip(out.unbind(0), counts)])
