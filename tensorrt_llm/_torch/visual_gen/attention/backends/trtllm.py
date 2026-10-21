@@ -19,10 +19,13 @@ Wraps TrtllmAttention with simplified metadata for visual generation (diffusion)
 Handles the specifics of no-KV-cache operation and fused QKV requirements.
 """
 
+import functools
 from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -37,16 +40,28 @@ from ....attention.backends.sparse.timestep_phase import graph_phase_for_timeste
 from ....attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from ....attention.backends.trtllm import TrtllmAttentionMetadata as BaseTrtllmAttentionMetadata
 from ....metadata import KVCacheParams
-from ...cache import CausalKVCacheManager
+from ...cache import BlockCausalKVCacheManager
 from ...cuda_graph_runner import resolved_extra_key
 from .interface import AttentionBackend, AttentionTensorLayout
 
-# The only page size with shipped trtllm-gen paged context kernels: every paged
-# context cubin under kernels/trtllmGenKernels/fmha/cubin is a ``P32`` variant, and
-# log2(tokens per page) is part of the kernel hash, so any other value has no kernel
-# and the attention op refuses the configuration. Nothing in the tree exposes this
-# number; it lives in the cubin inventory only.
-TRTLLM_GEN_TOKENS_PER_PAGE = 32
+
+@functools.lru_cache(maxsize=None)
+def _paged_context_kernel_exists(
+    head_dim: int, dtype: torch.dtype, tokens_per_page: int, device: int
+) -> bool:
+    """Whether this build has a fused paged context attention kernel for this head size,
+    K/V and output dtype and page size on ``device``'s GPU. Which page sizes exist
+    depends on the GPU family and on the kernels compiled in, so the build is asked.
+    The lookup probes a causal configuration; the full-attention kernels the cache path
+    runs come from the same kernel sets. A missing kernel would make the op fall back to
+    an unfused path that ignores the cached keys, so callers refuse instead."""
+    with torch.cuda.device(device):
+        # The lookup loads cubins through the driver, which needs a current context.
+        torch.empty(1, device="cuda")
+        binding = torch_dtype_to_binding(dtype)
+        return bool(
+            thop.fused_context_fmha_kernel_exists(head_dim, binding, tokens_per_page, binding)
+        )
 
 
 class TrtllmAttentionMetadata:
@@ -191,37 +206,52 @@ class TrtllmAttentionMetadata:
         return self._metadata
 
     def prepare_with_kv_cache(
-        self, kv_cache: CausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
+        self, kv_cache: BlockCausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
     ) -> BaseTrtllmAttentionMetadata:
         """Metadata over ``kv_cache``: ``num_causal_blocks`` context requests of
         ``causal_block_size`` tokens, request ``i`` with the fixed region, its window
-        and the ``i`` earlier blocks already cached (``kv_cache.cached_tokens``). All
-        requests are the one sequence; each reads its own row of the cache's table.
+        and the ``i`` earlier causal blocks already cached (``kv_cache.cached_tokens``).
+        All requests are the one sequence; each reads its own causal block's page list
+        (``kv_cache.causal_block_offsets``).
 
-        One object per (cache, geometry, blocking) for the life of the cache, shared
-        by every layer through the model-scoped state. It is built once, eagerly, and
-        then bound to the cache's own device tensors: the block offsets and the
-        per-block key counts the kernel reads are the cache's, rewritten in place by
+        One object per (geometry, causal block count and size), stored on the cache
+        (``kv_cache.attention_metadata``) and shared by every layer that attends over it;
+        ``BlockCausalKVCacheManager.shutdown`` drops it. It is built once, eagerly, and
+        then bound to the cache's own device tensors: the page offsets and the
+        per-causal-block key counts read by kernel are owned by the cache, rewritten in place by
         ``commit``. So nothing here changes after a commit, and a CUDA graph captured
-        around the forward replays correctly with no refresh. The host-side lengths
-        the op also takes are upper bounds, fixed at the geometry's capacity.
+        around the forward replays correctly with no refresh. The host-side lengths taken
+        by the op bear upper bound values, fixed at the geometry's capacity.
+
+        ``prepare()`` runs exactly once, when the object is built. Right after it, four
+        fields are replaced: ``kv_cache_block_offsets`` and ``kv_lens_cuda_runtime`` by
+        views of the cache's device tensors, ``kv_lens_runtime`` and
+        ``host_total_kv_lens`` by bounds at the pool's capacity. Every other field keeps
+        the value ``prepare()`` computed.
+
+        Mapping onto the LLM attention metadata: each causal block is one context
+        request whose cached past is the fixed region and its window.
+        - ``chunked_prefill=True`` makes each causal block attend to the cached tokens
+          (the fixed region, its window and the earlier causal blocks), not only to its
+          own.
+        - ``max_num_requests = max_num_sequences = max_causal_blocks``: one request per
+          causal block, sized for the most causal blocks any declared causal block size
+          cuts the staged tokens into. At the Cosmos geometry that is 4: 1 per denoising forward,
+          4 in the clean pass.
+        Unlike LLM chunked prefill, the requests are synthetic (no ``LlmRequest``) and
+        all carry request id 0, the mask is FULL within a causal block, and the past is
+        bounded by the window rather than a growing prefix. The total video length is
+        never needed: ``num_causal_blocks`` counts causal blocks per forward.
         """
-        cache_key = (
-            "kv_cache",
-            id(kv_cache),
-            kv_cache.geometry,
-            num_causal_blocks,
-            causal_block_size,
-        )
-        cached = self._metadata_cache.get(cache_key)
+        cache_key = ("trtllm", kv_cache.geometry, num_causal_blocks, causal_block_size)
+        cached = kv_cache.attention_metadata.get(cache_key)
         if cached is not None:
-            return cached["metadata"]
+            return cached
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
                 "K/V cache attention metadata first needed during CUDA graph capture; "
                 "run the forward eagerly once before capturing"
             )
-        self._drop_metadata_of_shut_down_caches()
         n, size = num_causal_blocks, causal_block_size
         metadata = BaseTrtllmAttentionMetadata(
             max_num_requests=kv_cache.max_causal_blocks,
@@ -242,35 +272,20 @@ class TrtllmAttentionMetadata:
         )
         kv_cache.set_causal_block_size(size)
         metadata.prepare()
-        # Each block's row holds the fixed region, its window, the earlier blocks and
-        # then its own tokens; the kernel writes the block right after the cached count,
-        # inside the block's private pages. Both tensors are the cache's.
-        metadata.kv_cache_block_offsets = kv_cache.block_offsets(size)[:, :n]
+        # Each causal block's page list holds the fixed region, its window, the earlier
+        # causal blocks and then its own tokens; the kernel writes the causal block right
+        # after the cached count, inside its private pages. Both tensors are the cache's.
+        metadata.kv_cache_block_offsets = kv_cache.causal_block_offsets(size)[:, :n]
         metadata.kv_lens_cuda_runtime = kv_cache.causal_block_lengths(size)[1][:n]
-        # host_past_key_value_lengths and the context total only bound the kernel's
-        # work; the per-block lengths come from the device tensor above. The bound is
-        # the pool, the most that can ever be resident on it: pin_tokens is not part of
-        # the geometry, so a later rollout of this geometry may hold more than the
-        # current one and still reuse this metadata and the graphs captured over it.
+        # Actual per-causal-block lengths come from the device tensor above. Use pool capacity
+        # as the host upper bound so this metadata and captured graphs remain valid
+        # when the same geometry is reopened with a longer pinned prefix.
         bound = kv_cache.pool_tokens
         metadata.kv_lens_runtime = torch.full((n,), bound, dtype=torch.int32)
         metadata.host_total_kv_lens[0] = n * bound
         metadata.host_total_kv_lens[1] = 0
-        self._metadata_cache[cache_key] = {"metadata": metadata}
+        kv_cache.attention_metadata[cache_key] = metadata
         return metadata
-
-    def _drop_metadata_of_shut_down_caches(self) -> None:
-        """Forget metadata built over caches that were shut down. Each entry holds its
-        cache, so without this a model that builds a new cache per rollout would keep
-        every old one alive. A merely closed cache keeps its metadata: it may be
-        reopened, and graphs captured over it still read those buffers."""
-        stale = [
-            key
-            for key, entry in self._metadata_cache.items()
-            if key[0] == "kv_cache" and entry["metadata"].kv_cache_manager.is_shut_down
-        ]
-        for key in stale:
-            del self._metadata_cache[key]
 
 
 class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
@@ -318,6 +333,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
         # TRTLLM expects flat [B*S, H*D] format
         self._preferred_layout = AttentionTensorLayout.NHD
+        self._dtype = dtype
 
         self.metadata = TrtllmAttentionMetadata(
             attention_metadata_state=attention_metadata_state,
@@ -375,7 +391,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     @torch.compiler.disable
     def _prepare_kv_cache_metadata(
-        self, kv_cache: CausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
+        self, kv_cache: BlockCausalKVCacheManager, num_causal_blocks: int, causal_block_size: int
     ):
         return self.metadata.prepare_with_kv_cache(kv_cache, num_causal_blocks, causal_block_size)
 
@@ -425,7 +441,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len_kv: Optional[int] = None,
         sparse_backend_args: Optional[SparseBackendForwardArgs] = None,
         timestep: Optional[torch.Tensor] = None,
-        kv_cache: Optional[CausalKVCacheManager] = None,
+        kv_cache: Optional[BlockCausalKVCacheManager] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -448,11 +464,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             k: Key tensor [B, S_kv, H_kv, D] or None if fused
             v: Value tensor [B, S_kv, H_kv, D] or None if fused
             batch_size: Batch size
-            seq_len: Number of real query tokens. Without ``kv_cache`` it equals
-                ``S``. With ``kv_cache`` it may be smaller: rows of ``q``/``k``/``v``
-                past ``seq_len`` are padding added so the sequence splits evenly
-                across ranks; they are neither written to the cache nor attended,
-                and their output rows are zero.
+            seq_len: Query length used for metadata and reshaping. Without ``kv_cache``,
+                the Attention module supplies ``S``, including padding. With ``kv_cache``,
+                the caller supplies the real query length, which may be smaller than
+                ``S``; trailing padding is neither cached nor attended and outputs zero.
             attention_mask: Attention mask type
             seq_len_kv: Sequence length for K/V (for cross-attention, defaults to seq_len)
             sparse_backend_args: Module-predicted sparse inputs handed to the core
@@ -464,15 +479,16 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 backends. The TRTLLM kernels have no key-padding input, so callers
                 that need padded keys must guard at the model level or select the
                 ``VANILLA`` backend.
-            kv_cache: A ``CausalKVCacheManager``. When given, ``k``/``v`` are the new
+            kv_cache: A ``BlockCausalKVCacheManager``. When given, ``k``/``v`` are the new
                 tokens only: the fused kernel writes them at ``staging_offset`` and
                 attends over everything cached before them plus themselves.
                 ``batch_size`` must be 1. Sparse attention is not supported on this path.
-            causal_block_size: Keyword understood by the ``kv_cache`` path only. Cuts
-                the new tokens into consecutive causal blocks: full attention within a
-                block, causal across blocks. Use it when the cache must hold each
-                block's K/V as if the blocks had been generated one at a time, so later
-                blocks never leak into earlier ones. Absent: one causal block.
+            causal_block_size: Specifies how the real tokens will be cut into consecutive
+                causal blocks: full attention within a causal block, causal across causal
+                blocks. Requires ``kv_cache``; passing it without one raises. Use it when the
+                cache must hold each causal block's K/V as if the causal blocks had been
+                generated one at a time, so later ones never leak into earlier ones. Absent:
+                one causal block.
 
         Returns:
             Output tensor [B, S, H*D]
@@ -552,7 +568,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         v: Optional[torch.Tensor],
         batch_size: int,
         seq_len: int,
-        kv_cache: CausalKVCacheManager,
+        kv_cache: BlockCausalKVCacheManager,
         causal_block_size: Optional[int],
         attention_mask: PredefinedAttentionMask,
     ) -> torch.Tensor:
@@ -566,7 +582,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             raise NotImplementedError("K/V cache attention does not combine with sparse attention.")
         packed = None
         if k is None and v is None:
-            # q is the fused projection [1, S, H + 2*H_kv, D]: the kernel takes it as
+            # ``q`` contains packed QKV [1, S, H + 2*H_kv, D]. The kernel takes it as
             # it is and the cache takes strided K/V slices of it, so nothing is
             # re-concatenated.
             packed = q
@@ -576,11 +592,12 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             v = packed[:, :, self.num_heads + kv_heads :]
         elif k is None or v is None:
             raise ValueError("K/V cache attention needs separate q, k, v, or one packed qkv.")
-        if kv_cache.tokens_per_page != TRTLLM_GEN_TOKENS_PER_PAGE:
+        if not self.support_kv_cache_page_size(kv_cache.tokens_per_page, q.dtype):
             raise NotImplementedError(
-                f"trtllm-gen ships paged context kernels for {TRTLLM_GEN_TOKENS_PER_PAGE}-token "
-                f"pages only; the cache uses {kv_cache.tokens_per_page}. Build the cache with "
-                f"tokens_per_page={TRTLLM_GEN_TOKENS_PER_PAGE} or use the CUDNN backend."
+                f"This build has no fused paged context attention kernel for "
+                f"{kv_cache.tokens_per_page}-token pages with head_dim {self.head_dim} and "
+                f"{q.dtype} on this GPU. Build the cache with a page size "
+                f"support_kv_cache_page_size() accepts, or use the CUDNN backend."
             )
         batch, num_rows, _, _ = q.shape
         if batch != 1 or batch_size != 1 or k.shape[1] != num_rows:
@@ -607,8 +624,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             if packed is not None:
                 packed = packed[:, :num_tokens]
         causal_block_size, num_causal_blocks = kv_cache.causal_blocks(num_tokens, causal_block_size)
-        # The fused kernel writes each block's own tokens into the block's private
-        # pages; the shared pages, which later blocks and later forwards read, are
+        # The fused kernel writes each causal block's own tokens into its private pages;
+        # the shared pages, which later causal blocks and later forwards read, are
         # staged here.
         kv_cache.write_staged(self.layer_idx, k[0], v[0], causal_block_size, own_tokens=False)
         metadata = self._prepare_kv_cache_metadata(kv_cache, num_causal_blocks, causal_block_size)
@@ -619,6 +636,9 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 [q.reshape(num_tokens, -1), k.reshape(num_tokens, -1), v.reshape(num_tokens, -1)],
                 dim=-1,
             )
+        # FULL is intended: attention within a causal block is full. Causality across
+        # causal blocks and against history comes from each causal block's page list
+        # and key count.
         output = super().forward(
             q=qkv, k=None, v=None, metadata=metadata, attention_mask=PredefinedAttentionMask.FULL
         )
@@ -640,3 +660,13 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
 
     def support_kv_cache(self) -> bool:
         return True
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        dtype = dtype or self._dtype
+        if dtype is None:
+            raise ValueError("support_kv_cache_page_size needs a dtype: the backend has none")
+        return _paged_context_kernel_exists(
+            self.head_dim, dtype, tokens_per_page, torch.cuda.current_device()
+        )

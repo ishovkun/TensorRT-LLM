@@ -30,7 +30,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ...cache import CausalKVCacheManager
+from ...cache import BlockCausalKVCacheManager
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from ...pipeline_registry import register_pipeline
 from ...utils import postprocess_video_tensor
@@ -333,7 +333,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 "running full history within the memory budget instead."
             )
         # One cache is resident at a time, keyed by its frame geometry.
-        self._sim_cache_obj: Optional[CausalKVCacheManager] = None
+        self._sim_cache_obj: Optional[BlockCausalKVCacheManager] = None
         self._sim_cache_key: Optional[int] = None
         # Finished chunks are decoded on this stream while later chunks denoise; on
         # another GPU when one is named, with its own VAE instance.
@@ -483,7 +483,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     def _cache_bytes(self, history_frames: int, tokens_per_frame: int) -> int:
         tf = self.transformer
-        return CausalKVCacheManager.pool_bytes_for(
+        return BlockCausalKVCacheManager.pool_bytes_for(
             num_layers=len(tf.gen_layers),
             num_kv_heads=tf.cache_kv_heads,
             head_dim=tf.gen_layers[0].cross_attention.head_dim,
@@ -533,7 +533,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     # ------------------------------------------------------------------ the rollout
 
-    def _sim_cache(self, tokens_per_frame: int) -> CausalKVCacheManager:
+    def _sim_cache(self, tokens_per_frame: int) -> BlockCausalKVCacheManager:
         """The resident cache for this frame geometry, kept across requests:
         ``close()``/``open()`` keep its device tensors, so graphs captured over it
         stay valid. A request with another geometry replaces it; two pools would
@@ -560,13 +560,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 f"({self.sim.chunk_frames} frames)."
             )
         tf = self.transformer
-        self._sim_cache_obj = CausalKVCacheManager(
+        self._sim_cache_obj = BlockCausalKVCacheManager(
             num_layers=len(tf.gen_layers),
             num_kv_heads=tf.cache_kv_heads,
             head_dim=tf.gen_layers[0].cross_attention.head_dim,
             dtype=self.dtype,
             tokens_per_page=32,
-            pool_tokens=CausalKVCacheManager.pool_tokens_for(
+            pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
                 tokens_per_page=32,
                 pin_tokens=self._max_pin_tokens(tokens_per_frame),
                 **self._cache_geometry(self._history_frames, tokens_per_frame),

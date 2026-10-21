@@ -12,28 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Attention backends over CausalKVCacheManager against a dense SDPA reference.
+"""Attention backends over BlockCausalKVCacheManager against a dense SDPA reference.
 
 Random inputs; the reference keeps its own dense copy of every K/V ever written
 and attends over exactly what the model's window allows: the fixed region (the
-prompt), the ``WINDOW`` tokens before each block, the earlier blocks of the chunk
-and the block itself. Stale tokens the whole-page eviction keeps resident must
-not be seen.
+prompt), the ``WINDOW`` tokens before each causal block, the earlier causal blocks
+of the chunk and the causal block itself. Stale tokens the whole-page eviction keeps
+resident must not be seen.
 """
 
+import gc
+import weakref
 from functools import partial
 from types import SimpleNamespace
 
 import pytest
 import torch
-from utils.kv_causal_reference import exact_reference as _exact_reference
-from utils.kv_causal_reference import reference_attention
+from utils.block_causal_reference import exact_reference as _exact_reference
+from utils.block_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm.visual_gen.args import AttentionConfig
@@ -55,13 +57,13 @@ GEOMETRY = dict(
 
 def make_cache(tokens_per_page, pin_tokens=PROMPT_CAPACITY, geometry=GEOMETRY):
     """A cache whose pool is sized for ``geometry`` with up to ``pin_tokens`` pinned."""
-    return CausalKVCacheManager(
+    return BlockCausalKVCacheManager(
         num_layers=1,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
         dtype=DTYPE,
         tokens_per_page=tokens_per_page,
-        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
             tokens_per_page=tokens_per_page, pin_tokens=pin_tokens, **geometry
         ),
     )
@@ -142,6 +144,11 @@ def open_with_prompt(cache, prompt_len, geometry=GEOMETRY):
 BACKENDS = ["cudnn", "trtllm"]
 
 
+def lacks_kernel(backend, cache):
+    """Whether this build has no attention kernel for the cache's page size on this GPU."""
+    return not make_backend(backend).support_kv_cache_page_size(cache.tokens_per_page)
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize(
     "prompt_len", [0, 17, 64], ids=["no-prompt", "unaligned-prompt", "page-exact-prompt"]
@@ -150,11 +157,10 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
     torch.manual_seed(0)
     prompt_k, prompt_v = open_with_prompt(cache, prompt_len)
     attn = make_backend(backend)
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        # trtllm-gen has paged context kernels for 32-token pages only; other sizes
-        # would silently drop the prefix, so the backend must refuse them.
+    if lacks_kernel(backend, cache):
+        # Without a kernel the op would silently drop the prefix, so the backend refuses.
         q, k, v = rand_qkv(CHUNK)
-        with pytest.raises(NotImplementedError, match="32-token"):
+        with pytest.raises(NotImplementedError, match="no fused paged context attention kernel"):
             run(attn, cache, q, k, v)
         return
 
@@ -190,8 +196,8 @@ def test_rollout_matches_dense_reference(cache, backend, prompt_len):
 
 
 def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_blocks, chunk):
-    """One call cut into causal blocks: block i sees the prompt, its own window of
-    history, the blocks before it and itself. ``hk``/``hv``: all committed history."""
+    """One call cut into causal blocks: causal block i sees the prompt, its own window
+    of history, the causal blocks before it and itself. ``hk``/``hv``: all committed history."""
     causal_block_size = chunk // num_causal_blocks
     q, k, v = rand_qkv(chunk)
     out = run(attn, cache, q, k, v, causal_block_size=causal_block_size)
@@ -222,8 +228,8 @@ def test_causal_blocks_at_any_alignment(cache, backend):
     """The clean pass: one launch, four causal blocks of 10 sharing pages mid-way,
     each with its own window start, over a rotated table with stale tokens."""
     torch.manual_seed(3)
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     pk, pv = open_with_prompt(cache, 9)
     history_k, history_v = [], []
     for _ in range(3):  # 120 tokens committed, one page dropped: 88 resident, 24 stale
@@ -262,15 +268,15 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     read, or a key read twice shows up as a 1, a 0 or a 2 where it should not.
     Covers the window filling (0 and 1 commits) and full (3), and ``sink`` generated
     tokens pinned with the prompt by the first commit."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(7)
     prompt = 9
     fixed = prompt + (sink if commits else 0)
     hist = commits * CHUNK
     total = prompt + hist + CHUNK
     # Watch the prompt, up to the last 79 committed tokens (window edges of every
-    # block and stale tokens), the whole chunk, and ids that never exist: one per
+    # causal block and stale tokens), the whole chunk, and ids that never exist: one per
     # (K/V head, dimension).
     ids = torch.cat(
         [
@@ -303,7 +309,7 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     torch.cuda.synchronize()
 
     token = torch.arange(CHUNK, device=DEVICE)
-    start = token // size * size  # each query's block start within the chunk
+    start = token // size * size  # each query's causal block start within the chunk
     end = start + size
     # Ids are sequence positions before any eviction: fixed [0, fixed), then history.
     g = watch.repeat_interleave(NUM_HEADS // NUM_KV_HEADS, dim=0)[None]  # [1, H, D]
@@ -322,8 +328,8 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
     """``seq_len`` counts the real tokens: a padded chunk behaves like the unpadded one."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(6)
     pk, pv = open_with_prompt(cache, 9)
     attn = make_backend(backend)
@@ -355,8 +361,8 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_dirty_steps_overwrite_in_place(cache, backend):
     """Several forwards at the same ``past`` leave only the last K/V in the cache."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(1)
     open_with_prompt(cache, 9)
     attn = make_backend(backend)
@@ -378,8 +384,8 @@ def test_graph_replay_survives_commit(cache, backend):
     """A forward captured in a CUDA graph stays correct after commit() moves the cache,
     including across a page rotation: writes land on the new pages and attention
     reads the new lengths, with nothing refreshed between commit and replay."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(5)
     pk, pv = open_with_prompt(cache, 9)
     attn = make_backend(backend)
@@ -426,7 +432,7 @@ def test_graph_replay_survives_commit(cache, backend):
 def test_graph_runner_keys_cached_forwards(backend):
     """Through VisualGen's CUDAGraphRunner, the way a model runs: with the real token
     count, the causal block size and the cache registered as extra keys, forwards of
-    equal tensor shapes but different block sizes get their own graphs, and commits
+    equal tensor shapes but different causal block sizes get their own graphs, and commits
     between forwards replay them (the cache's device state needs no recapture)."""
     torch.manual_seed(7)
     cache = make_cache(32)
@@ -470,7 +476,7 @@ def test_graph_runner_keys_cached_forwards(backend):
             cache.commit(CHUNK)
             history_k.append(k)
             history_v.append(v)
-        assert len(runner.graphs) == 2, "one graph per block size, replayed across commits"
+        assert len(runner.graphs) == 2, "one graph per causal block size, replayed across commits"
     finally:
         runner.clear()
         cache.shutdown()
@@ -602,12 +608,26 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
         attn._attn_impl(q, q, q, kv_cache=cache)
 
 
+def test_trtllm_refuses_a_page_size_without_a_kernel(cache, monkeypatch):
+    """Where the build has no paged context kernel for the cache's page size, the TRTLLM
+    backend reports it and refuses the cache instead of running the unfused fallback."""
+    from tensorrt_llm._torch.visual_gen.attention.backends import trtllm as trtllm_backend
+
+    open_with_prompt(cache, 9)
+    attn = make_backend("trtllm")
+    monkeypatch.setattr(trtllm_backend, "_paged_context_kernel_exists", lambda *a: False)
+    assert not attn.support_kv_cache_page_size(cache.tokens_per_page)
+    q, k, v = rand_qkv(CHUNK)
+    with pytest.raises(NotImplementedError, match="no fused paged context attention kernel"):
+        run(attn, cache, q, k, v)
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_with_causal_blocks_over_stale_history(cache, backend):
     """Ulysses padding during the clean pass: four causal blocks over a rotated table
     with stale tokens, plus padding rows that are neither written nor attended."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(9)
     pk, pv = open_with_prompt(cache, 9)
     history_k, history_v = [], []
@@ -646,11 +666,11 @@ def test_padding_with_causal_blocks_over_stale_history(cache, backend):
     torch.testing.assert_close(v_back, v[:CHUNK])
 
 
-@pytest.mark.parametrize("block", [32, 64])
+@pytest.mark.parametrize("causal_block_size", [32, 64])
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_blocks_of_one_and_two_whole_pages(backend, block):
+def test_causal_blocks_of_one_and_two_whole_pages(backend, causal_block_size):
     """Causal blocks exactly one page and exactly two pages long, several per chunk, so
-    block starts and ends fall on page boundaries, through several rotations."""
+    their starts and ends fall on page boundaries, through several rotations."""
     torch.manual_seed(10)
     prompt, window, chunk = 8, 96, 128
     geometry = dict(window_tokens=window, max_staged_tokens=chunk, causal_block_sizes=(128, 64, 32))
@@ -662,15 +682,15 @@ def test_blocks_of_one_and_two_whole_pages(backend, block):
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
         for step in range(6):
             q, k, v = rand_qkv(chunk)
-            out = run(attn, cache, q, k, v, causal_block_size=block)
+            out = run(attn, cache, q, k, v, causal_block_size=causal_block_size)
             torch.cuda.synchronize()
             hk = torch.cat(history_k) if history_k else empty
             hv = torch.cat(history_v) if history_v else empty
             keys, values = torch.cat([pk, hk, k]), torch.cat([pv, hv, v])
             pos = torch.arange(keys.shape[0], device=DEVICE)
             expected = []
-            for start in range(0, chunk, block):
-                end = start + block
+            for start in range(0, chunk, causal_block_size):
+                end = start + causal_block_size
                 visible = (pos < prompt) | (
                     (pos >= prompt + hk.shape[0] + start - window)
                     & (pos < prompt + hk.shape[0] + end)
@@ -690,8 +710,8 @@ def test_blocks_of_one_and_two_whole_pages(backend, block):
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_cache_path_refusals(cache, backend):
     """What the cache path does not support raises instead of computing something else."""
-    if backend == "trtllm" and cache.tokens_per_page != 32:
-        pytest.skip("trtllm-gen: 32-token pages only")
+    if lacks_kernel(backend, cache):
+        pytest.skip("no paged context kernel for this page size in this build")
     open_with_prompt(cache, 9)
     attn = make_backend(backend)
     q, k, v = rand_qkv(CHUNK)
@@ -717,42 +737,36 @@ def test_cache_path_refusals(cache, backend):
             attn.forward(q[None], k[None], v[None], batch_size=1, **common)
 
 
-def test_trtllm_forgets_metadata_of_shut_down_caches():
-    """Metadata holds its cache. Once a cache is shut down, building metadata for the
-    next one drops the old entries, so a cache per rollout does not leak. A merely
-    closed cache keeps its metadata: graphs captured over it still read it."""
+def test_trtllm_metadata_lives_on_the_cache():
+    """The TRTLLM backend keeps the metadata it builds over a cache on that cache and
+    holds no reference to the cache itself. A closed cache keeps its metadata, since
+    graphs captured over it still read it; shutdown() drops it. A cache dropped without
+    shutdown() is reclaimed by the cyclic garbage collector."""
     attn = make_backend("trtllm")
-
-    def held():
-        return {
-            id(e["metadata"].kv_cache_manager)
-            for key, e in attn.metadata._metadata_cache.items()
-            if key[0] == "kv_cache"
-        }
-
-    def new_cache():
-        return make_cache(32)
-
-    caches = [new_cache() for _ in range(3)]
+    cache = make_cache(32)
     try:
-        for rollout, cache in enumerate(caches):
-            open_with_prompt(cache, 9)
-            attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)
-            attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4)
-            assert held() == {id(cache)}, f"rollout {rollout}: metadata of shut-down caches kept"
-            cache.shutdown()
-        reopened, other = new_cache(), new_cache()
-        caches += [reopened, other]
-        open_with_prompt(reopened, 9)
-        attn.metadata.prepare_with_kv_cache(reopened, 1, CHUNK)
-        reopened.close()
-        open_with_prompt(other, 9)
-        attn.metadata.prepare_with_kv_cache(other, 1, CHUNK)
-        assert held() == {id(reopened), id(other)}, "a closed cache must keep its metadata"
+        open_with_prompt(cache, 9)
+        one = attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK)
+        four = attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4)
+        assert len(cache.attention_metadata) == 2
+        assert attn.metadata.prepare_with_kv_cache(cache, 1, CHUNK) is one
+        cache.close()
+        assert len(cache.attention_metadata) == 2
+        open_with_prompt(cache, 9)
+        assert attn.metadata.prepare_with_kv_cache(cache, 4, CHUNK // 4) is four
+        cache.shutdown()
+        assert cache.attention_metadata == {}
     finally:
-        for cache in caches:
-            if not cache.is_shut_down:
-                cache.shutdown()
+        if not cache.is_shut_down:
+            cache.shutdown()
+
+    dropped = make_cache(32)
+    open_with_prompt(dropped, 9)
+    attn.metadata.prepare_with_kv_cache(dropped, 1, CHUNK)
+    ref = weakref.ref(dropped)
+    del dropped
+    gc.collect()
+    assert ref() is None, "the backend keeps a dropped cache alive"
 
 
 def test_packed_qkv_matches_separate_tensors_on_the_cache_path():

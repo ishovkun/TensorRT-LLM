@@ -31,7 +31,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from utils.llm_data import get_checkpoint
 
-from tensorrt_llm._torch.visual_gen.cache import CausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     create_attention_metadata_state,
@@ -124,13 +124,13 @@ def make_cache(model):
         max_staged_tokens=CHUNK_FRAMES * tokens_per_frame,
         causal_block_sizes=tuple(k * tokens_per_frame for k in range(CHUNK_FRAMES, 0, -1)),
     )
-    cache = CausalKVCacheManager(
+    cache = BlockCausalKVCacheManager(
         num_layers=len(model.gen_layers),
         num_kv_heads=model.cache_kv_heads,
         head_dim=model.gen_layers[0].cross_attention.head_dim,
         dtype=DTYPE,
         tokens_per_page=32,
-        pool_tokens=CausalKVCacheManager.pool_tokens_for(
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
             tokens_per_page=32, pin_tokens=MAX_TEXT, **geometry
         ),
     )
