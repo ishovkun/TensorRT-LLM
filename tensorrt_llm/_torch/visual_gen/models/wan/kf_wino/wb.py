@@ -83,19 +83,22 @@ def _wino_plan(N, H, W, TPF):
             (2, 30, 52): (1, True)}.get((N, H, W), (1, False))
 
 
-def _gemm_kernel(a, b, c, n_tile, pdl):
-    key = ("gemm", n_tile, pdl)
+def _gemm_kernel(a, b, c, n_tile, pdl, static=True):
+    """The batched GEMM on the static persistent schedule (with or without the PDL release in
+    the prologue), or, with ``static=False``, on the CLC dynamic persistent schedule. The
+    dynamic one is opt-in for measurements only: under GPU contention it leaves tiles of a run
+    unwritten (garbage in the output) in 1-10% of the launches, in every form that has a CTA
+    process more than one tile (measured on GB200, 150-300 repeats per shape), while the
+    static schedule stayed bit-reproducible on every shape."""
+    key = ("gemm", n_tile, pdl, static)
     fn = _compiled.get(key)
     if fn is None:
-        if pdl:
-            # static persistent schedule: every CTA is resident from the start, so the PDL release
-            # in the kernel prologue lets the next transform kernel co-run immediately
+        if static:
             max_clusters = utils.HardwareInfo().get_max_active_clusters(2)
             op = StaticPersistentGemm(cutlass.Float32, True, (256, n_tile), (2, 1), True,
-                                      use_pdl=True)
+                                      use_pdl=pdl)
             fn = cute.compile(op, a, b, c, max_clusters, make_fake_stream())
         else:
-            # CLC dynamic persistent schedule: better load balance when nothing co-runs
             op = ClcGemm(cutlass.Float32, True, (256, n_tile), (2, 1), (2, 1), True)
             fn = cute.compile(op, a, b, c, make_fake_stream())
         _compiled[key] = fn

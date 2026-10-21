@@ -65,7 +65,9 @@ def wino_spatial_conv_kf(
     GEMM rows are output channels with the tile count split into 256/224/192-wide column
     tiles, both as four per-component chunks pipelined under PDL; "wa0" / "wb0" = the same
     chunks as plain serialized launches; "wb1" = "wb" layout as one GEMM over all components
-    without PDL; ``None`` picks by shape."""
+    without PDL (the default); "wb1d" = the same on the CLC dynamic schedule (not reproducible
+    under contention, measurements only); every other form runs the static persistent GEMM;
+    ``None`` picks by shape."""
     comps, pairs, positions, cin = d.shape
     cout = u.shape[2]
     x = d.view(comps * pairs, height, width, cin)
@@ -79,6 +81,8 @@ def wino_spatial_conv_kf(
         _run_wb(x, u, y, comps, pairs, chunked=True, pdl=mode == "wb")
     elif mode == "wb1":
         _run_wb(x, u, y, comps, pairs, chunked=False, pdl=False)
+    elif mode == "wb1d":
+        _run_wb(x, u, y, comps, pairs, chunked=False, pdl=False, dynamic=True)
     else:
         raise ValueError(f"unknown spatial Winograd mode {mode!r}")
     return y.view(comps, pairs, positions, cout)
@@ -146,6 +150,7 @@ def _run_wb(
     pairs: int,
     chunked: bool,
     pdl: bool,
+    dynamic: bool = False,
 ) -> None:
     import cuda.bindings.driver as cuda
     from cutlass.cute.runtime import from_dlpack
@@ -178,20 +183,23 @@ def _run_wb(
             stream
         )
 
-    def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pdl: bool) -> None:
+    def gemm(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, pdl: bool, static=True) -> None:
         # M = Cout, N = tiles, K = Cin, batched over the 36 coordinates (x components)
         a = from_dlpack(a.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         b = from_dlpack(b.permute(1, 2, 0), assumed_align=16).mark_layout_dynamic(leading_dim=1)
         c = from_dlpack(c.permute(2, 1, 0), assumed_align=16).mark_layout_dynamic(leading_dim=0)
-        wb._gemm_kernel(a, b, c, n_tile, pdl)(a, b, c, stream)
+        wb._gemm_kernel(a, b, c, n_tile, pdl, static)(a, b, c, stream)
 
     if not chunked:
+        # One GEMM over all components; the dynamic schedule only on request (see
+        # wb._gemm_kernel).
         _xform_kernel("in", wino.in_xform, [x, v], (frames, height, width, cin, 4, 4, 0))(stream)
         gemm(
             u.view(36 * comps, cout, cin),
             v.view(36 * comps, tiles, cin),
             m.view(36 * comps, tiles, cout),
             False,
+            static=not dynamic,
         )
         _xform_kernel("out", wino.out_xform, [m, y], (frames, height, width, cout, 4, 4, 0))(stream)
         return

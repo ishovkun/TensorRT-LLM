@@ -37,7 +37,7 @@ def cudnn_frontend_available() -> bool:
 
 def _cache_file() -> pathlib.Path:
     base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return pathlib.Path(base) / "tensorrt_llm" / "vae_cudnn_plans.json"
+    return pathlib.Path(base) / "tensorrt_llm" / "vae_cudnn_plans_v2.json"
 
 
 @functools.lru_cache(maxsize=None)
@@ -181,6 +181,9 @@ class _Conv:
         for index in range(self.plan_count):
             try:
                 workspace = self._build(index)
+                # Zeroed first: a plan that reports success without writing must not pass on
+                # the previous candidate's output.
+                y.zero_()
                 self._run(index, workspace, x, w, b, y)
                 torch.cuda.synchronize()
             except Exception:  # noqa: BLE001 - plans the engine cannot build/run are skipped
@@ -188,7 +191,9 @@ class _Conv:
             rel = (
                 (y.float() - reference.float()).norm() / reference.float().norm().clamp_min(1e-12)
             ).item()
-            if rel > 2e-2:
+            # A correct plan differs from torch's conv by bf16 rounding only (~1e-3); a NaN
+            # error (garbage input during warm-up) is a failure, not a pass.
+            if not rel <= 3e-3:
                 continue
             # warm, then time a few launches
             for _ in range(2):
@@ -205,6 +210,8 @@ class _Conv:
             raise RuntimeError("cuDNN frontend: no plan produced a correct result")
         _, self.plan, self.workspace = best
         _save_choice(key, self.plan)
+        # The caller's output must hold the chosen plan's result, not the last candidate's.
+        self._run(self.plan, self.workspace, x, w, b, y)
 
 
 _convs: dict[tuple, _Conv] = {}
