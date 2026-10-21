@@ -194,12 +194,22 @@ class TestParallelWinoVaeDecode:
     def test_decode_2gpu(self, split_dim: str, option_set: str, frames: int) -> None:
         _run(2, _logic_decode, split_dim, option_set, frames)
 
+    # Four ranks: every rank but the edges has two neighbours, so both halo lines travel in
+    # one exchange (the 8 x 12 latent divides by four along either axis).
+    @pytest.mark.parametrize("split_dim", ["height", "width"])
+    @pytest.mark.parametrize("option_set", ["all_on", "all_off"])
+    def test_decode_4gpu(self, split_dim: str, option_set: str) -> None:
+        _run(4, _logic_decode, split_dim, option_set, 5)
+
 
 class TestParallelWinoVaeEncode:
     @pytest.mark.parametrize("split_dim", ["height", "width"])
     @pytest.mark.parametrize("option_set", ["all_on", "all_off"])
     def test_encode_2gpu(self, split_dim: str, option_set: str) -> None:
         _run(2, _logic_encode, split_dim, option_set, 9)
+
+    def test_encode_4gpu(self) -> None:
+        _run(4, _logic_encode, "width", "all_on", 9)
 
 
 if __name__ == "__main__":

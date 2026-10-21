@@ -116,19 +116,20 @@ class Shard:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Send ``send_left`` to the left neighbour and ``send_right`` to the right one;
         returns what they sent back (same shapes), None where there is no neighbour. One
-        batched send/receive per neighbour, both neighbours in one group call."""
+        batched send/receive for both neighbours on the world group (a batch must use a
+        single group; the peers are addressed by global rank)."""
         ops = []
         recv_left = recv_right = None
         if self.left is not None:
             assert send_left is not None
             recv_left = self._buffer("recv_left", send_left)
-            ops.append(dist.P2POp(dist.isend, send_left, self.left, group=self.left_group))
-            ops.append(dist.P2POp(dist.irecv, recv_left, self.left, group=self.left_group))
+            ops.append(dist.P2POp(dist.isend, send_left, self.left, group=self.pg))
+            ops.append(dist.P2POp(dist.irecv, recv_left, self.left, group=self.pg))
         if self.right is not None:
             assert send_right is not None
             recv_right = self._buffer("recv_right", send_right)
-            ops.append(dist.P2POp(dist.isend, send_right, self.right, group=self.right_group))
-            ops.append(dist.P2POp(dist.irecv, recv_right, self.right, group=self.right_group))
+            ops.append(dist.P2POp(dist.isend, send_right, self.right, group=self.pg))
+            ops.append(dist.P2POp(dist.irecv, recv_right, self.right, group=self.pg))
         if ops:
             for req in dist.batch_isend_irecv(ops):
                 req.wait()

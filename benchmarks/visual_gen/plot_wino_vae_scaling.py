@@ -35,8 +35,8 @@ PANELS = (
 
 
 def _median_ms(row: dict) -> float:
-    if row.get("step_latency") and row["step_latency"].get("steady_step_ms") is not None:
-        return float(row["step_latency"]["steady_step_ms"])
+    if row.get("step_latency") and row["step_latency"].get("step_ms") is not None:
+        return float(row["step_latency"]["step_ms"])
     return row["timing"]["span"]["median_us"] / 1e3
 
 
@@ -79,12 +79,23 @@ def main() -> None:
     rows_n = -(-len(panels) // cols)
     fig, axes = plt.subplots(rows_n, cols, figsize=(6.2 * cols, 4.6 * rows_n), squeeze=False)
     colors = {name: f"C{i}" for i, (_, name) in enumerate(dict(SERIES).items())}
+    # Backends sharing a display name form one line (vLLM-Omni: the fast path at one GPU, the
+    # sharded decode beyond), the most recent point winning where both measured a size.
+    lines: dict[str, list[str]] = {}
+    for backend, name in SERIES:
+        lines.setdefault(name, []).append(backend)
     for ax, (op, shape, title) in zip(axes.flat, panels):
-        for backend, name in SERIES:
-            xs = [n for n in sizes if (backend, shape, op, n) in points]
-            if not xs:
+        for name, backends in lines.items():
+            pts = {
+                n: points[(b, shape, op, n)]
+                for b in backends
+                for n in sizes
+                if (b, shape, op, n) in points
+            }
+            if not pts:
                 continue
-            ys = [points[(backend, shape, op, n)] for n in xs]
+            xs = sorted(pts)
+            ys = [pts[n] for n in xs]
             ax.plot(xs, ys, marker="o", color=colors[name], label=name)
             for x, y in zip(xs, ys):
                 ax.annotate(
