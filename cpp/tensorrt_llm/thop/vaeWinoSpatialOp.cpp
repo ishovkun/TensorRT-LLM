@@ -67,6 +67,43 @@ torch::Tensor vae_wino_spatial_in(
     return v;
 }
 
+// The stacked-frame input transform (components == 1) over frames held in separate buffers:
+// ``zero_front`` zero frames, then the frames of each tensor in ``taps`` ([n_i, H, W, C], same
+// dtype and shape), side by side along K: V [(tile+2)^2, ntiles, (zero_front + sum n_i) * C] fp16.
+torch::Tensor vae_wino_spatial_in_taps(
+    at::TensorList taps, int64_t zero_front, int64_t row0, int64_t row1, int64_t tile)
+{
+    TORCH_CHECK(!taps.empty(), "taps must hold at least one tensor");
+    TORCH_CHECK(zero_front >= 0, "zero_front must be non-negative");
+    auto p = params(taps[0], 1, row0, row1, tile);
+    p.stackFrames = 1;
+    p.segments = 0;
+    if (zero_front > 0)
+    {
+        p.segPtr[p.segments] = nullptr;
+        p.segFrames[p.segments++] = static_cast<int>(zero_front);
+    }
+    int frames = static_cast<int>(zero_front);
+    for (auto const& tap : taps)
+    {
+        TORCH_CHECK(p.segments < 3, "at most three frame segments (zero frames, history, new frame)");
+        TORCH_CHECK(tap.dim() == 4 && tap.size(1) == p.height && tap.size(2) == p.width && tap.size(3) == p.channels
+                && tap.scalar_type() == taps[0].scalar_type(),
+            "every tap must be [n, H, W, C] of the same shape and dtype");
+        CHECK_INPUT(tap, taps[0].scalar_type());
+        p.segPtr[p.segments] = tap.data_ptr();
+        p.segFrames[p.segments++] = static_cast<int>(tap.size(0));
+        frames += static_cast<int>(tap.size(0));
+    }
+    p.frames = frames;
+    int64_t const coords = (tile + 2) * (tile + 2);
+    int64_t const ntiles = static_cast<int64_t>(p.row1 - p.row0) * ((p.width + tile - 1) / tile);
+    auto v = torch::empty({coords, ntiles, p.frames * p.channels}, taps[0].options().dtype(torch::kHalf));
+    tensorrt_llm::kernels::launchVaeWinoSpatialInput(
+        nullptr, v.data_ptr(), p, at::cuda::getCurrentCUDAStream(taps[0].get_device()));
+    return v;
+}
+
 // y[:, tile*i+a, tile*j+b, :] = A^T M A (+ bias) for tile rows [row0, row1); writes into ``frames`` and
 // returns it.
 torch::Tensor vae_wino_spatial_out(torch::Tensor const& m, torch::Tensor const& frames, int64_t components,
@@ -96,6 +133,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "vae_wino_spatial_in(Tensor frames, int components, int row0, int row1, int tile=2, bool stack_frames=False)"
         " -> Tensor");
+    m.def("vae_wino_spatial_in_taps(Tensor[] taps, int zero_front, int row0, int row1, int tile=2) -> Tensor");
     m.def(
         "vae_wino_spatial_out(Tensor m, Tensor(a!) frames, int components, int row0, int row1, int tile=2,"
         " Tensor? bias=None) -> Tensor(a!)");
@@ -104,6 +142,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("vae_wino_spatial_in", &vae_wino_spatial_in);
+    m.impl("vae_wino_spatial_in_taps", &vae_wino_spatial_in_taps);
     m.impl("vae_wino_spatial_out", &vae_wino_spatial_out);
 }
 

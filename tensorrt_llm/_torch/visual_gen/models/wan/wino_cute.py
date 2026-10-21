@@ -1379,6 +1379,7 @@ def wino_pass_kernel(
     mB_nkl: cute.Tensor,
     mT: cute.Tensor,
     mY: cute.Tensor,
+    mBias: cute.Tensor,
     mCount: cute.Tensor,
     a_smem_layout: cute.ComposedLayout,
     b_smem_layout: cute.ComposedLayout,
@@ -1394,6 +1395,7 @@ def wino_pass_kernel(
     height: cutlass.Int32,
     width: cutlass.Int32,
     pairs: cutlass.Int32,
+    has_bias: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1714,6 +1716,13 @@ def wino_pass_kernel(
                 n_block = tb % n_blocks
                 m_tile = (tb // n_blocks) % m_tiles
                 comp = tb // (n_blocks * m_tiles)
+                if cutlass.const_expr(has_bias):
+                    bsrc = cute.make_tensor(
+                        (mBias.iterator + (n_block * Q_N + cgrp)).align(16), seg8
+                    )
+                    btmp = cute.make_rmem_tensor(seg8, OUT_DTYPE)
+                    cute.autovec_copy(bsrc, btmp)
+                    bvec = btmp.load().to(ACC_DTYPE)
                 slab_row0 = m_tile * Q_TILER_MNK[0] + jv * 128 + part * (Q_JOB_CHUNKS * Q_CROWS)
                 cxb0 = comp * P_COORDS * 2
                 slab_base = mT.iterator + ((cxb0 * n_blocks + n_block) * m_alloc + slab_row0) * Q_N
@@ -1762,10 +1771,15 @@ def wino_pass_kernel(
                             tmp = cute.make_rmem_tensor(seg8, IO_DTYPE)
                             cute.autovec_copy(src, tmp)
                             tx[x] = tmp.load().to(ACC_DTYPE)
+                        s0 = (tx[0] + tx[1]) + tx[2]
+                        s1 = (tx[1] - tx[2]) - tx[3]
+                        if cutlass.const_expr(has_bias):
+                            s0 = s0 + bvec
+                            s1 = s1 + bvec
                         y0 = cute.make_rmem_tensor(seg8, OUT_DTYPE)
                         y1 = cute.make_rmem_tensor(seg8, OUT_DTYPE)
-                        y0.store(((tx[0] + tx[1]) + tx[2]).to(OUT_DTYPE))
-                        y1.store(((tx[1] - tx[2]) - tx[3]).to(OUT_DTYPE))
+                        y0.store(s0.to(OUT_DTYPE))
+                        y1.store(s1.to(OUT_DTYPE))
                         pcol = pcol0 + b
                         if r_valid & (pcol < width):
                             if prow0 < height:
@@ -1808,6 +1822,7 @@ def wino_pass_host(
     b: cute.Tensor,
     t: cute.Tensor,
     y: cute.Tensor,
+    bias: cute.Tensor,
     counters: cute.Tensor,
     m_valid: cutlass.Int32,
     m_alloc: cutlass.Int32,
@@ -1818,6 +1833,7 @@ def wino_pass_host(
     pairs: cutlass.Int32,
     components: cutlass.Constexpr[int],
     num_clusters: cutlass.Constexpr[int],
+    has_bias: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     op = tcgen05.MmaF16BF16Op(
@@ -1859,6 +1875,7 @@ def wino_pass_host(
         b_tma_tensor,
         t,
         y,
+        bias,
         counters,
         a_smem_layout,
         b_smem_layout,
@@ -1874,6 +1891,7 @@ def wino_pass_host(
         height,
         width,
         pairs,
+        has_bias,
     ).launch(
         grid=(P_PAIR * num_clusters, 1, 1),
         block=(Q_THREADS, 1, 1),
@@ -1890,11 +1908,12 @@ def _max_active_pairs() -> int:
 
 @functools.lru_cache(maxsize=None)
 def _compiled_pass(key: tuple[int, ...]):
-    nl, m_pad, n, k, pixels, num_clusters = key
+    nl, m_pad, n, k, pixels, num_clusters, has_bias = key
     v = torch.empty(nl, m_pad, k, dtype=torch.float16, device="cuda")
     u = torch.empty(nl, n, k, dtype=torch.float16, device="cuda")
     t = torch.empty(nl // 2 * m_pad, n, dtype=torch.float16, device="cuda")
     y = torch.empty(pixels, n, dtype=torch.bfloat16, device="cuda")
+    bias = torch.empty(n, dtype=torch.bfloat16, device="cuda")
     counters = torch.zeros(1, dtype=torch.int32, device="cuda")
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     one = cutlass.Int32(1)
@@ -1904,6 +1923,7 @@ def _compiled_pass(key: tuple[int, ...]):
         _as_mkl(u, 1),
         _as_rows(t),
         _as_rows(y),
+        from_dlpack(bias, assumed_align=16),
         from_dlpack(counters, assumed_align=16),
         one,
         one,
@@ -1914,8 +1934,15 @@ def _compiled_pass(key: tuple[int, ...]):
         one,
         nl // 16,
         num_clusters,
+        bool(has_bias),
         stream,
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _pass_no_bias(device_index: int) -> torch.Tensor:
+    """Stand-in bias operand of a bias-free launch (never read)."""
+    return torch.zeros(8, dtype=torch.bfloat16, device=torch.device("cuda", device_index))
 
 
 @functools.lru_cache(maxsize=None)
@@ -1940,13 +1967,15 @@ def wino_spatial_conv_pass2(
     height: int,
     width: int,
     workspace: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Spatial Winograd conv from the transformed tiles: ``v`` [components*16, rows, Cin]
     (coordinate l = comp*16 + x*4 + y, rows >= pairs * ntiles), ``u_nk`` [components*16, Cout,
     Cin] **with the y = 3 coordinate negated** (see :func:`winograd_pass_filters`); writes the
     output frames ``out`` [components*pairs, H, W, Cout]. ``workspace`` bf16 of
     ``pass2_workspace_numel(components, rows, Cout)`` elements holds the row partials in flight
-    (allocated here if not given). Cout % 256 == 0, Cin % 64 == 0."""
+    (allocated here if not given); ``bias`` [Cout] bf16 is added before the output rounding.
+    Cout % 256 == 0, Cin % 64 == 0."""
     nl, m_pad, k = v.shape
     n = u_nk.shape[1]
     tiles_w = (width + 1) // 2
@@ -1965,13 +1994,17 @@ def wino_spatial_conv_pass2(
     counters = _pass_counters(n_counters + 2 + n_counters * Q_JOB_SPLIT, v.device.index)
     counters[n_counters:].zero_()  # queue head, tail and job slots start empty every call
     pixels = components * pairs * height * width
-    fn = _compiled_pass((nl, m_pad, n, k, pixels, num_clusters))
+    if bias is not None:
+        assert bias.dtype == torch.bfloat16 and bias.numel() == n
+        bias = bias.contiguous()
+    fn = _compiled_pass((nl, m_pad, n, k, pixels, num_clusters, bias is not None))
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     fn(
         _as_mkl(v, 1),
         _as_mkl(u_nk, 1),
         _as_rows(t.view(nl // 2 * m_alloc, n)),
         _as_rows(out.view(pixels, n)),
+        from_dlpack(bias if bias is not None else _pass_no_bias(v.device.index), assumed_align=16),
         from_dlpack(counters, assumed_align=16),
         cutlass.Int32(m_valid),
         cutlass.Int32(m_alloc),

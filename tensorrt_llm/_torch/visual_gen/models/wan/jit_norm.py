@@ -68,6 +68,70 @@ class FrameGeometry:
             raise ValueError("the logical frame must fit inside the physical one")
 
 
+@dataclass(frozen=True)
+class UpsampleSource:
+    """Frames defined by the phase gather of a packed 2x2 upsample conv output, formed by the
+    kernel while reading: output pixel ``(2i+p, 2j+q)`` of frame ``t`` is
+    ``round(temp[t, phase 2p+q, i+p, j+q] + bias)`` plus, when a shortcut is given, the DupUp3D
+    element ``shortcut[(t + crop) // factor_t, i, j, (c * factor + S) // repeats]`` with
+    ``factor = 4 * factor_t`` and ``S = (((t + crop) % factor_t) * 2 + p) * 2 + q``, rounded to
+    bf16 after each add (the arithmetic of the standalone gather kernel). ``temp`` is
+    ``[T, (height+1) * (width+1), 4C]`` rows, ``shortcut`` ``[framesR, height * width, Cin]``
+    rows, ``bias`` ``[C]``; ``height`` and ``width`` are the low-resolution frame size."""
+
+    temp: torch.Tensor
+    shortcut: torch.Tensor | None
+    bias: torch.Tensor | None
+    factor_t: int
+    repeats: int
+    crop: int
+    height: int
+    width: int
+
+    @property
+    def frames(self) -> int:
+        return self.temp.shape[0]
+
+    @property
+    def channels(self) -> int:
+        return self.temp.shape[-1] // 4
+
+    @property
+    def positions(self) -> int:
+        return 4 * self.height * self.width
+
+    @property
+    def ratio(self) -> int:
+        """Shortcut elements per output channel (factor / repeats)."""
+        return 4 * self.factor_t // self.repeats if self.shortcut is not None else 1
+
+    def check(self) -> None:
+        if self.temp.dim() != 3 or self.temp.shape[1] != (self.height + 1) * (self.width + 1):
+            raise ValueError("temp must be [T, (height+1)*(width+1), 4C] rows")
+        if self.temp.shape[-1] % (4 * _VEC):
+            raise ValueError("temp channels must be 4 * (a multiple of 8)")
+        if self.shortcut is not None:
+            factor = 4 * self.factor_t
+            if self.factor_t not in (1, 2) or factor % self.repeats or self.ratio not in (1, 2):
+                raise ValueError("the shortcut mapping must give 1 or 2 elements per channel")
+            if self.shortcut.dim() != 3 or self.shortcut.shape[1] != self.height * self.width:
+                raise ValueError("shortcut must be [framesR, height*width, Cin] rows")
+            if self.shortcut.shape[0] * self.factor_t != self.frames + self.crop:
+                raise ValueError("shortcut frames do not match the output frames")
+            if self.shortcut.shape[-1] * self.repeats != self.channels * factor:
+                raise ValueError("shortcut channel repeat mismatch")
+        if self.bias is not None and self.bias.numel() != self.channels:
+            raise ValueError("bias must be [C]")
+
+
+def _up_variant(up: UpsampleSource | None) -> tuple[int, int]:
+    """The kernel's (UP_FT, UP_RATIO) template arguments: 0 without an upsample input, else the
+    shortcut's temporal factor (1 when there is no shortcut) and the elements per channel."""
+    if up is None:
+        return 0, 1
+    return (up.factor_t if up.shortcut is not None else 1), up.ratio
+
+
 def _map_args(geo: FrameGeometry | None) -> tuple[int, int, int]:
     return (geo.frame, geo.cols, geo.offset) if geo is not None else (0, 0, 0)
 
@@ -156,6 +220,8 @@ class Variant:
     padded: bool
     in_map: bool = False
     out_map: bool = False
+    up_ft: int = 0
+    up_ratio: int = 1
 
     def name(self) -> str:
         def b(v: bool) -> str:
@@ -166,7 +232,7 @@ class Variant:
             f"vaewino::vaeNormKernel<__nv_bfloat16, {td}, {self.order}, {_VEC}, {self.lanes}, {self.k}, "
             f"{b(self.reference)}, {b(self.has_bias)}, {b(self.has_in_bias)}, {b(self.has_residual)}, "
             f"{b(self.in_wino)}, {self.mid}, {self.out}, {b(self.padded)}, {b(self.in_map)}, "
-            f"{b(self.out_map)}>"
+            f"{b(self.out_map)}, {self.up_ft}, {self.up_ratio}>"
         )
 
     def signature(self) -> str:
@@ -175,7 +241,7 @@ class Variant:
             f"({t} const*, {td} const*, {td}*, long long, long long, {t} const*, {t} const*, {t} const*, "
             f"{t} const*, "
             f"{t} const*, {t}*, {t}*, {t}*, long long, int, int, int, int, int, int, int, long long, int, int, "
-            f"long long, int, int, float, float)"
+            f"long long, int, int, int, int, int, int, float, float)"
         )
 
     @property
@@ -295,8 +361,7 @@ _ARG_TYPES = (
     ctypes.c_int,
     ctypes.c_int,
     ctypes.c_longlong,
-    ctypes.c_int,
-    ctypes.c_int,
+    *(ctypes.c_int,) * 6,
     ctypes.c_float,
     ctypes.c_float,
 )
@@ -334,6 +399,7 @@ def _launch(
     scale: float,
     in_geo: FrameGeometry | None = None,
     out_geo: FrameGeometry | None = None,
+    up: UpsampleSource | None = None,
 ) -> None:
     from cuda.bindings import driver as cuda
 
@@ -381,6 +447,11 @@ def _launch(
         pad_w,
         *_map_args(in_geo),
         *_map_args(out_geo),
+        *(
+            (up.height, up.width, up.crop, up.shortcut.shape[-1] if up.shortcut is not None else 0)
+            if up is not None
+            else (0, 0, 0, 0)
+        ),
         float(scale),
         1e-12,
     )
@@ -425,14 +496,22 @@ def wino_norm_silu(
     reference_rounding: bool = False,
     products_geometry: FrameGeometry | None = None,
     slab_geometry: FrameGeometry | None = None,
+    upsample: UpsampleSource | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Temporal Winograd norm: frame layout ``[T, P, C]`` (``m``/``D`` as
     ``[T/order, P, C]``, cache ``[0..2, P, C]``). Returns ``(sum or None, y_tail, D)``.
 
     ``products_geometry`` / ``slab_geometry``: the products are read from, and the slabs
     written to, frames with halo rows or columns (``[T/order, rows * cols, C]``); the kernel
-    touches the logical positions only."""
-    if (x is None) == (m is None):
+    touches the logical positions only. With ``upsample`` (instead of ``x`` or ``m``) the
+    frames are formed from the packed upsample conv output while reading and written as the
+    sum."""
+    if upsample is not None:
+        if x is not None or m is not None or residual is not None or in_bias is not None:
+            raise ValueError("upsample replaces x, m, residual and in_bias")
+        upsample.check()
+        x, residual, in_bias = upsample.temp, upsample.shortcut, upsample.bias
+    elif (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
     if order not in (2, 4) or (order == 4 and not half_slabs):
         raise ValueError("order must be 2 or 4; order 4 needs fp16 slabs")
@@ -447,11 +526,13 @@ def wino_norm_silu(
     if products_geometry is not None and x is not None:
         raise ValueError("products_geometry applies to the products")
     src = x if x is not None else m[0]
-    channels = src.shape[-1]
+    channels = upsample.channels if upsample is not None else src.shape[-1]
     if products_geometry is not None:
         positions = products_geometry.height * products_geometry.width
         if m[0].shape[1] != products_geometry.frame:
             raise ValueError("the products do not match products_geometry")
+    elif upsample is not None:
+        positions = upsample.positions
     else:
         positions = src.shape[1]
     height, width = (
@@ -467,7 +548,7 @@ def wino_norm_silu(
         raise ValueError("channels must be a multiple of 8")
     device = src.device.index
     opts = dict(device=src.device, dtype=torch.bfloat16)
-    want_sum = residual is not None or in_bias is not None or x is None
+    want_sum = residual is not None or in_bias is not None or x is None or upsample is not None
     out_sum = torch.empty((frames, positions, channels), **opts) if want_sum else None
     y_tail = torch.empty((2, positions, channels), **opts)
     slab_positions = slab_geometry.frame if slab_geometry is not None else positions
@@ -496,6 +577,7 @@ def wino_norm_silu(
         False,
         products_geometry is not None,
         slab_geometry is not None,
+        *_up_variant(upsample),
     )
     _launch(
         variant,
@@ -524,12 +606,13 @@ def wino_norm_silu(
         scale=scale,
         in_geo=products_geometry,
         out_geo=slab_geometry,
+        up=upsample,
     )
     return out_sum, y_tail, d
 
 
 def rms_norm_silu_rows(
-    x: torch.Tensor,
+    x: torch.Tensor | None,
     gamma: torch.Tensor,
     bias: torch.Tensor | None,
     scale: float,
@@ -541,6 +624,7 @@ def rms_norm_silu_rows(
     silu: bool = True,
     frames: int = 1,
     out_geometry: FrameGeometry | None = None,
+    upsample: UpsampleSource | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """RMSNorm (+ SiLU, + residual, + deferred bias) on rows ``[N, C]`` bf16: returns
     ``(sum or None, y)``; ``sum = round(x (+ in_bias) + residual)`` is written when a residual
@@ -548,8 +632,20 @@ def rms_norm_silu_rows(
 
     With ``out_geometry`` the rows are ``frames`` frames of ``height * width`` positions and
     ``out`` holds frames with halo rows / columns (``[frames * rows * cols, C]``); only the
-    logical positions are written."""
-    rows, channels = x.shape
+    logical positions are written.
+
+    With ``upsample`` (instead of ``x``) the rows are its ``frames`` frames of ``4 * height *
+    width`` positions, formed from the packed upsample conv output while reading; the sum is
+    always returned then."""
+    if upsample is not None:
+        if x is not None or residual is not None or in_bias is not None:
+            raise ValueError("upsample replaces x, residual and in_bias")
+        upsample.check()
+        x, residual, in_bias = upsample.temp, upsample.shortcut, upsample.bias
+        frames, channels = upsample.frames, upsample.channels
+        rows = frames * upsample.positions
+    else:
+        rows, channels = x.shape
     if channels % _VEC:
         raise ValueError("channels must be a multiple of 8")
     if out_geometry is not None and out_geometry.identity:
@@ -561,11 +657,16 @@ def rms_norm_silu_rows(
             raise ValueError("out_geometry needs a destination and frames * height * width rows")
         if out.shape[0] != frames * out_geometry.frame:
             raise ValueError("out does not match out_geometry")
-    else:
+    elif upsample is None:
         frames = 1
     device = x.device.index
-    y = out if out is not None else torch.empty_like(x)
-    out_sum = torch.empty_like(x) if residual is not None else None
+    opts = dict(device=x.device, dtype=torch.bfloat16)
+    y = out if out is not None else torch.empty((rows, channels), **opts)
+    out_sum = (
+        torch.empty((rows, channels), **opts)
+        if residual is not None or upsample is not None
+        else None
+    )
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
         False,
@@ -582,6 +683,7 @@ def rms_norm_silu_rows(
         False,
         False,
         out_geometry is not None,
+        *_up_variant(upsample),
     )
     _launch(
         variant,
@@ -609,6 +711,7 @@ def rms_norm_silu_rows(
         pad_w=0,
         scale=scale,
         out_geo=out_geometry,
+        up=upsample,
     )
     return out_sum, y
 

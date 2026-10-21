@@ -13,6 +13,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import (
     FrameGeometry,
+    UpsampleSource,
     combine,
     rms_norm_silu_rows,
     wino_norm_silu,
@@ -200,6 +201,82 @@ def add_rms_norm_silu_cuda(
         out_geometry=out_geometry,
     )
     return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
+
+
+def upsample_source(
+    temp: torch.Tensor,
+    shortcut: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    factor_t: int,
+    repeats: int,
+    crop: int,
+) -> UpsampleSource:
+    """The kernel-side description of a fused upsample input from the model's tensors: ``temp``
+    ``[T, 4C, H+1, W+1]`` channels-last (the packed 2x2 conv output), ``shortcut`` ``[1, Cin,
+    Tr, H, W]`` channels-last or None (the DupUp3D input), ``bias`` ``[C]`` or None."""
+    rows = _channel_rows(temp)
+    if rows is None:
+        raise ValueError("temp must be a channels-last CUDA tensor")
+    t, c4, hp1, wp1 = temp.shape
+    sc = None
+    if shortcut is not None:
+        sc = frames_view(_channels_last_3d_if_needed_rows(shortcut))
+    if sc is None:
+        factor_t, repeats, crop = 1, 1, 0
+    return UpsampleSource(
+        rows.view(t, hp1 * wp1, c4),
+        sc,
+        bias.reshape(-1) if bias is not None else None,
+        factor_t,
+        repeats,
+        crop,
+        hp1 - 1,
+        wp1 - 1,
+    )
+
+
+def _channels_last_3d_if_needed_rows(x: torch.Tensor) -> torch.Tensor:
+    return (
+        x
+        if x.is_contiguous(memory_format=torch.channels_last_3d)
+        else x.contiguous(memory_format=torch.channels_last_3d)
+    )
+
+
+def upsample_rms_norm_silu_cuda(
+    up: UpsampleSource,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | None,
+    scale: float,
+    *,
+    reference_rounding: bool = False,
+    out: torch.Tensor | None = None,
+    out_geometry: FrameGeometry | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The upsample gather fused into the row-mode norm: returns ``(x, SiLU(RMSNorm(x)))`` with
+    ``x`` the gathered frames as channels-last ``[1, C, T, 2H, 2W]``; ``out`` is an optional
+    channels-last destination for the activation (with ``out_geometry``: frames with halo
+    lines, logical positions written)."""
+    dst = _channel_rows(out) if out is not None else None
+    if out is not None and dst is None:
+        raise ValueError("out must be a channels-last CUDA tensor")
+    s_rows, a_rows = rms_norm_silu_rows(
+        None,
+        gamma.reshape(-1),
+        bias.reshape(-1) if bias is not None else None,
+        float(scale),
+        reference_rounding=reference_rounding,
+        out=dst,
+        out_geometry=out_geometry,
+        upsample=up,
+    )
+    h, w = 2 * up.height, 2 * up.width
+    x = frames_to_video(s_rows.view(up.frames, h * w, up.channels), h, w)
+    return x, (
+        out
+        if out is not None
+        else frames_to_video(a_rows.view(up.frames, h * w, up.channels), h, w)
+    )
 
 
 def apply_in_bias(x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor:
@@ -413,6 +490,54 @@ def wino_spatial_conv_frames(
     out = torch.empty((1, height, width, u.shape[2]), dtype=frames.dtype, device=frames.device)
     torch.ops.trtllm.vae_wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
     return out.view(height * width, u.shape[2])
+
+
+def wino_spatial_conv_taps(
+    taps: list[torch.Tensor],
+    zero_front: int,
+    u: torch.Tensor,
+    height: int,
+    width: int,
+    bias: torch.Tensor | None = None,
+    kernel: str = "cublas",
+) -> torch.Tensor:
+    """:func:`wino_spatial_conv_frames` with the taps' input frames in separate buffers:
+    ``zero_front`` zero frames, then the frames of each tensor in ``taps`` (``[n, H*W, C]``
+    bf16, oldest first; the causal history and the new frame, no concatenation). ``kernel``
+    "cublas": ``u`` from :func:`winograd_spatial_taps_weights`, one batched GEMM and the output
+    transform kernel; "cute": ``u`` from :func:`cute_taps_filters`, the two-pass CuTe kernel
+    with the output transform (and the bias) in its epilogue."""
+    tile = spatial_tile_of(u, 1)
+    tile_rows = -(-height // tile)
+    cout = u.shape[1] if kernel == "cute" else u.shape[2]
+    v = torch.ops.trtllm.vae_wino_spatial_in_taps(
+        [t.view(t.shape[0], height, width, t.shape[-1]) for t in taps],
+        zero_front,
+        0,
+        tile_rows,
+        tile,
+    )
+    out = torch.empty((1, height, width, cout), dtype=taps[0].dtype, device=taps[0].device)
+    if kernel == "cute":
+        from tensorrt_llm._torch.visual_gen.models.wan.wino_cute import wino_spatial_conv_pass2
+
+        wino_spatial_conv_pass2(v, u, out, 1, 1, height, width, bias=bias)
+    else:
+        m = torch.bmm(v, u)
+        torch.ops.trtllm.vae_wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
+    return out.view(height * width, cout)
+
+
+def cute_taps_eligible(cin: int, cout: int, taps: int, tile: int) -> bool:
+    """Whether :func:`wino_spatial_conv_taps` can run on the two-pass CuTe kernel: F(2x2, 3x3),
+    Cout a multiple of 256 and K = taps * Cin a multiple of 64."""
+    return cute_wino_available() and tile == 2 and cout % 256 == 0 and (taps * cin) % 64 == 0
+
+
+def cute_taps_filters(u: torch.Tensor) -> torch.Tensor:
+    """Filters for the "cute" kernel of :func:`wino_spatial_conv_taps` from the "cublas" ones
+    ``[16, K, Cout]``: ``[16, Cout, K]`` with the y = 3 coordinate negated."""
+    return cute_spatial_filters(u.transpose(1, 2).contiguous())
 
 
 def spatial_tile_of(u: torch.Tensor, components: int = 4) -> int:
@@ -692,11 +817,14 @@ def wino_norm_silu_cuda(
     half_slabs: bool = False,
     products_geometry: FrameGeometry | None = None,
     slab_geometry: FrameGeometry | None = None,
+    upsample: UpsampleSource | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
     ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
     ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16. The
-    geometries describe products / slabs that carry halo rows or columns (sharded decode)."""
+    geometries describe products / slabs that carry halo rows or columns (sharded decode);
+    ``upsample`` replaces ``x``: the frames are formed from the packed upsample conv output
+    while reading (:func:`upsample_source`) and returned as the sum."""
     return wino_norm_silu(
         x,
         m,
@@ -712,6 +840,7 @@ def wino_norm_silu_cuda(
         reference_rounding=reference_rounding,
         products_geometry=products_geometry,
         slab_geometry=slab_geometry,
+        upsample=upsample,
     )
 
 

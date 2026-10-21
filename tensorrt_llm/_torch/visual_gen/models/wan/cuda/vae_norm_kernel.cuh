@@ -88,6 +88,13 @@ struct VaeNormParams
     long long outFrame;
     int outW;
     int outOff;
+    // Upsample input (UP_FT > 0): the frames are the phase gather of the packed 2x2 upsample
+    // conv output ``x`` [T, (upHeight+1) * (upWidth+1), 4C] plus the DupUp3D shortcut
+    // ``residual`` [framesR, upHeight * upWidth, upCin] (upCrop leading frames dropped).
+    int upHeight;
+    int upWidth;
+    int upCrop;
+    int upCin;
     float scale;
     float eps;
 };
@@ -197,10 +204,16 @@ __host__ __device__ constexpr int sharedBytes(int channels)
 #endif
 
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP>
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO>
 __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormParams const& p)
 {
     constexpr bool SLABS = OUT == kOutSlabs;
+    // The frames come from the phase gather of a packed 2x2 upsample conv output (plus the
+    // DupUp3D shortcut as the residual): UP_FT is the shortcut's temporal factor, UP_RATIO the
+    // number of shortcut elements per output channel (factor / repeats).
+    constexpr bool IN_UP = UP_FT > 0;
+    static_assert(!IN_UP || (!IN_WINO && !IN_MAP && !PADDED), "the upsample input is a plain-frame source");
+    static_assert(UP_FT >= 0 && UP_FT <= 2 && (UP_RATIO == 1 || UP_RATIO == 2), "unsupported upsample mapping");
     static_assert(!SLABS || MID == kMidNormSilu, "slabs are formed from normalized, activated frames");
     static_assert(!PADDED || OUT == kOutRows, "padding applies to the row output");
     static_assert(!(PADDED && OUT_MAP), "the padded row output has its own position map");
@@ -218,7 +231,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     // The standalone norm op rounds the deferred-bias add and the residual add to bf16 in
     // every mode (the sum row must be the eager ``x + residual`` bit for bit); the slab modes
     // keep fp32 there unless REF.
-    constexpr bool ROUND1 = REF || OUT == kOutRows;
+    constexpr bool ROUND1 = REF || OUT == kOutRows || IN_UP;
     constexpr int kPosPerWarp = 32 / L;
     constexpr int kPosPerBlock = kPosPerWarp * kWarps;
 
@@ -352,6 +365,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     {
         cuda::std::conditional_t<IN_WINO, TD, T> const* in;
         T const* res;
+        int resOff; // upsample input: the shortcut element of the lane's first output channel
     };
 
     // ``sposSrc``: the position's physical index inside a product frame (inIndex(spos)).
@@ -359,6 +373,28 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     {
         FrameSrc f{};
         int64_t const frow = static_cast<int64_t>(t) * P + spos;
+        if constexpr (IN_UP)
+        {
+            // Output pixel (2i+pp, 2j+qq) of frame t reads temp[t, phase 2pp+qq, i+pp, j+qq]
+            // and shortcut element (c * factor + S) / repeats = c * UP_RATIO + S / repeats of
+            // low-res pixel (i, j) of frame (t + crop) / UP_FT, S = ((a*2+pp)*2+qq).
+            int const w2 = 2 * p.upWidth;
+            int const oi = static_cast<int>(spos / w2);
+            int const oj = static_cast<int>(spos - static_cast<int64_t>(oi) * w2);
+            int const i = oi >> 1, pp = oi & 1, j = oj >> 1, qq = oj & 1;
+            int64_t const trow = (static_cast<int64_t>(t) * (p.upHeight + 1) + i + pp) * (p.upWidth + 1) + j + qq;
+            f.in = ptrs.x + trow * (4 * C) + (2 * pp + qq) * C + laneChunkOff;
+            if constexpr (HAS_RESIDUAL)
+            {
+                constexpr int REPEATS = 4 * UP_FT / UP_RATIO;
+                int const ft = t + p.upCrop;
+                int const tr = ft / UP_FT, a = ft - tr * UP_FT;
+                int64_t const srow = (static_cast<int64_t>(tr) * p.upHeight + i) * p.upWidth + j;
+                f.res = ptrs.residual + srow * p.upCin + static_cast<int64_t>(laneChunkOff) * UP_RATIO;
+                f.resOff = ((a * 2 + pp) * 2 + qq) / REPEATS;
+            }
+            return f;
+        }
         if constexpr (IN_WINO)
         {
             f.in = gRow(ptrs.m, static_cast<int64_t>(t / R) * inFrame + sposSrc);
@@ -394,7 +430,22 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
         {
             dst[0] = loadVec(f.in, k);
         }
-        if constexpr (HAS_RESIDUAL)
+        if constexpr (HAS_RESIDUAL && IN_UP && UP_RATIO == 2)
+        {
+            // Output channel c reads shortcut element 2c + resOff: two vectors, every other
+            // element, both parities built with constant indices and one selected.
+            Vec const lo = *reinterpret_cast<Vec const*>(f.res + 2 * k * L * V);
+            Vec const hi = *reinterpret_cast<Vec const*>(f.res + 2 * k * L * V + V);
+            Vec even, odd;
+#pragma unroll
+            for (int e = 0; e < V; ++e)
+            {
+                even.val[e] = 2 * e < V ? lo.val[(2 * e) % V] : hi.val[(2 * e) % V];
+                odd.val[e] = 2 * e + 1 < V ? lo.val[(2 * e + 1) % V] : hi.val[(2 * e + 1) % V];
+            }
+            dres = f.resOff == 0 ? even : odd;
+        }
+        else if constexpr (HAS_RESIDUAL)
         {
             dres = loadVec(f.res, k);
         }
@@ -846,12 +897,12 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
 // Entry point for the runtime-compiled kernel: every argument a scalar (the launcher passes a
 // typed argument list).
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP>
-__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
-    vaeNormKernel(T const* x, TD const* m, TD* d, long long compStride, long long inCompStride, T const* residual,
-        T const* inBias, T const* cache, T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions,
-        int channels, int frames, int cacheFrames, int height, int width, int padH, int padW, long long inFrame,
-        int inW, int inOff, long long outFrame, int outW, int outOff, float scale, float eps)
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO>
+__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>()) vaeNormKernel(T const* x, TD const* m,
+    TD* d, long long compStride, long long inCompStride, T const* residual, T const* inBias, T const* cache,
+    T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions, int channels, int frames,
+    int cacheFrames, int height, int width, int padH, int padW, long long inFrame, int inW, int inOff,
+    long long outFrame, int outW, int outOff, int upHeight, int upWidth, int upCrop, int upCin, float scale, float eps)
 {
     Ptrs<T, TD> ptrs{};
     ptrs.x = x;
@@ -882,10 +933,14 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
     p.outFrame = outFrame;
     p.outW = outW;
     p.outOff = outOff;
+    p.upHeight = upHeight;
+    p.upWidth = upWidth;
+    p.upCrop = upCrop;
+    p.upCin = upCin;
     p.scale = scale;
     p.eps = eps;
-    vaeNormBody<T, TD, R, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, IN_WINO, MID, OUT, PADDED, IN_MAP,
-        OUT_MAP>(ptrs, p);
+    vaeNormBody<T, TD, R, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, IN_WINO, MID, OUT, PADDED, IN_MAP, OUT_MAP,
+        UP_FT, UP_RATIO>(ptrs, p);
 }
 
 } // namespace vaewino

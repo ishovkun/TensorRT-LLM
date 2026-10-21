@@ -88,6 +88,31 @@ __device__ __forceinline__ int64_t vmOffset(
     return row * p.channels + c0;
 }
 
+// Base of frame n (channel 0): the `frames` buffer, or the segment holding the frame; nullptr
+// for a zero frame.
+template <typename T>
+__device__ __forceinline__ T const* frameBase(T const* frames, VaeWinoSpatialParams const& p, int n)
+{
+    int64_t const frameElems = static_cast<int64_t>(p.height) * p.width * p.channels;
+    if (p.segments == 0)
+    {
+        return frames + n * frameElems;
+    }
+    int begin = 0;
+#pragma unroll
+    for (int s = 0; s < 3; ++s)
+    {
+        if (s < p.segments && n < begin + p.segFrames[s])
+        {
+            return p.segPtr[s] == nullptr
+                ? nullptr
+                : static_cast<T const*>(p.segPtr[s]) + static_cast<int64_t>(n - begin) * frameElems;
+        }
+        begin += s < p.segments ? p.segFrames[s] : 0;
+    }
+    return nullptr;
+}
+
 __device__ __forceinline__ float2 operator+(float2 a, float2 b)
 {
     return make_float2(a.x + b.x, a.y + b.y);
@@ -189,19 +214,20 @@ __global__ void __launch_bounds__(kThreads)
         int const comp = n / g.pairs, pair = n - comp * g.pairs;
 
         Vec d[A][A];
-        T const* frame0 = frames + (static_cast<int64_t>(n) * p.height * p.width) * C + c0;
+        T const* frame0 = frameBase(frames, p, n);
+        bool const present = frame0 != nullptr;
 #pragma unroll
         for (int a = 0; a < A; ++a)
         {
             int const row = M * i - 1 + a;
-            T const* rowp = frame0 + (static_cast<int64_t>(row) * p.width + (M * j - 1)) * C;
 #pragma unroll
             for (int b = 0; b < A; ++b)
             {
                 int const col = M * j - 1 + b;
-                if (row >= 0 && row < p.height && col >= 0 && col < p.width)
+                if (present && row >= 0 && row < p.height && col >= 0 && col < p.width)
                 {
-                    d[a][b] = *reinterpret_cast<Vec const*>(rowp + b * C);
+                    d[a][b]
+                        = *reinterpret_cast<Vec const*>(frame0 + (static_cast<int64_t>(row) * p.width + col) * C + c0);
                 }
                 else
                 {
@@ -294,7 +320,10 @@ __global__ void __launch_bounds__(kThreads)
         constexpr int ChunksPerPixel = CH / 8;
         constexpr int Total = A * Cols * ChunksPerPixel;
         constexpr int Iters = (Total + kThreads - 1) / kThreads;
-        T const* frame0 = frames + (static_cast<int64_t>(n) * p.height * p.width) * C + chunk * CH;
+        T const* frame0 = frameBase(frames, p, n);
+        bool const present = frame0 != nullptr;
+        // A zero frame has no source; the copies below then move 0 bytes from a valid address.
+        T const* base = present ? frame0 + chunk * CH : reinterpret_cast<T const*>(v);
 #pragma unroll
         for (int it = 0; it < Iters; ++it)
         {
@@ -305,8 +334,8 @@ __global__ void __launch_bounds__(kThreads)
                 int const pix = q / ChunksPerPixel;
                 int const a = pix / Cols, b = pix - a * Cols;
                 int const row = row0 + a, col = col0 + b;
-                bool const in = row >= 0 && row < p.height && col >= 0 && col < p.width;
-                T const* src = in ? frame0 + (static_cast<int64_t>(row) * p.width + col) * C + cc * 8 : frame0;
+                bool const in = present && row >= 0 && row < p.height && col >= 0 && col < p.width;
+                T const* src = in ? base + (static_cast<int64_t>(row) * p.width + col) * C + cc * 8 : base;
                 unsigned const dst = static_cast<unsigned>(__cvta_generic_to_shared(&win[a][b][cc * 8]));
                 asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(in ? 16 : 0));
             }
@@ -461,6 +490,18 @@ void check(VaeWinoSpatialParams const& p)
     TLLM_CHECK_WITH_INFO(!p.stackFrames || p.components == 1, "vaeWinoSpatial: stacked frames need components == 1");
     TLLM_CHECK_WITH_INFO(0 <= p.row0 && p.row0 < p.row1 && p.row1 <= (p.height + p.tile - 1) / p.tile,
         "vaeWinoSpatial: bad tile-row range");
+    TLLM_CHECK_WITH_INFO(0 <= p.segments && p.segments <= 3, "vaeWinoSpatial: at most three frame segments");
+    if (p.segments > 0)
+    {
+        TLLM_CHECK_WITH_INFO(p.stackFrames, "vaeWinoSpatial: frame segments need stacked frames");
+        int total = 0;
+        for (int s = 0; s < p.segments; ++s)
+        {
+            TLLM_CHECK_WITH_INFO(p.segFrames[s] > 0, "vaeWinoSpatial: empty frame segment");
+            total += p.segFrames[s];
+        }
+        TLLM_CHECK_WITH_INFO(total == p.frames, "vaeWinoSpatial: frame segments must add up to N");
+    }
 }
 
 template <typename T, int M>

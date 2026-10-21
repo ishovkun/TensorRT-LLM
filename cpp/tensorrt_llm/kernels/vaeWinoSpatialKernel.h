@@ -56,6 +56,13 @@ struct VaeWinoSpatialParams
     int tile;        // output tile side m: 2 (F(2x2, 3x3)) or 4 (F(4x4, 3x3))
     int stackFrames; // input transform only: V layout [(m+2)^2, ntilesStrip, N * C]
     int halfFrames;  // frames (and the output transform's bias) are fp16 instead of bf16
+    // Input transform with stacked frames only: the N frames may live in up to three separate
+    // buffers (leading zero frames, the causal history, the new frame), frame n being frame
+    // n - start of its segment; a null segment pointer stands for zero frames. 0 segments: all
+    // frames in the `frames` argument.
+    int segments;
+    void const* segPtr[3];
+    int segFrames[3];
 };
 
 void launchVaeWinoSpatialInput(void const* frames, void* v, VaeWinoSpatialParams const& p, cudaStream_t stream);

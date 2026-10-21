@@ -528,6 +528,78 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa
     wino_combine_reference,
 )
 
+
+@upsample_op
+@cuda_op
+@pytest.mark.parametrize("mode", ["rows", "slabs"])
+@pytest.mark.parametrize("with_bias", [False, True])
+# (factor_t, cin -> cout): no shortcut; repeats 8 (one element per channel, up0); repeats 4
+# and 2 (two elements per channel, up1 / up2); first-chunk crop.
+@pytest.mark.parametrize(
+    "shortcut_spec",
+    [None, (2, 64, 64, False), (2, 128, 64, False), (1, 128, 64, False), (2, 64, 64, True)],
+)
+def test_upsample_norm_matches_gather_then_norm(
+    mode: str, with_bias: bool, shortcut_spec: tuple[int, int, int, bool] | None
+) -> None:
+    """The norm kernel forming the upsampled frames while reading (item 38) is bit-identical to
+    the gather kernel followed by the norm, in the row mode and the Winograd slab mode."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
+        frames_view,
+        rms_norm_silu_cuda,
+        upsample_rms_norm_silu_cuda,
+        upsample_source,
+        wino_norm_silu_cuda,
+    )
+
+    factor_t, cin, cout, first_chunk = shortcut_spec or (1, 64, 64, False)
+    tr, h, w = 2, 5, 6
+    frames = tr * factor_t - (factor_t - 1 if first_chunk else 0)
+    if mode == "slabs" and frames % 2:
+        # The first-chunk crop leaves an odd frame count, which the model routes through the
+        # row mode; the pair walk never sees it.
+        pytest.skip("odd frame count after the first-chunk crop: row mode only")
+    gen = torch.Generator(device="cuda").manual_seed(cin + cout + factor_t)
+    temp = torch.randn(frames, 4 * cout, h + 1, w + 1, generator=gen, device="cuda")
+    temp = temp.to(torch.bfloat16).contiguous(memory_format=torch.channels_last)
+    bias = (
+        (0.1 * torch.randn(cout, generator=gen, device="cuda")).to(torch.bfloat16)
+        if with_bias
+        else None
+    )
+    residual = None
+    repeats, crop = 1, 0
+    if shortcut_spec is not None:
+        frames_r = (frames + (factor_t - 1 if first_chunk else 0)) // factor_t
+        residual = torch.randn(1, cin, frames_r, h, w, generator=gen, device="cuda").to(
+            torch.bfloat16
+        )
+        residual = residual.to(memory_format=torch.channels_last_3d)
+        dup = DupUp3D(cin, cout, factor_t=factor_t, factor_s=2)
+        repeats = dup.repeats
+        crop = factor_t - 1 if first_chunk else 0
+    gamma = (1 + 0.1 * torch.randn(cout, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
+    nbias = (0.05 * torch.randn(cout, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
+    scale = cout**0.5
+    x = upsample_gather_cuda(temp, residual, 1, frames, factor_t, repeats, crop, bias=bias)
+    up = upsample_source(temp, residual, bias, factor_t, repeats, crop)
+    if mode == "rows":
+        want = rms_norm_silu_cuda(x, gamma, nbias, scale)
+        s, got = upsample_rms_norm_silu_cuda(up, gamma, nbias, scale)
+        assert torch.equal(s, x)
+        assert torch.equal(got, want)
+        return
+    cache = torch.randn(1, cout, 2, 2 * h, 2 * w, generator=gen, device="cuda").to(torch.bfloat16)
+    cache = frames_view(cache.to(memory_format=torch.channels_last_3d))
+    args = (cache, gamma.reshape(-1), nbias.reshape(-1), scale, frames)
+    kw = dict(order=2, half_slabs=True)
+    _, tail_want, d_want = wino_norm_silu_cuda(frames_view(x), None, None, None, *args, **kw)
+    s, tail, d = wino_norm_silu_cuda(None, None, None, None, *args, upsample=up, **kw)
+    assert torch.equal(s.view(frames, -1, cout), frames_view(x))
+    assert torch.equal(tail, tail_want)
+    assert torch.equal(d, d_want)
+
+
 frame_ops = pytest.mark.skipif(
     not cuda_frame_ops_available(), reason="trtllm::vae_interleave_bias not built"
 )
@@ -810,6 +882,48 @@ def test_spatial_winograd_frames_matches_conv3d(
     got = wino_spatial_conv_frames(frames, u, h, w, bias)
     x = frames.view(taps, h, w, cin).permute(3, 0, 1, 2).unsqueeze(0).float()
     x = F.pad(x, (0, 0, 0, 0, 3 - taps, 0))  # zero history before the first frame
+    ref = F.conv3d(x, weight.float(), bias.float() if with_bias else None, 1, (0, 1, 1))
+    ref = ref[0, :, 0].permute(1, 2, 0).reshape(h * w, cout)
+    rel = ((got.float() - ref).norm() / ref.norm()).item()
+    assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@spatial_op
+@pytest.mark.parametrize("cin_cout", [(64, 128), (128, 256)])
+@pytest.mark.parametrize("hw", [(6, 10), (9, 13)])
+@pytest.mark.parametrize("history", [0, 1, 2])
+@pytest.mark.parametrize("kernel", ["cublas", "cute"])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_spatial_winograd_taps_matches_conv3d(
+    cin_cout: tuple[int, int], hw: tuple[int, int], history: int, kernel: str, with_bias: bool
+) -> None:
+    """The single-frame path with the history frames in their own buffer (``history`` of them,
+    zero frames before): the cuBLAS GEMM + output transform, or the two-pass CuTe kernel with
+    the output transform and the bias in its epilogue."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
+        cute_taps_eligible,
+        cute_taps_filters,
+        wino_spatial_conv_taps,
+        winograd_spatial_taps_weights,
+    )
+
+    torch.manual_seed(4)
+    cin, cout = cin_cout
+    h, w = hw
+    if kernel == "cute" and not cute_taps_eligible(cin, cout, 3, 2):
+        if cout % 256 or (3 * cin) % 64:
+            pytest.skip("the two-pass kernel needs Cout % 256 == 0 and K % 64 == 0")
+        pytest.skip("CuTe DSL spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
+    bias = torch.randn(cout, device="cuda").to(torch.bfloat16) if with_bias else None
+    frames = torch.randn(3, h * w, cin, device="cuda").to(torch.bfloat16)
+    frames[: 2 - history].zero_()
+    taps = ([frames[2 - history : 2]] if history else []) + [frames[2:]]
+    u = winograd_spatial_taps_weights(weight, 2, 3)
+    if kernel == "cute":
+        u = cute_taps_filters(u)
+    got = wino_spatial_conv_taps(taps, 2 - history, u, h, w, bias, kernel)
+    x = frames.view(3, h, w, cin).permute(3, 0, 1, 2).unsqueeze(0).float()
     ref = F.conv3d(x, weight.float(), bias.float() if with_bias else None, 1, (0, 1, 1))
     ref = ref[0, :, 0].permute(1, 2, 0).reshape(h * w, cout)
     rel = ((got.float() - ref).norm() / ref.norm()).item()
