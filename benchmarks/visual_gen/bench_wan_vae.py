@@ -32,6 +32,12 @@ if str(_THIRD_PARTY) not in sys.path:
     sys.path.insert(0, str(_THIRD_PARTY))
 
 VLLM_BACKENDS = {"vllm_lossless": "lossless", "vllm_channels_last": "channels_last"}
+# vLLM-Omni's multi-GPU VAE decode (vendored, benchmarks/visual_gen/third_party): the Diffusers
+# model with its decoder patched for spatially sharded decode under --world-size > 1. vLLM-Omni
+# does not combine it with its fast path, so the single-GPU vLLM-Omni series stays the fast path.
+VLLM_SHARD_BACKEND = "vllm_spatial_shard"
+# Set by _init_parallel: the process group and split axis the shard backend installs with.
+_SHARD_GROUP: tuple[Any, str] | None = None
 
 # Wan2.2-TI2V-5B VAE, as shipped in Cosmos3 checkpoints' vae/config.json.
 COSMOS_VAE_CONFIG: dict[str, Any] = {
@@ -149,7 +155,7 @@ def _build(
     dtype: torch.dtype,
     winovae_opts: dict[str, Any],
 ) -> torch.nn.Module:
-    if backend == "diffusers" or backend in VLLM_BACKENDS:
+    if backend == "diffusers" or backend in VLLM_BACKENDS or backend == VLLM_SHARD_BACKEND:
         from diffusers import AutoencoderKLWan
 
         model = AutoencoderKLWan(**COSMOS_VAE_CONFIG)
@@ -165,6 +171,12 @@ def _build(
         raise ValueError(backend)
     model.load_state_dict(state_dict, strict=True)
     model = model.to(device="cuda", dtype=dtype).eval().requires_grad_(False)
+    if backend == VLLM_SHARD_BACKEND and _SHARD_GROUP is not None:
+        from vllm_omni_wan_spatial_shard import install_wan_spatial_shard_decode
+
+        group, split_dim = _SHARD_GROUP
+        # Every rank keeps the assembled frames (dst=None), like the TRT-LLM parallel wrapper.
+        install_wan_spatial_shard_decode(model, group, split_dim=split_dim, dst=None)
     if backend in VLLM_BACKENDS:
         # Vendored vLLM-Omni fast path (benchmarks/visual_gen/third_party); rebinds
         # the Diffusers module forwards in place, so decode()/encode() stay the same.
@@ -214,6 +226,8 @@ def _init_parallel(world_size: int, split_dim: str):
         dist.new_group([ranks[i], ranks[i + 1]], use_local_synchronization=False)
         for i in range(world_size - 1)
     ]
+    global _SHARD_GROUP
+    _SHARD_GROUP = (pg, split_dim)
 
     def wrap(model: torch.nn.Module) -> torch.nn.Module:
         return ParallelVAEFactory.from_vae(model, split_dim, pg, adj_groups).eval()
@@ -225,7 +239,7 @@ def _make_op(
     model: torch.nn.Module, backend: str, op: str, inp: torch.Tensor, decode_chunk: int
 ) -> Callable[[], torch.Tensor]:
     if op == "decode":
-        if backend == "diffusers" or backend in VLLM_BACKENDS:
+        if backend == "diffusers" or backend in VLLM_BACKENDS or backend == VLLM_SHARD_BACKEND:
             return lambda: model.decode(inp, return_dict=False)[0]
         return lambda: model.decode(inp, return_dict=False, temporal_chunk_size=decode_chunk)[0]
     if op == "encode":
@@ -579,10 +593,15 @@ def main() -> None:
 
             for backend in backends:
                 t_start = time.time()
+                if backend == VLLM_SHARD_BACKEND and (parallel is None or op != "decode"):
+                    # Decode-only and multi-GPU-only by construction (vLLM-Omni's sharded VAE
+                    # has no encoder path); the single-GPU vLLM-Omni point is the fast path.
+                    print(f"  {backend:9s} skipped ({'single GPU' if parallel is None else op})")
+                    continue
                 model = _build(
                     backend, state_dict, dtype, winovae_opts if backend == "winovae" else {}
                 )
-                if parallel is not None:
+                if parallel is not None and backend != VLLM_SHARD_BACKEND:
                     model = parallel(model)
                 run_fn = _make_op(model, backend, op, inp, decode_chunk)
 
@@ -723,11 +742,15 @@ def main() -> None:
                                 where = f" box {lo}..{hi}"
                             if diff:
                                 f0 = diff[0]
-                                first = f"first divergent step {f0}/{len(n0)}: {n0[f0]}; before: {n0[max(0, f0 - 4) : f0]}; after: {n0[f0 + 1 : f0 + 4]}"
+                                first = (
+                                    f"first divergent step {f0}/{len(n0)}: {n0[f0]}; "
+                                    f"before: {n0[max(0, f0 - 4) : f0]}; after: {n0[f0 + 1 : f0 + 4]}"
+                                )
                             else:
                                 first = "records identical"
                             print(
-                                f"    [debug] call {k + 1} vs call 1: {nd} output values differ, max {d.max().item():.3f}{where}; {len(diff)} records differ; {first}",
+                                f"    [debug] call {k + 1} vs call 1: {nd} output values differ, "
+                                f"max {d.max().item():.3f}{where}; {len(diff)} records differ; {first}",
                                 flush=True,
                             )
                         del runs
