@@ -33,8 +33,8 @@ from plot_wino_vae_ladder import COLUMNS as _LADDER_COLUMNS  # noqa: E402
 
 PANELS = tuple(
     (op, shape, title)
+    for op in ("encode", "decode")  # one row per op: encode on top, decode below
     for column in ("t2i", "t2v_720p", "edge_480p", "bimanual_sim")
-    for op in ("encode", "decode")
     for shape, _field, title in (_LADDER_COLUMNS[column][op],)
 )
 
