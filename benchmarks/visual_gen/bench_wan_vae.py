@@ -487,12 +487,9 @@ def main() -> None:
         sys.exit(subprocess.call(cmd))
     dist_rank, parallel = _init_parallel(args.world_size, args.split_dim)
     if parallel is not None:
-        unsupported = [
-            b for b in args.backends.split(",") if b in ("winovae",) or b in VLLM_BACKENDS
-        ]
+        unsupported = [b for b in args.backends.split(",") if b in VLLM_BACKENDS]
         if unsupported:
-            # WinoVae has no halo-exchange wrapper yet (its fused norm/slab path would have to
-            # exchange borders), and the vLLM-Omni fast path refuses sharded modules.
+            # The vLLM-Omni fast path refuses sharded modules.
             print(
                 f"[parallel] world_size={args.world_size}: skipping {unsupported} (no parallel wrapper)",
                 file=sys.stderr,
@@ -610,6 +607,130 @@ def main() -> None:
                     row["peak_alloc_gb"] = torch.cuda.max_memory_allocated() / 2**30
                     row["output_shape"] = list(out.shape)
                     out_cpu = out.float().cpu()
+                    if os.environ.get("BENCH_DEBUG_FIRST_CALL"):
+                        # Race probe: exact checksums (integer sum of the raw bits, no host
+                        # syncs) of every stage of a second and a third call; report the first
+                        # step where they diverge from the first.
+                        from tensorrt_llm._torch.visual_gen.models.wan import (
+                            wino_vae,
+                            wino_vae_shard,
+                        )
+
+                        record: list[tuple[str, torch.Tensor]] = []
+
+                        def _ck(t: torch.Tensor) -> torch.Tensor:
+                            t = t.detach()
+                            bits = (
+                                t.view(torch.int16)
+                                if t.element_size() == 2
+                                else t.view(torch.int32)
+                            )
+                            return bits.long().sum().reshape(1)
+
+                        def _tensors(obj):
+                            if isinstance(obj, torch.Tensor):
+                                yield obj
+                            elif isinstance(obj, (list, tuple)):
+                                for o in obj:
+                                    yield from _tensors(o)
+                            elif isinstance(obj, wino_vae.PendingAdd):
+                                for o in (obj.a, obj.b, *(obj.wino or [])):
+                                    if o is not None:
+                                        yield o
+                            elif isinstance(obj, wino_vae.WinoSlabs):
+                                yield obj.stacked
+
+                        def rec(name, obj):
+                            for i, t in enumerate(_tensors(obj)):
+                                record.append((f"{name}#{i}", _ck(t)))
+
+                        handles = []
+                        base = getattr(model, "vae_backend", model)
+                        for name_, module_ in base.named_modules():
+                            if isinstance(
+                                module_,
+                                (
+                                    wino_vae.WinoVaeResidualBlock,
+                                    wino_vae.WinoVaeResample,
+                                    wino_vae.WinoVaeAttentionBlock,
+                                ),
+                            ):
+
+                                def hook(mod, inputs, output, _name=name_):
+                                    rec(_name, output)
+
+                                handles.append(module_.register_forward_hook(hook))
+                        patched = {}
+
+                        def patch(cls, attr, label):
+                            orig = getattr(cls, attr)
+
+                            def wrapper(self, *a, **k):
+                                out = orig(self, *a, **k)
+                                rec(label, out)
+                                return out
+
+                            patched[(cls, attr)] = orig
+                            setattr(cls, attr, wrapper)
+
+                        patch(wino_vae.WinoVaeCausalConv3d, "forward_winograd", "forward_winograd")
+                        patch(wino_vae.WinoVaeCausalConv3d, "slab_conv", "slab_conv")
+                        # (the slabs are recorded after their halo lines are zeroed, at the exchange)
+                        orig_fsw = wino_vae.WinoVaeRMSNorm.forward_silu_wino
+
+                        def fsw(self, *a, **k):
+                            out = orig_fsw(self, *a, **k)
+                            rec("forward_silu_wino", out[:2])
+                            return out
+
+                        patched[(wino_vae.WinoVaeRMSNorm, "forward_silu_wino")] = orig_fsw
+                        wino_vae.WinoVaeRMSNorm.forward_silu_wino = fsw
+                        patch(wino_vae.PendingAdd, "materialize", "materialize")
+                        orig_exchange = wino_vae_shard.Shard.exchange
+
+                        def exchange(self, phys, geo):
+                            record.append(("exchange.before", _ck(phys)))
+                            orig_exchange(self, phys, geo)
+                            record.append(("exchange.after", _ck(phys)))
+
+                        wino_vae_shard.Shard.exchange = exchange
+                        runs = []
+                        for _k in range(int(os.environ.get("BENCH_DEBUG_CALLS", "3"))):
+                            record.clear()
+                            with torch.inference_mode():
+                                o = run_fn().clone()
+                            torch.cuda.synchronize()
+                            runs.append(
+                                (o, [n for n, _ in record], torch.cat([v for _, v in record]).cpu())
+                            )
+                        for h in handles:
+                            h.remove()
+                        for (cls, attr), orig in patched.items():
+                            setattr(cls, attr, orig)
+                        wino_vae_shard.Shard.exchange = orig_exchange
+                        o0, n0, s0 = runs[0]
+                        for k, (o, n, sv) in enumerate(runs[1:], 1):
+                            d = (o.float() - o0.float()).abs()
+                            nd = int((d > 0).sum().item())
+                            diff = (sv != s0).nonzero().flatten().tolist() if n == n0 else []
+                            where = ""
+                            if nd:
+                                idx = (d > 0).nonzero()
+                                lo, hi = (
+                                    idx.min(dim=0).values.tolist(),
+                                    idx.max(dim=0).values.tolist(),
+                                )
+                                where = f" box {lo}..{hi}"
+                            if diff:
+                                f0 = diff[0]
+                                first = f"first divergent step {f0}/{len(n0)}: {n0[f0]}; before: {n0[max(0, f0 - 4) : f0]}; after: {n0[f0 + 1 : f0 + 4]}"
+                            else:
+                                first = "records identical"
+                            print(
+                                f"    [debug] call {k + 1} vs call 1: {nd} output values differ, max {d.max().item():.3f}{where}; {len(diff)} records differ; {first}",
+                                flush=True,
+                            )
+                        del runs
                     if reference is not None:
                         row["vs_ref_fp32"] = _metrics(out_cpu, reference)
                     if backend == "native":

@@ -879,7 +879,7 @@ def test_spatial_winograd_conv_frame_dtypes(
 
 
 @spatial_op
-@pytest.mark.parametrize("mode", ["wa", "wb", "wa0", "wb0", "wb1", None])
+@pytest.mark.parametrize("mode", ["wa", "wb", "wa0", "wb0", "wb1", "wb1d", None])
 @pytest.mark.parametrize(
     "cin_cout_hw_pairs", [(64, 256, 6, 12, 4), (128, 256, 9, 16, 2), (512, 512, 24, 40, 2)]
 )
@@ -1051,3 +1051,166 @@ def test_unpatchify_clamp_into_matches_eager(patch: int, shape: tuple[int, int, 
     unpatchify_clamp_into(chunks[1], out, 1, patch)
     ref = torch.clamp(unpatchify(torch.cat(chunks, dim=2), patch), -1.0, 1.0)
     assert torch.equal(out.float(), ref.float())
+
+
+# ---------------------------------------------------------------------------
+# Frame geometry: products read from, and slabs / rows written to, frames with halo rows
+# or columns (the spatially sharded model exchanges the halos)
+# ---------------------------------------------------------------------------
+
+
+def _halo_geometry(h: int, w: int, axis: str):
+    from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import FrameGeometry
+
+    if axis == "h":
+        return FrameGeometry(h, w, h + 2, w, 1, 0)
+    return FrameGeometry(h, w, h, w + 2, 0, 1)
+
+
+def _embed(frames: torch.Tensor, geo) -> torch.Tensor:
+    """Frames ``[..., H*W, C]`` placed inside physical frames ``[..., rows*cols, C]`` whose
+    halo positions hold a sentinel the kernel must never read."""
+    lead = frames.shape[:-2]
+    out = torch.full(
+        (*lead, geo.rows, geo.cols, frames.shape[-1]), 7.0, dtype=frames.dtype, device=frames.device
+    )
+    out[..., geo.row0 : geo.row0 + geo.height, geo.col0 : geo.col0 + geo.width, :] = frames.view(
+        *lead, geo.height, geo.width, -1
+    )
+    return out.view(*lead, geo.frame, frames.shape[-1])
+
+
+def _interior(phys: torch.Tensor, geo) -> torch.Tensor:
+    lead = phys.shape[:-2]
+    v = phys.view(*lead, geo.rows, geo.cols, -1)
+    return v[..., geo.row0 : geo.row0 + geo.height, geo.col0 : geo.col0 + geo.width, :].reshape(
+        *lead, geo.height * geo.width, -1
+    )
+
+
+@cuda_op
+@pytest.mark.parametrize("C", [256, 160, 48, 24, 16])
+@pytest.mark.parametrize("axis", ["h", "w"])
+@pytest.mark.parametrize("order", [2, 4])
+def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None:
+    """Producer: slabs into halo frames; consumer: products from halo frames; both bitwise."""
+    from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
+
+    gen = torch.Generator(device="cuda").manual_seed(C)
+    H, W, T = 6, 10, 2 * order
+    P = H * W
+    bf = torch.bfloat16
+    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
+    x = rnd(T, P, C)
+    residual = rnd(T, P, C)
+    in_bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    cache = rnd(2, P, C)
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    geo = _halo_geometry(H, W, axis)
+
+    # Producer with a slab geometry.
+    s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
+        x, None, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, half_slabs=True
+    )
+    d_phys = torch.full(
+        (order + 2, T // order, geo.frame, C), 7.0, dtype=torch.float16, device="cuda"
+    )
+    s, tail, d = jit_norm.wino_norm_silu(
+        x,
+        None,
+        residual,
+        in_bias,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        half_slabs=True,
+        slab_geometry=geo,
+    )
+    assert d.shape == d_phys.shape
+    assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref)
+    assert torch.equal(_interior(d, geo), d_ref)
+
+    # Consumer with a products geometry (halo positions hold a sentinel).
+    m_ref = [rnd(T // order, P, C).to(torch.float16) for _ in range(order + 2)]
+    s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
+        None, m_ref, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, half_slabs=True
+    )
+    m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
+    s, tail, d = jit_norm.wino_norm_silu(
+        None,
+        m_phys,
+        residual,
+        in_bias,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        half_slabs=True,
+        products_geometry=geo,
+    )
+    assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref) and torch.equal(d, d_ref)
+
+    # Both at once: products with halos in, slabs with halos out.
+    s, tail, d = jit_norm.wino_norm_silu(
+        None,
+        m_phys,
+        residual,
+        in_bias,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        half_slabs=True,
+        products_geometry=geo,
+        slab_geometry=geo,
+    )
+    assert torch.equal(s, s_ref) and torch.equal(_interior(d, geo), d_ref)
+
+
+@cuda_op
+@pytest.mark.parametrize("C", [256, 160, 48, 24, 16])
+@pytest.mark.parametrize("axis", ["h", "w"])
+def test_rows_and_combine_geometry_match_plain(C: int, axis: str) -> None:
+    from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
+
+    gen = torch.Generator(device="cuda").manual_seed(C)
+    H, W, T = 6, 10, 3
+    P = H * W
+    bf = torch.bfloat16
+    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
+    geo = _halo_geometry(H, W, axis)
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    bias = (0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+
+    # Row norm into halo frames.
+    x = rnd(T * P, C)
+    residual = rnd(T * P, C)
+    s_ref, y_ref = jit_norm.rms_norm_silu_rows(x, gamma, bias, C**0.5, residual=residual)
+    out = torch.full((T * geo.frame, C), 7.0, dtype=bf, device="cuda")
+    s, y = jit_norm.rms_norm_silu_rows(
+        x, gamma, bias, C**0.5, residual=residual, out=out, frames=T, out_geometry=geo
+    )
+    assert torch.equal(s, s_ref)
+    assert torch.equal(_interior(y.view(T, geo.frame, C), geo), y_ref.view(T, P, C))
+    halo = y.view(T, geo.rows, geo.cols, C)
+    edge = halo[:, 0] if axis == "h" else halo[:, :, 0]
+    assert torch.all(edge == 7.0), "halo positions must stay untouched"
+
+    # Combine from halo products (plain and zero-padded output).
+    m_ref = [rnd(T, P, C).to(torch.float16) for _ in range(6)]
+    T4 = 4
+    m_ref = [mk[:1] for mk in m_ref]  # one group of four frames
+    bias_c = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    res = rnd(T4, P, C)
+    for pad in (0, 1):
+        ref = jit_norm.combine(None, list(m_ref), bias_c, res, T4, H, W, pad, pad)
+        m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
+        got = jit_norm.combine(None, m_phys, bias_c, res, T4, H, W, pad, pad, products_geometry=geo)
+        assert torch.equal(got, ref)

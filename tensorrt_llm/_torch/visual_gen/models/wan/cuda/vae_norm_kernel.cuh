@@ -79,6 +79,15 @@ struct VaeNormParams
     int width;
     int padH;          // extra zero rows at the bottom of the row output (0 or 1)
     int padW;          // extra zero columns at the right (0 or 1)
+    // Physical frame geometry of the products (IN_MAP) and of the slab / row output (OUT_MAP)
+    // when they carry halo rows or columns: logical position (i, j) of a W-wide frame sits at
+    // i * physW + j + physOff inside a frame of physFrame positions.
+    long long inFrame;
+    int inW;
+    int inOff;
+    long long outFrame;
+    int outW;
+    int outOff;
     float scale;
     float eps;
 };
@@ -99,7 +108,8 @@ struct Ptrs
     T* yTail;
     T* y;
     TD* d;
-    int64_t compStride;
+    int64_t compStride;   // elements between the slab components of d
+    int64_t inCompStride; // elements between the product components of m
 };
 
 // a (+/-) b with the eager bf16 rounding in reference mode.
@@ -187,12 +197,14 @@ __host__ __device__ constexpr int sharedBytes(int channels)
 #endif
 
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED>
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP>
 __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormParams const& p)
 {
     constexpr bool SLABS = OUT == kOutSlabs;
     static_assert(!SLABS || MID == kMidNormSilu, "slabs are formed from normalized, activated frames");
     static_assert(!PADDED || OUT == kOutRows, "padding applies to the row output");
+    static_assert(!(PADDED && OUT_MAP), "the padded row output has its own position map");
+    static_assert(!IN_MAP || IN_WINO, "the input map applies to the products");
     static_assert(IN_WINO || SLABS || R == 1, "R is 1 unless products are combined or slabs are emitted");
     using Vec = PackedAligned<T, V>;
     using VecD = PackedAligned<TD, V>;
@@ -225,6 +237,33 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     int64_t const P = p.positions;
     int const outW = p.width + p.padW;
     int64_t const POut = PADDED ? static_cast<int64_t>(p.height + p.padH) * outW : P;
+    int64_t const inFrame = IN_MAP ? p.inFrame : P;       // physical positions per product frame
+    int64_t const outFrame = OUT_MAP ? p.outFrame : POut; // physical positions per output frame
+    // Physical index of a logical position inside a product / output frame.
+    auto inIndex = [&](int64_t pos) -> int64_t
+    {
+        if constexpr (IN_MAP)
+        {
+            int const i = static_cast<int>(pos) / p.width;
+            return static_cast<int64_t>(i) * p.inW + (static_cast<int>(pos) - i * p.width) + p.inOff;
+        }
+        else
+        {
+            return pos;
+        }
+    };
+    auto outIndex = [&](int64_t pos) -> int64_t
+    {
+        if constexpr (OUT_MAP)
+        {
+            int const i = static_cast<int>(pos) / p.width;
+            return static_cast<int64_t>(i) * p.outW + (static_cast<int>(pos) - i * p.width) + p.outOff;
+        }
+        else
+        {
+            return pos;
+        }
+    };
     int const posInBlock = warp * kPosPerWarp + group;
 
     // Table layout: the V floats of vector vi are split into 16-byte quarters stored in
@@ -315,13 +354,14 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
         T const* res;
     };
 
-    auto srcOf = [&](int t, int64_t spos) -> FrameSrc
+    // ``sposSrc``: the position's physical index inside a product frame (inIndex(spos)).
+    auto srcOf = [&](int t, int64_t spos, int64_t sposSrc) -> FrameSrc
     {
         FrameSrc f{};
         int64_t const frow = static_cast<int64_t>(t) * P + spos;
         if constexpr (IN_WINO)
         {
-            f.in = gRow(ptrs.m, static_cast<int64_t>(t / R) * P + spos);
+            f.in = gRow(ptrs.m, static_cast<int64_t>(t / R) * inFrame + sposSrc);
         }
         else
         {
@@ -347,7 +387,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
 #pragma unroll
             for (int j = 0; j < numTerms<R>(J); ++j)
             {
-                dst[j] = loadVec(f.in + termIndex<R>(J, j) * ptrs.compStride, k);
+                dst[j] = loadVec(f.in + termIndex<R>(J, j) * ptrs.inCompStride, k);
             }
         }
         else
@@ -377,6 +417,8 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     for (int64_t opos = static_cast<int64_t>(blockIdx.x) * kPosPerBlock + posInBlock; opos < POut; opos += gridPos)
     {
         int64_t const pos = sourcePos(opos);
+        int64_t const posSrc = IN_MAP ? inIndex(pos) : pos;
+        int64_t const posOut = OUT_MAP ? outIndex(opos) : opos;
         if constexpr (PADDED)
         {
             if (pos < 0)
@@ -425,7 +467,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
 
         if (!prefetched)
         {
-            src = srcOf(0, pos);
+            src = srcOf(0, pos, posSrc);
             if constexpr (PF)
             {
                 loadSlice(cuda::std::integral_constant<int, 0>{}, inA, resA, src, 0);
@@ -450,6 +492,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
             bool const nextInPos = t + 1 < T_;
             int64_t const nextPos = nextInPos ? pos : sourcePos(opos + gridPos);
             bool const hasNext = nextInPos || (opos + gridPos < POut && nextPos >= 0);
+            int64_t const nextPosSrc = nextInPos ? posSrc : (IN_MAP && hasNext ? inIndex(nextPos) : nextPos);
             FrameSrc next{};
             if constexpr (FRAME_PF)
             {
@@ -457,7 +500,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                 // frame is done, so every frame reads inA whatever its parity.
                 if (hasNext)
                 {
-                    next = srcOf(nextInPos ? t + 1 : 0, nextPos);
+                    next = srcOf(nextInPos ? t + 1 : 0, nextPos, nextPosSrc);
                     if (nextInPos)
                         loadSlice(termsNext, inB, resB, next, 0);
                     else
@@ -475,7 +518,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
             // buffers stay in registers.
             float ss = 0.0f;
             Vec y[K];
-            int64_t const orow = static_cast<int64_t>(t) * POut + opos;
+            int64_t const orow = static_cast<int64_t>(t) * outFrame + posOut;
             auto slice = [&](VecIn const(&cin)[NUM_IN], Vec const& cres, Vec& yk, int k)
             {
                 VecF const ib = constAt(sInBias, ibReg, k);
@@ -613,7 +656,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
             {
                 if (hasNext)
                 {
-                    next = srcOf(nextInPos ? t + 1 : 0, nextPos);
+                    next = srcOf(nextInPos ? t + 1 : 0, nextPos, nextPosSrc);
                     // The next frame's term list is J + 1 within the position, 0 across positions.
                     if (nextInPos)
                     {
@@ -655,7 +698,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                 // f_0 .. f_{J+1} from the ring and f_{J+2}, this frame, from registers) or into
                 // the output row.
                 int const t0 = t - J; // first output frame of the group; f_i is frame t0 - 2 + i
-                int64_t const drow = static_cast<int64_t>(t / R) * P + pos;
+                int64_t const drow = static_cast<int64_t>(t / R) * outFrame + posOut;
                 T* const ySlot = SLABS ? slotPtr(ringSlot<R>(t)) : gRowW(ptrs.y, orow);
 #pragma unroll
                 for (int k = 0; k < K; ++k)
@@ -765,7 +808,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
             {
                 if (nextInPos)
                 {
-                    src = srcOf(t + 1, pos);
+                    src = srcOf(t + 1, pos, posSrc);
                 }
             }
         };
@@ -803,17 +846,19 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
 // Entry point for the runtime-compiled kernel: every argument a scalar (the launcher passes a
 // typed argument list).
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED>
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP>
 __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
-    vaeNormKernel(T const* x, TD const* m, TD* d, long long compStride, T const* residual, T const* inBias,
-        T const* cache, T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions, int channels,
-        int frames, int cacheFrames, int height, int width, int padH, int padW, float scale, float eps)
+    vaeNormKernel(T const* x, TD const* m, TD* d, long long compStride, long long inCompStride, T const* residual,
+        T const* inBias, T const* cache, T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions,
+        int channels, int frames, int cacheFrames, int height, int width, int padH, int padW, long long inFrame,
+        int inW, int inOff, long long outFrame, int outW, int outOff, float scale, float eps)
 {
     Ptrs<T, TD> ptrs{};
     ptrs.x = x;
     ptrs.m = m;
     ptrs.d = d;
     ptrs.compStride = compStride;
+    ptrs.inCompStride = inCompStride;
     ptrs.residual = residual;
     ptrs.inBias = inBias;
     ptrs.cache = cache;
@@ -831,9 +876,16 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
     p.width = width;
     p.padH = padH;
     p.padW = padW;
+    p.inFrame = inFrame;
+    p.inW = inW;
+    p.inOff = inOff;
+    p.outFrame = outFrame;
+    p.outW = outW;
+    p.outOff = outOff;
     p.scale = scale;
     p.eps = eps;
-    vaeNormBody<T, TD, R, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, IN_WINO, MID, OUT, PADDED>(ptrs, p);
+    vaeNormBody<T, TD, R, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, IN_WINO, MID, OUT, PADDED, IN_MAP,
+        OUT_MAP>(ptrs, p);
 }
 
 } // namespace vaewino

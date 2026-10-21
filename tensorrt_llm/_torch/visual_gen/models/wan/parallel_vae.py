@@ -17,12 +17,14 @@ import os
 from typing import Any, Literal
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock, WanCausalConv3d
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
-from tensorrt_llm._torch.visual_gen.models.wan import wan_vae
+from tensorrt_llm._torch.visual_gen.models.wan import wan_vae, wino_vae
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import Shard
 from tensorrt_llm._torch.visual_gen.modules.vae import (
     HaloExchangeConv,
     HaloExchangeConv2dStride2,
@@ -343,3 +345,58 @@ class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
     ) -> DecoderOutput | tuple[torch.Tensor]:
         kwargs["temporal_chunk_size"] = _native_decode_chunk_size(self.world_size, z.dtype)
         return super()._decode_impl(z, **kwargs)
+
+
+class ParallelWinoVae(ParallelVAEBase):
+    """Parallel wrapper for ``WinoVae``: the model itself exchanges halo lines inside its fused
+    paths (``WinoVae.set_shard``), so no modules are replaced; this wrapper splits the input
+    along the shard axis and gathers the output."""
+
+    make_spec = staticmethod(ParallelVAE_Wan.make_spec)
+
+    def _parallelize_modules(self) -> None:
+        axis = "h" if self.spec.split_dim == "height" else "w"
+        self.vae_backend.set_shard(
+            Shard(self.rank, self.world_size, axis, self.pg, self._adj_groups)
+        )
+
+    def _gather_tensor(self, x_local: torch.Tensor) -> torch.Tensor:
+        """All-gather of a channels-last ``[N, C, T, H, W]`` output along the shard axis.
+
+        The collective runs on the physical (N, T, H, W, C) layout, which is contiguous, with
+        the receive slots as views of one flat buffer: NCCL writes the result directly and no
+        per-tensor copy-back is needed (the generic gather hands NCCL non-contiguous tensors
+        and relies on copies after the collective)."""
+        phys = x_local.permute(0, 2, 3, 4, 1)
+        if not phys.is_contiguous():
+            phys = phys.contiguous()
+        parts = torch.empty((self.world_size, *phys.shape), dtype=phys.dtype, device=phys.device)
+        dist.all_gather(list(parts.unbind(0)), phys, group=self.pg)
+        dim = 2 if self.spec.split_dim == "height" else 3
+        full = torch.cat(list(parts.unbind(0)), dim=dim)
+        return full.permute(0, 4, 1, 2, 3)
+
+    def _encode_impl(self, x: torch.Tensor, **kwargs: Any):
+        return_dict = kwargs.pop("return_dict", True)
+        x_local, _ = self._split_tensor(x)
+        posterior_local = self.vae_backend.encode(x_local, return_dict=False, **kwargs)[0]
+        dist_ = wino_vae.LazyDiagonalGaussianDistribution(
+            self._gather_tensor(posterior_local.parameters)
+        )
+        if not return_dict:
+            return (dist_,)
+        return AutoencoderKLOutput(latent_dist=dist_)
+
+    def encode_mode(self, x: torch.Tensor) -> torch.Tensor:
+        x_local, _ = self._split_tensor(x)
+        return self._gather_tensor(self.vae_backend.encode_mode(x_local))
+
+    def _decode_impl(self, z: torch.Tensor, **kwargs: Any) -> DecoderOutput | tuple[torch.Tensor]:
+        return_dict = kwargs.pop("return_dict", True)
+        z_local, _ = self._split_tensor(z)
+        sample = self._gather_tensor(
+            self.vae_backend.decode(z_local, return_dict=False, **kwargs)[0]
+        )
+        if not return_dict:
+            return (sample,)
+        return DecoderOutput(sample=sample)

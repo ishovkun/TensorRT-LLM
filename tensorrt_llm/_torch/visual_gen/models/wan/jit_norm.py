@@ -38,6 +38,40 @@ MID_NONE, MID_NORM, MID_NORM_SILU = 0, 1, 2
 OUT_SLABS, OUT_ROWS = 0, 1
 
 
+@dataclass(frozen=True)
+class FrameGeometry:
+    """Physical layout of a frame that carries halo rows / columns around its ``height`` x
+    ``width`` logical positions: logical (i, j) sits at ``(i + row0) * cols + j + col0`` inside
+    ``rows * cols`` physical positions (spatially sharded models exchange the halos)."""
+
+    height: int
+    width: int
+    rows: int
+    cols: int
+    row0: int = 0
+    col0: int = 0
+
+    @property
+    def frame(self) -> int:
+        return self.rows * self.cols
+
+    @property
+    def offset(self) -> int:
+        return self.row0 * self.cols + self.col0
+
+    @property
+    def identity(self) -> bool:
+        return self.rows == self.height and self.cols == self.width and self.offset == 0
+
+    def __post_init__(self) -> None:
+        if self.row0 + self.height > self.rows or self.col0 + self.width > self.cols:
+            raise ValueError("the logical frame must fit inside the physical one")
+
+
+def _map_args(geo: FrameGeometry | None) -> tuple[int, int, int]:
+    return (geo.frame, geo.cols, geo.offset) if geo is not None else (0, 0, 0)
+
+
 def _check(result, what: str):
     err, *values = result
     if int(err) != 0:
@@ -120,6 +154,8 @@ class Variant:
     mid: int
     out: int
     padded: bool
+    in_map: bool = False
+    out_map: bool = False
 
     def name(self) -> str:
         def b(v: bool) -> str:
@@ -129,14 +165,17 @@ class Variant:
         return (
             f"vaewino::vaeNormKernel<__nv_bfloat16, {td}, {self.order}, {_VEC}, {self.lanes}, {self.k}, "
             f"{b(self.reference)}, {b(self.has_bias)}, {b(self.has_in_bias)}, {b(self.has_residual)}, "
-            f"{b(self.in_wino)}, {self.mid}, {self.out}, {b(self.padded)}>"
+            f"{b(self.in_wino)}, {self.mid}, {self.out}, {b(self.padded)}, {b(self.in_map)}, "
+            f"{b(self.out_map)}>"
         )
 
     def signature(self) -> str:
         t, td = "__nv_bfloat16", "__half" if self.slab_half else "__nv_bfloat16"
         return (
-            f"({t} const*, {td} const*, {td}*, long long, {t} const*, {t} const*, {t} const*, {t} const*, "
-            f"{t} const*, {t}*, {t}*, {t}*, long long, int, int, int, int, int, int, int, float, float)"
+            f"({t} const*, {td} const*, {td}*, long long, long long, {t} const*, {t} const*, {t} const*, "
+            f"{t} const*, "
+            f"{t} const*, {t}*, {t}*, {t}*, long long, int, int, int, int, int, int, int, long long, int, int, "
+            f"long long, int, int, float, float)"
         )
 
     @property
@@ -221,7 +260,7 @@ def _kernel(device: int, variant: Variant) -> _Kernel:
     digest = hashlib.sha256()
     for h in _HEADERS:
         digest.update(_sources()[h].encode())
-    digest.update(f"{name}|{arch}|{'|'.join(_extra_defines())}|v2".encode())
+    digest.update(f"{name}|{arch}|{'|'.join(_extra_defines())}|v3".encode())
     cache = _cache_dir() / f"{digest.hexdigest()[:32]}.cubin"
     lowered_path = cache.with_suffix(".name")
     if cache.exists() and lowered_path.exists():
@@ -230,10 +269,14 @@ def _kernel(device: int, variant: Variant) -> _Kernel:
     else:
         cubin, lowered = _compile_cubin(variant, arch)
         cache.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache.with_suffix(".tmp")
+        # Several processes (the ranks of a sharded run) may compile the same variant at once:
+        # each writes its own temporary and the rename is atomic, so the cache stays consistent.
+        tmp = cache.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_bytes(cubin)
         os.replace(tmp, cache)
-        lowered_path.write_text(lowered)
+        tmp_name = lowered_path.with_suffix(f".{os.getpid()}.tmp")
+        tmp_name.write_text(lowered)
+        os.replace(tmp_name, lowered_path)
     torch.cuda.set_device(device)
     torch.cuda.current_stream(device)  # make sure the primary context exists
     module = _check(cuda.cuModuleLoadData(cubin), "cuModuleLoadData")
@@ -244,9 +287,16 @@ def _kernel(device: int, variant: Variant) -> _Kernel:
 _ARG_TYPES = (
     *(ctypes.c_void_p,) * 3,
     ctypes.c_longlong,
+    ctypes.c_longlong,
     *(ctypes.c_void_p,) * 8,
     ctypes.c_longlong,
     *(ctypes.c_int,) * 7,
+    ctypes.c_longlong,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_longlong,
+    ctypes.c_int,
+    ctypes.c_int,
     ctypes.c_float,
     ctypes.c_float,
 )
@@ -264,6 +314,7 @@ def _launch(
     m_ptr: int,
     d,
     comp_stride: int,
+    in_comp_stride: int,
     residual,
     in_bias,
     cache,
@@ -281,6 +332,8 @@ def _launch(
     pad_h: int,
     pad_w: int,
     scale: float,
+    in_geo: FrameGeometry | None = None,
+    out_geo: FrameGeometry | None = None,
 ) -> None:
     from cuda.bindings import driver as cuda
 
@@ -309,6 +362,7 @@ def _launch(
         m_ptr,
         _addr(d),
         comp_stride,
+        in_comp_stride,
         _addr(residual),
         _addr(in_bias),
         _addr(cache) if cache_frames else 0,
@@ -325,6 +379,8 @@ def _launch(
         width,
         pad_h,
         pad_w,
+        *_map_args(in_geo),
+        *_map_args(out_geo),
         float(scale),
         1e-12,
     )
@@ -367,9 +423,15 @@ def wino_norm_silu(
     order: int = 2,
     half_slabs: bool = False,
     reference_rounding: bool = False,
+    products_geometry: FrameGeometry | None = None,
+    slab_geometry: FrameGeometry | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Temporal Winograd norm: frame layout ``[T, P, C]`` (``m``/``D`` as
-    ``[T/order, P, C]``, cache ``[0..2, P, C]``). Returns ``(sum or None, y_tail, D)``."""
+    ``[T/order, P, C]``, cache ``[0..2, P, C]``). Returns ``(sum or None, y_tail, D)``.
+
+    ``products_geometry`` / ``slab_geometry``: the products are read from, and the slabs
+    written to, frames with halo rows or columns (``[T/order, rows * cols, C]``); the kernel
+    touches the logical positions only."""
     if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
     if order not in (2, 4) or (order == 4 and not half_slabs):
@@ -378,8 +440,29 @@ def wino_norm_silu(
         raise ValueError("frames must be a positive multiple of order")
     comps = order + 2
     slab_dtype = torch.float16 if half_slabs else torch.bfloat16
+    if products_geometry is not None and products_geometry.identity:
+        products_geometry = None
+    if slab_geometry is not None and slab_geometry.identity:
+        slab_geometry = None
+    if products_geometry is not None and x is not None:
+        raise ValueError("products_geometry applies to the products")
     src = x if x is not None else m[0]
-    _, positions, channels = src.shape
+    channels = src.shape[-1]
+    if products_geometry is not None:
+        positions = products_geometry.height * products_geometry.width
+        if m[0].shape[1] != products_geometry.frame:
+            raise ValueError("the products do not match products_geometry")
+    else:
+        positions = src.shape[1]
+    height, width = (
+        (slab_geometry.height, slab_geometry.width)
+        if slab_geometry is not None
+        else (products_geometry.height, products_geometry.width)
+        if products_geometry is not None
+        else (0, 0)
+    )
+    if height and width and height * width != positions:
+        raise ValueError("the geometries must agree on the logical frame")
     if channels % _VEC:
         raise ValueError("channels must be a multiple of 8")
     device = src.device.index
@@ -387,17 +470,16 @@ def wino_norm_silu(
     want_sum = residual is not None or in_bias is not None or x is None
     out_sum = torch.empty((frames, positions, channels), **opts) if want_sum else None
     y_tail = torch.empty((2, positions, channels), **opts)
+    slab_positions = slab_geometry.frame if slab_geometry is not None else positions
     d = torch.empty(
-        (comps, frames // order, positions, channels), device=src.device, dtype=slab_dtype
+        (comps, frames // order, slab_positions, channels), device=src.device, dtype=slab_dtype
     )
     cache_frames = cache.shape[0] if cache is not None and cache.numel() else 0
-    m_ptr = 0
+    m_ptr, m_stride = 0, 0
     if m is not None:
         if len(m) != comps:
             raise ValueError("m must hold order + 2 tensors")
-        m_ptr, stride = _stacked_products(m, slab_dtype)
-        if stride != d[0].numel():
-            raise ValueError("products and slabs must have the same component size")
+        m_ptr, m_stride = _stacked_products(m, slab_dtype)
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
         half_slabs,
@@ -412,6 +494,8 @@ def wino_norm_silu(
         MID_NORM_SILU,
         OUT_SLABS,
         False,
+        products_geometry is not None,
+        slab_geometry is not None,
     )
     _launch(
         variant,
@@ -420,6 +504,7 @@ def wino_norm_silu(
         m_ptr=m_ptr,
         d=d,
         comp_stride=d[0].numel(),
+        in_comp_stride=m_stride,
         residual=residual,
         in_bias=in_bias,
         cache=cache,
@@ -432,11 +517,13 @@ def wino_norm_silu(
         positions=positions,
         channels=channels,
         frames=frames,
-        height=0,
-        width=0,
+        height=height,
+        width=width,
         pad_h=0,
         pad_w=0,
         scale=scale,
+        in_geo=products_geometry,
+        out_geo=slab_geometry,
     )
     return out_sum, y_tail, d
 
@@ -452,13 +539,30 @@ def rms_norm_silu_rows(
     residual: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     silu: bool = True,
+    frames: int = 1,
+    out_geometry: FrameGeometry | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """RMSNorm (+ SiLU, + residual, + deferred bias) on rows ``[N, C]`` bf16: returns
     ``(sum or None, y)``; ``sum = round(x (+ in_bias) + residual)`` is written when a residual
-    is given; ``out`` is an optional destination for ``y``."""
+    is given; ``out`` is an optional destination for ``y``.
+
+    With ``out_geometry`` the rows are ``frames`` frames of ``height * width`` positions and
+    ``out`` holds frames with halo rows / columns (``[frames * rows * cols, C]``); only the
+    logical positions are written."""
     rows, channels = x.shape
     if channels % _VEC:
         raise ValueError("channels must be a multiple of 8")
+    if out_geometry is not None and out_geometry.identity:
+        out_geometry = None
+    height = width = 0
+    if out_geometry is not None:
+        height, width = out_geometry.height, out_geometry.width
+        if out is None or rows != frames * height * width:
+            raise ValueError("out_geometry needs a destination and frames * height * width rows")
+        if out.shape[0] != frames * out_geometry.frame:
+            raise ValueError("out does not match out_geometry")
+    else:
+        frames = 1
     device = x.device.index
     y = out if out is not None else torch.empty_like(x)
     out_sum = torch.empty_like(x) if residual is not None else None
@@ -476,6 +580,8 @@ def rms_norm_silu_rows(
         MID_NORM_SILU if silu else MID_NORM,
         OUT_ROWS,
         False,
+        False,
+        out_geometry is not None,
     )
     _launch(
         variant,
@@ -484,6 +590,7 @@ def rms_norm_silu_rows(
         m_ptr=0,
         d=None,
         comp_stride=0,
+        in_comp_stride=0,
         residual=residual,
         in_bias=in_bias,
         cache=None,
@@ -493,14 +600,15 @@ def rms_norm_silu_rows(
         out_sum=out_sum,
         y_tail=None,
         y=y,
-        positions=rows,
+        positions=rows // frames,
         channels=channels,
-        frames=1,
-        height=0,
-        width=0,
+        frames=frames,
+        height=height,
+        width=width,
         pad_h=0,
         pad_w=0,
         scale=scale,
+        out_geo=out_geometry,
     )
     return out_sum, y
 
@@ -515,15 +623,26 @@ def combine(
     width: int,
     pad_h: int = 0,
     pad_w: int = 0,
+    products_geometry: FrameGeometry | None = None,
 ) -> torch.Tensor:
     """``(combine(m) | x) + bias + residual`` as
     bf16 frames ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns appended, every add
-    rounded like the eager chain."""
+    rounded like the eager chain. ``products_geometry``: the products carry halo rows /
+    columns around their ``height`` x ``width`` logical positions."""
     if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
+    if products_geometry is not None and products_geometry.identity:
+        products_geometry = None
+    if products_geometry is not None and (
+        x is not None
+        or (products_geometry.height, products_geometry.width) != (height, width)
+        or m[0].shape[1] != products_geometry.frame
+    ):
+        raise ValueError("products_geometry must describe the products' frames")
     src = x if x is not None else m[0]
-    positions, channels = src.shape[1], src.shape[2]
-    if height * width != positions:
+    channels = src.shape[2]
+    positions = height * width
+    if products_geometry is None and src.shape[1] != positions:
         raise ValueError("height * width must equal the position count")
     device = src.device.index
     order, m_ptr, stride = 1, 0, 0
@@ -556,6 +675,7 @@ def combine(
         MID_NONE,
         OUT_ROWS,
         padded,
+        products_geometry is not None,
     )
     _launch(
         variant,
@@ -563,7 +683,8 @@ def combine(
         x=x,
         m_ptr=m_ptr,
         d=None,
-        comp_stride=stride,
+        comp_stride=0,
+        in_comp_stride=stride,
         residual=residual,
         in_bias=bias,
         cache=None,
@@ -581,5 +702,6 @@ def combine(
         pad_h=pad_h,
         pad_w=pad_w,
         scale=1.0,
+        in_geo=products_geometry,
     )
     return y

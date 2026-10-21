@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import (
+    FrameGeometry,
     combine,
     rms_norm_silu_rows,
     wino_norm_silu,
@@ -117,13 +118,15 @@ def rms_norm_silu_cuda(
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
     silu: bool = True,
+    out_geometry: FrameGeometry | None = None,
 ) -> torch.Tensor:
     """The CUDA kernel (:mod:`jit_norm` in row mode); same contract as ``rms_norm_silu``.
     ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
     ``out`` is an optional channels-last destination of ``x``'s shape (a frame-buffer
-    window); the result is written there and returned.
+    window); the result is written there and returned. With ``out_geometry`` the destination
+    holds frames with halo lines and only their logical positions are written.
     """
     rows = _channel_rows(x)
     if rows is None:
@@ -142,8 +145,15 @@ def rms_norm_silu_cuda(
         in_bias=in_bias.reshape(-1) if in_bias is not None else None,
         out=dst,
         silu=silu,
+        frames=_frame_count(x),
+        out_geometry=out_geometry,
     )
     return out if out is not None else _rows_to_like(out_rows, x)
+
+
+def _frame_count(x: torch.Tensor) -> int:
+    """Frames of a channels-last ``[N, C, T, H, W]`` or ``[N, C, H, W]`` tensor."""
+    return x.shape[0] * x.shape[2] if x.dim() == 5 else x.shape[0]
 
 
 def _rows_to_like(rows: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
@@ -165,9 +175,11 @@ def add_rms_norm_silu_cuda(
     reference_rounding: bool = False,
     in_bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
+    out_geometry: FrameGeometry | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``s = (x + in_bias) + residual`` (bf16-rounded) and ``SiLU(RMSNorm(s))``; returns ``(s, act)``.
-    ``out``: optional channels-last destination for the activation."""
+    ``out``: optional channels-last destination for the activation (with ``out_geometry``:
+    frames with halo lines, logical positions written)."""
     rows = _channel_rows(x)
     rrows = _channel_rows(residual)
     if rows is None or rrows is None:
@@ -184,6 +196,8 @@ def add_rms_norm_silu_cuda(
         in_bias=in_bias.reshape(-1) if in_bias is not None else None,
         residual=rrows,
         out=dst,
+        frames=_frame_count(x),
+        out_geometry=out_geometry,
     )
     return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
 
@@ -599,11 +613,13 @@ def wino_combine_cuda(
     width: int,
     pad_h: int = 0,
     pad_w: int = 0,
+    products_geometry: FrameGeometry | None = None,
 ) -> torch.Tensor:
     """``(combine(m) | x) + bias + residual`` in frame layout ``[T, P, C]``, eager rounding order.
 
     With ``pad_h``/``pad_w`` the result is ``[T, (H+pad_h)*(W+pad_w), C]`` with zero rows/columns
-    appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``)."""
+    appended (the downsampler's ``ZeroPad2d((0, 1, 0, 1))``). ``products_geometry``: the
+    products carry halo rows / columns (spatially sharded decode)."""
     return combine(
         x,
         m,
@@ -614,6 +630,7 @@ def wino_combine_cuda(
         width,
         pad_h,
         pad_w,
+        products_geometry=products_geometry,
     )
 
 
@@ -673,10 +690,13 @@ def wino_norm_silu_cuda(
     reference_rounding: bool = False,
     order: int = 2,
     half_slabs: bool = False,
+    products_geometry: FrameGeometry | None = None,
+    slab_geometry: FrameGeometry | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
     ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
-    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16."""
+    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16. The
+    geometries describe products / slabs that carry halo rows or columns (sharded decode)."""
     return wino_norm_silu(
         x,
         m,
@@ -690,6 +710,8 @@ def wino_norm_silu_cuda(
         order=order,
         half_slabs=half_slabs,
         reference_rounding=reference_rounding,
+        products_geometry=products_geometry,
+        slab_geometry=slab_geometry,
     )
 
 
