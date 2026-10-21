@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime
 from pathlib import Path
 
 # Bars drawn per panel, in this order, and their display names. The vLLM-Omni bit-exact
@@ -113,7 +114,9 @@ def _ladder_rows(runs: list[dict]) -> list[dict]:
     return rows
 
 
-def _plot(rows: list[dict], out_png: Path, gpu: str, world_size: int, columns: list[str]) -> None:
+def _plot(
+    rows: list[dict], out_png: Path, gpu: str, world_size: int, columns: list[str], newest: str
+) -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -170,7 +173,9 @@ def _plot(rows: list[dict], out_png: Path, gpu: str, world_size: int, columns: l
                 ax.set_ylabel("Median GPU time [ms]")
             ax.set_ylim(0, max(values) * 1.15 if values else 1)
             ax.grid(axis="y", alpha=0.3)
-    fig.suptitle(f"Wan VAE optimization ladder — {gpu}, world_size={world_size}")
+    fig.suptitle(
+        f"Wan VAE optimization ladder — {gpu}, world_size={world_size} (newest run {newest})"
+    )
     fig.tight_layout()
     fig.savefig(out_png, dpi=140)
 
@@ -197,14 +202,20 @@ def main() -> None:
     rows = _ladder_rows(all_runs)
     (out_dir / "ladder.json").write_text(json.dumps(rows, indent=1))
 
-    # One plot per (GPU, world size): ladders on different hardware never share a panel.
-    for stale in out_dir.glob("ladder_*.png"):
-        stale.unlink()
+    # One plot per (GPU, world size): ladders on different hardware never share a panel. A
+    # plot is redrawn only when a run newer than the file exists, so an untouched ladder keeps
+    # its date instead of passing as fresh.
     signatures = sorted({(r["meta"]["gpu_short"], r["meta"]["world_size"]) for r in all_runs})
     for gpu, world_size in signatures:
         sig_rows = [r for r in rows if r["gpu"] == gpu and r["world_size"] == world_size]
+        newest = max(r["timestamp"] for r in sig_rows)
         out_png = out_dir / f"ladder_{gpu}_ws{world_size}.png"
-        _plot(sig_rows, out_png, gpu, world_size, args.columns.split(","))
+        if out_png.exists():
+            newest_epoch = datetime.fromisoformat(newest).timestamp()
+            if out_png.stat().st_mtime >= newest_epoch:
+                print(f"kept {out_png.name}: no run newer than the file (newest run {newest[:16]})")
+                continue
+        _plot(sig_rows, out_png, gpu, world_size, args.columns.split(","), newest[:16])
 
     print(
         f"{'label':22s} {'backend':19s} {'shape':16s} {'op':6s} {'median_ms':>10s} {'p90_ms':>10s}"
