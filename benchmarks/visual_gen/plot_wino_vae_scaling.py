@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 SERIES = (
     ("diffusers", "diffusers"),
@@ -24,13 +27,15 @@ SERIES = (
     ("vllm_spatial_shard", "vllm-omni"),
     ("winovae", "WinoVae"),
 )
-PANELS = (
-    ("decode", "t2v_720p_189f", "decode — 189 frames @ 720x1280"),
-    ("decode", "edge_480p_121f", "decode — 121 frames @ 480x832"),
-    ("decode", "bimanual_480x832_901f", "bimanual-sim decode step (2 latents -> 8 frames)"),
-    ("encode", "t2v_720p_189f", "encode — 189 frames @ 720x1280"),
-    ("encode", "edge_480p_121f", "encode — 121 frames @ 480x832"),
-    ("decode", "t2i_1024", "decode — 1 image @ 1024x1024"),
+# The same eight panels as the ladder plot, in its order (the bimanual step panel reads the
+# steady-state step latency, as there).
+from plot_wino_vae_ladder import COLUMNS as _LADDER_COLUMNS  # noqa: E402
+
+PANELS = tuple(
+    (op, shape, title)
+    for column in ("t2i", "t2v_720p", "edge_480p", "bimanual_sim")
+    for op in ("decode", "encode")
+    for shape, _field, title in (_LADDER_COLUMNS[column][op],)
 )
 
 
@@ -75,7 +80,7 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     panels = [p for p in PANELS if any(k[1] == p[1] and k[2] == p[0] for k in points)]
-    cols = 3
+    cols = 4
     rows_n = -(-len(panels) // cols)
     fig, axes = plt.subplots(rows_n, cols, figsize=(6.2 * cols, 4.6 * rows_n), squeeze=False)
     colors = {name: f"C{i}" for i, (_, name) in enumerate(dict(SERIES).items())}
