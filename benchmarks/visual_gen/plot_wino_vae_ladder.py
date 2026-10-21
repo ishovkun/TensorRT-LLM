@@ -122,7 +122,7 @@ def _plot(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    ops = ("decode", "encode")
+    ops = ("encode", "decode")  # encode on top, decode below
     present = {r["shape"] for r in rows}
     columns = [c for c in columns if any(COLUMNS[c][op][0] in present for op in ops)]
     # Per panel the most recent measurement of each backend is drawn (a run may cover only

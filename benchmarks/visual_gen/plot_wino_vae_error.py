@@ -26,7 +26,7 @@ GROUPS = tuple(
         ("edge_480p", "480p 121f"),
         ("bimanual_sim", "bimanual cond image"),
     )
-    for op in ("decode", "encode")
+    for op in ("encode", "decode")
 )
 
 
