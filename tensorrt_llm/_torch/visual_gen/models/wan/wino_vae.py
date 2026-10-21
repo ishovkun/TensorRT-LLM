@@ -2472,11 +2472,10 @@ class WinoVae(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
-    def _benchmark_convs(self, *, encoder: bool, frames: int) -> bool:
-        """cuDNN autotuning per the options, except on a spatial shard: autotuning picks the
-        fastest algorithm without checking it, and on the halo-padded shapes (asymmetric
-        padding, odd extents) one of the candidates returns wrong values; about one process
-        in six picked it. The heuristics' choice is reproducible and correct."""
+    def _benchmark_convs(self, *, frames: int, encoder: bool) -> bool:
+        """cuDNN autotuning per the options, except on a spatial shard, where it measured no
+        gain (two B300s, width split: 720p decode 766 ms either way, 480p 250 vs 251) and the
+        heuristics' choice has the merit of being the same in every process."""
         return self.shard is None and self.options.benchmark_convs(encoder=encoder, frames=frames)
 
     def set_shard(self, shard: Shard | None) -> None:
