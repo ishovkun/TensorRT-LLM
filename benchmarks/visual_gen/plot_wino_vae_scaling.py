@@ -120,12 +120,18 @@ def main() -> None:
     seen: dict[str, object] = {}
     for handle, label in zip(handles, labels):
         seen.setdefault(label, handle)
+    # Legend right under the title, where the eye lands first.
     fig.legend(
-        seen.values(), seen.keys(), loc="lower center", ncol=len(seen), bbox_to_anchor=(0.5, -0.01)
+        seen.values(),
+        seen.keys(),
+        loc="upper center",
+        ncol=len(seen),
+        bbox_to_anchor=(0.5, 0.925),
+        fontsize=11,
     )
     note = "; ".join(args.note)
-    fig.suptitle(args.title + (f"\n{note}" if note else ""))
-    fig.tight_layout(rect=(0, 0.04, 1, 0.95))
+    fig.suptitle(args.title + (f"\n{note}" if note else ""), y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.89))
     fig.savefig(args.out, dpi=140)
     print(f"wrote {args.out}")
 
