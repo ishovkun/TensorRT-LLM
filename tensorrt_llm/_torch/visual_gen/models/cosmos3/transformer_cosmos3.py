@@ -31,6 +31,7 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.cache import ForwardPlan
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sim_packing import (
     SIM_CONFIG_KEY,
@@ -907,15 +908,13 @@ class Cosmos3CrossAttention(Attention):
         freqs_cos: torch.Tensor,
         freqs_sin: torch.Tensor,
         *,
-        kv_cache: Any,
-        seq_len: int,
-        causal_block_size: int,
+        kv: ForwardPlan,
         timestep=None,
     ) -> torch.Tensor:
         """Attention over the K/V cache: the prompt and the history are read from it,
         the chunk's own K/V are written to it. ``hidden_states`` is ``[1, S_rows, D]``,
-        this rank's shard with padding under sequence parallelism; ``seq_len`` is the
-        chunk's real token count."""
+        this rank's shard with padding under sequence parallelism; ``kv`` carries the
+        chunk's real token count and its causal blocks."""
         batch_size, rows = hidden_states.shape[:2]
         qkv = self.qkv_proj(hidden_states)  # [1, rows, (H + 2 H_kv) * D]
         # One kernel: per-head RMSNorm of Q and K and rotate-half RoPE, in place.
@@ -928,12 +927,11 @@ class Cosmos3CrossAttention(Attention):
                 k=None,
                 v=None,
                 batch_size=batch_size,
-                seq_len=seq_len,
+                seq_len=rows,
                 seq_len_kv=rows,
                 attention_mask=PredefinedAttentionMask.FULL,
                 timestep=timestep,
-                kv_cache=kv_cache,
-                causal_block_size=causal_block_size,
+                kv=kv,
             )
             out = out.reshape(batch_size, rows, -1)
         else:
@@ -944,9 +942,7 @@ class Cosmos3CrossAttention(Attention):
                 v,
                 attention_mask=PredefinedAttentionMask.FULL,
                 timestep=timestep,
-                kv_cache=kv_cache,
-                seq_len=seq_len,
-                causal_block_size=causal_block_size,
+                kv=kv,
             )
         return self.to_out[0](out)
 
@@ -1121,9 +1117,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         residual: torch.Tensor,
         freqs: Tuple[torch.Tensor, torch.Tensor],
         *,
-        kv_cache: Any,
-        seq_len: int,
-        causal_block_size: int,
+        kv: ForwardPlan,
         timestep=None,
     ) -> torch.Tensor:
         """``hidden_states`` is the layer's input already normalised by
@@ -1136,9 +1130,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             hidden_states,
             cos,
             sin,
-            kv_cache=kv_cache,
-            seq_len=seq_len,
-            causal_block_size=causal_block_size,
+            kv=kv,
             timestep=timestep,
         )
         B, S, D = attn.shape
@@ -1874,6 +1866,8 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             hidden_states.device,
             torch.float32,
         )
+        # Denoising attends the chunk as one causal block; the clean pass as one per frame.
+        kv = kv_cache.plan(packing.num_tokens, packing.tokens_per_frame if clean_pass else None)
         out = self._forward_causal_core(
             hidden_states,
             raw_timestep,
@@ -1882,7 +1876,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             action_latents,
             action_domain_ids,
             timestep,
-            kv_cache=kv_cache,
+            kv=kv,
             packing=packing,
             clean_pass=clean_pass,
             first_frame=first_frame,
@@ -1903,7 +1897,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         action_domain_ids: torch.Tensor,
         timestep: Optional[torch.Tensor],
         *,
-        kv_cache: Any,
+        kv: ForwardPlan,
         packing: FramePacking,
         clean_pass: bool,
         first_frame: int,
@@ -1912,7 +1906,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         """The device work of ``forward_causal``: everything after validation and the
         rotary tables. Tensors in, ``(video_velocity, action_velocity)`` out (``None``
         for the clean pass), no host reads, so the pipeline can run it under a CUDA
-        graph keyed on the tensor shapes, the packing, the pass and the cache."""
+        graph keyed on the tensor shapes, the packing, the pass and ``kv.graph_key``."""
         T, H, W = hidden_states.shape[2:]
         hidden_vis = self.vae2llm(self.patchify(hidden_states, T, H, W))
         if not clean_pass:
@@ -1932,7 +1926,6 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden = self.sharder.shard(hidden, dim=1, pad_to_multiple=True)
         cos = self.sharder.shard(cos, dim=1, pad_to_multiple=True)
         sin = self.sharder.shard(sin, dim=1, pad_to_multiple=True)
-        block = packing.tokens_per_frame if clean_pass else num_tokens
 
         # The residual stream lives in ``residual``; ``x`` is the normalised input of
         # the next sub-block. Each layer's output add and the following norm are one
@@ -1950,9 +1943,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     x,
                     residual,
                     (cos, sin),
-                    kv_cache=kv_cache,
-                    seq_len=num_tokens,
-                    causal_block_size=block,
+                    kv=kv,
                     timestep=timestep,
                 )
                 if clean_pass and i + 1 == len(self.gen_layers):
@@ -1961,9 +1952,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         # keys, so later frames attend as in training, and lose their
                         # values, so they contribute nothing (the reference zeroes V).
                         action_slots, _ = packing.frame_slices(0)
-                        start = kv_cache.staging_offset + action_slots.start
+                        start = kv.cache.staging_offset + action_slots.start
                         for layer_idx in range(len(self.gen_layers)):
-                            kv_cache.zero_values(layer_idx, start, packing.action_tokens)
+                            kv.cache.zero_values(layer_idx, start, packing.action_tokens)
                     return None
                 next_norm = (
                     self.gen_layers[i + 1].input_layernorm

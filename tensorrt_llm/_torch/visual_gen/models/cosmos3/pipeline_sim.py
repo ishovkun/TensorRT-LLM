@@ -30,7 +30,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ...cache import BlockCausalKVCacheManager
+from ...cache import BlockCausalKVCacheManager, RolloutSpec
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from ...pipeline_registry import register_pipeline
 from ...utils import postprocess_video_tensor
@@ -467,30 +467,30 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 hi = mid - 1
         return lo
 
-    def _cache_geometry(self, history_frames: int, tokens_per_frame: int) -> dict:
-        """The ``open()`` geometry of a rollout: the window, the most tokens a forward
-        stages (one chunk) and every causal block size a forward may use (a whole
-        chunk for a denoising step, one frame for the clean pass, shorter last chunks)."""
+    def _rollout_spec(self, history_frames: int, tokens_per_frame: int) -> RolloutSpec:
+        """The rollout's cache geometry: the window, one chunk staged per forward, and the
+        causal blocks a forward cuts it into. A denoising step is one causal block of its
+        whole chunk, which is ``k`` frames for a chunk of ``k <= chunk_frames`` frames
+        (the partition's first chunks and the last one may be shorter); the clean pass
+        is one causal block per frame."""
         sim = self.sim
-        return dict(
+        frames = sim.chunk_frames
+        return RolloutSpec(
             window_tokens=max(history_frames, 1) * tokens_per_frame,
-            max_staged_tokens=sim.chunk_frames * tokens_per_frame,
-            causal_block_sizes=tuple(k * tokens_per_frame for k in range(sim.chunk_frames, 0, -1)),
+            max_staged_tokens=frames * tokens_per_frame,
+            causal_blocks={k * tokens_per_frame: frames // k for k in range(1, frames + 1)},
+            max_pin_tokens=sim.text_cache_max_len + sim.sink_frames * tokens_per_frame,
         )
-
-    def _max_pin_tokens(self, tokens_per_frame: int) -> int:
-        return self.sim.text_cache_max_len + self.sim.sink_frames * tokens_per_frame
 
     def _cache_bytes(self, history_frames: int, tokens_per_frame: int) -> int:
         tf = self.transformer
         return BlockCausalKVCacheManager.pool_bytes_for(
+            self._rollout_spec(history_frames, tokens_per_frame),
             num_layers=len(tf.gen_layers),
             num_kv_heads=tf.cache_kv_heads,
             head_dim=tf.gen_layers[0].cross_attention.head_dim,
             dtype=self.dtype,
             tokens_per_page=32,
-            pin_tokens=self._max_pin_tokens(tokens_per_frame),
-            **self._cache_geometry(history_frames, tokens_per_frame),
         )
 
     def _tokens_per_frame(self, height: int, width: int) -> int:
@@ -512,8 +512,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
     def _setup_cuda_graphs(self) -> None:
         """Run the chunk forward under CUDA graphs. The bidirectional forward is not
         wrapped: the rollout never calls it. Keys: the tensor shapes, the packing,
-        the pass and the cache; the cache's page tables and lengths are read at
-        replay from the metadata the loop refreshes after every commit."""
+        the pass and the forward plan's ``graph_key`` (cache, rollout spec, token
+        count, causal block size). Commits rewrite the cache's device tensors in
+        place, so one graph replays for every chunk of the same shape."""
         if not self.pipeline_config.cuda_graph.enable:
             return
         if self.offloader.stages():
@@ -525,7 +526,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         runner.register_extra_key_fn("clean_pass", lambda *a, **k: bool(k.get("clean_pass")))
         runner.register_extra_key_fn("first_chunk", lambda *a, **k: k.get("first_frame") == 0)
         runner.register_extra_key_fn("packing", lambda *a, **k: k.get("packing"))
-        runner.register_extra_key_fn("kv_cache", lambda *a, **k: id(k.get("kv_cache")))
+        runner.register_extra_key_fn("kv", lambda *a, kv=None, **k: kv.graph_key if kv else None)
         tf = self.transformer
         tf._forward_causal_core = runner.wrap(tf._forward_causal_core)
         self._cuda_graph_runners["transformer.forward_causal"] = runner
@@ -567,9 +568,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             dtype=self.dtype,
             tokens_per_page=32,
             pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-                tokens_per_page=32,
-                pin_tokens=self._max_pin_tokens(tokens_per_frame),
-                **self._cache_geometry(self._history_frames, tokens_per_frame),
+                self._rollout_spec(self._history_frames, tokens_per_frame), tokens_per_page=32
             ),
         )
         self._sim_cache_key = tokens_per_frame
@@ -617,8 +616,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             )
         decoder = self._start_overlapped_decode(latents)
         cache.open(
+            self._rollout_spec(self._history_frames, tokens_per_frame),
             pin_tokens=text_len + sim.sink_frames * tokens_per_frame,
-            **self._cache_geometry(self._history_frames, tokens_per_frame),
         )
         try:
             tf.write_prompt_kv(cache, cond_ids, cond_mask, offload_context=offload)
@@ -672,7 +671,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                         timestep=zero_t,
                         offload_context=offload,
                     )
-                    cache.commit((f1 - f0) * tokens_per_frame)
+                    cache.commit()
         finally:
             cache.close()
         if decoder is not None:

@@ -31,7 +31,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from utils.llm_data import get_checkpoint
 
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
 from tensorrt_llm._torch.visual_gen.config import (
     DiffusionPipelineConfig,
     create_attention_metadata_state,
@@ -119,10 +119,11 @@ def model(request):
 
 def make_cache(model):
     tokens_per_frame = A + (H // 2) * (W // 2)
-    geometry = dict(
+    spec = RolloutSpec(
         window_tokens=(WINDOW_FRAMES - 1) * tokens_per_frame,
         max_staged_tokens=CHUNK_FRAMES * tokens_per_frame,
-        causal_block_sizes=tuple(k * tokens_per_frame for k in range(CHUNK_FRAMES, 0, -1)),
+        causal_blocks={k * tokens_per_frame: CHUNK_FRAMES // k for k in range(1, CHUNK_FRAMES + 1)},
+        max_pin_tokens=MAX_TEXT,
     )
     cache = BlockCausalKVCacheManager(
         num_layers=len(model.gen_layers),
@@ -130,11 +131,9 @@ def make_cache(model):
         head_dim=model.gen_layers[0].cross_attention.head_dim,
         dtype=DTYPE,
         tokens_per_page=32,
-        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-            tokens_per_page=32, pin_tokens=MAX_TEXT, **geometry
-        ),
+        pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(spec, tokens_per_page=32),
     )
-    cache.test_geometry = geometry
+    cache.test_spec = spec
     return cache
 
 
@@ -155,7 +154,7 @@ def frames(num_frames, seed, channels=48):
 
 def open_with_prompt(model, cache):
     text_ids, text_mask = prompt()
-    cache.open(pin_tokens=TEXT_LEN, **cache.test_geometry)
+    cache.open(cache.test_spec, pin_tokens=TEXT_LEN)
     assert model.write_prompt_kv(cache, text_ids, text_mask) == TEXT_LEN
     cache.commit(TEXT_LEN)
     return text_ids, text_mask

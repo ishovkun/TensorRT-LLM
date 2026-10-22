@@ -32,12 +32,14 @@ from utils.block_causal_reference import exact_reference as _exact_reference
 from utils.block_causal_reference import reference_attention
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention as BaseTrtllmAttention
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager
+from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.visual_gen.args import AttentionConfig
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -50,23 +52,35 @@ DEVICE = torch.device("cuda")
 PROMPT_CAPACITY = 64
 WINDOW = 64
 CHUNK = 40  # not a page multiple: exercises partial pages and stale tokens
-GEOMETRY = dict(
-    window_tokens=WINDOW, max_staged_tokens=CHUNK, causal_block_sizes=(CHUNK, CHUNK // 4)
-)
 
 
-def make_cache(tokens_per_page, pin_tokens=PROMPT_CAPACITY, geometry=GEOMETRY):
-    """A cache whose pool is sized for ``geometry`` with up to ``pin_tokens`` pinned."""
-    return BlockCausalKVCacheManager(
-        num_layers=1,
+def spec_for(max_pin_tokens=PROMPT_CAPACITY, causal_blocks=None, window_tokens=WINDOW, chunk=CHUNK):
+    """The tests' spec: a denoising step over the whole chunk and four causal blocks of
+    a quarter chunk, unless ``causal_blocks`` says otherwise."""
+    return RolloutSpec(
+        window_tokens=window_tokens,
+        max_staged_tokens=chunk,
+        causal_blocks=causal_blocks or {chunk: 1, chunk // 4: 4},
+        max_pin_tokens=max_pin_tokens,
+    )
+
+
+def make_cache(tokens_per_page, pin_tokens=PROMPT_CAPACITY, spec=None, num_layers=1, dtype=DTYPE):
+    """A cache whose pool is sized for ``spec`` (default: the tests' spec with up to
+    ``pin_tokens`` pinned). The spec rides on the cache for ``open_with_prompt``."""
+    spec = spec or spec_for(max_pin_tokens=pin_tokens)
+    cache = BlockCausalKVCacheManager(
+        num_layers=num_layers,
         num_kv_heads=NUM_KV_HEADS,
         head_dim=HEAD_DIM,
-        dtype=DTYPE,
+        dtype=dtype,
         tokens_per_page=tokens_per_page,
         pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-            tokens_per_page=tokens_per_page, pin_tokens=pin_tokens, **geometry
+            spec, tokens_per_page=tokens_per_page
         ),
     )
+    cache.test_spec = spec
+    return cache
 
 
 exact_reference = partial(_exact_reference, window=WINDOW)
@@ -81,21 +95,21 @@ def cache(request):
         mgr.shutdown()
 
 
-def make_backend(name):
+def make_backend(name, layer_idx=0, dtype=DTYPE):
     if name == "cudnn":
         return CuDNNAttention(
-            layer_idx=0,
+            layer_idx=layer_idx,
             num_heads=NUM_HEADS,
             head_dim=HEAD_DIM,
             num_kv_heads=NUM_KV_HEADS,
-            dtype=DTYPE,
+            dtype=dtype,
         )
     return TrtllmAttention(
-        layer_idx=0,
+        layer_idx=layer_idx,
         num_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
         num_kv_heads=NUM_KV_HEADS,
-        dtype=DTYPE,
+        dtype=dtype,
         max_seq_len=PROMPT_CAPACITY + WINDOW + CHUNK + 32,
         attention_metadata_state={},
     )
@@ -109,8 +123,7 @@ def run(attn, cache, q, k, v, causal_block_size=None):
         v[None],
         batch_size=1,
         seq_len=q.shape[0],
-        kv_cache=cache,
-        causal_block_size=causal_block_size,
+        kv=cache.plan(q.shape[0], causal_block_size),
     )
     return out.reshape(q.shape[0], NUM_HEADS, HEAD_DIM)
 
@@ -124,16 +137,16 @@ def read_kv(cache, layer, positions):
     return buf[page, 0, :, slot, :], buf[page, 1, :, slot, :]
 
 
-def rand_qkv(n):
-    q = torch.randn(n, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
-    k = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
+def rand_qkv(n, dtype=DTYPE):
+    q = torch.randn(n, NUM_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    k = torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
     return q, k, torch.randn_like(k)
 
 
-def open_with_prompt(cache, prompt_len, geometry=GEOMETRY):
-    """Open pinning ``prompt_len`` tokens, write a random prompt at position 0 and
-    commit it; returns its K and V."""
-    cache.open(pin_tokens=prompt_len, **geometry)
+def open_with_prompt(cache, prompt_len):
+    """Open the cache's spec pinning ``prompt_len`` tokens, write a random prompt at
+    position 0 and commit it; returns its K and V."""
+    cache.open(cache.test_spec, pin_tokens=prompt_len)
     pk, pv = rand_qkv(prompt_len)[1:]
     cache.write_range(0, 0, pk, pv)
     if prompt_len:
@@ -144,9 +157,11 @@ def open_with_prompt(cache, prompt_len, geometry=GEOMETRY):
 BACKENDS = ["cudnn", "trtllm"]
 
 
-def lacks_kernel(backend, cache):
+def lacks_kernel(backend, cache, dtype=DTYPE):
     """Whether this build has no attention kernel for the cache's page size on this GPU."""
-    return not make_backend(backend).support_kv_cache_page_size(cache.tokens_per_page)
+    return not make_backend(backend, dtype=dtype).support_kv_cache_page_size(
+        cache.tokens_per_page, dtype
+    )
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -223,6 +238,107 @@ def check_causal_blocks(attn, cache, prompt_k, prompt_v, hk, hv, num_causal_bloc
         run(attn, cache, q, k, v, causal_block_size=7)
 
 
+def expected_fmha_library(dtype, num_causal_blocks):
+    """The FMHA library the TRTLLM backend should pick for a cached forward. On
+    SM100/SM103 FlashInfer's TRTLLM-Gen kernels serve it, except a BF16 context batch
+    of at most 4 requests (one per causal block), which goes to the fallback for LLM
+    time to first token. Elsewhere only the fallback is available."""
+    if get_sm_version() not in (100, 103):
+        return "FallbackFmha"
+    if dtype == torch.bfloat16 and num_causal_blocks <= 4:
+        return "FallbackFmha"
+    return "FlashInferTrtllmGenFmha"
+
+
+def record_fmha_libraries(attn, served):
+    """Wrap the backend's FMHA selection so every library it picks lands in ``served``."""
+    manager = attn._fmha_manager
+    select = manager.select
+
+    def recording_select(*args, **kwargs):
+        fmha = select(*args, **kwargs)
+        served.add(type(fmha).__name__)
+        return fmha
+
+    manager.select = recording_select
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("num_causal_blocks", [1, 4, 8])
+@pytest.mark.parametrize("tokens_per_page", [32, 64], ids=["tpb32", "tpb64"])
+def test_every_layer_and_library_over_a_multi_layer_cache(
+    backend, dtype, num_causal_blocks, tokens_per_page
+):
+    """A 3-layer cache with different K/V in every layer, attended on every layer
+    through a rotating table, with 1, 4 and 8 causal blocks in BF16 and FP16. Each
+    layer must read its own pages. For TRTLLM the cases also cross the FMHA library
+    boundary on SM100/SM103, and the library that served each one is checked. For
+    cuDNN every layer shares one graph."""
+    torch.manual_seed(11)
+    num_layers, prompt_len = 3, 17
+    spec = spec_for(max_pin_tokens=prompt_len, causal_blocks={CHUNK: 1, 10: 4, 5: 8})
+    cache = make_cache(tokens_per_page, spec=spec, num_layers=num_layers, dtype=dtype)
+    try:
+        if lacks_kernel(backend, cache, dtype):
+            pytest.skip("no paged context kernel for this page size in this build")
+        cache.open(spec, pin_tokens=prompt_len)
+        prompt = [rand_qkv(prompt_len, dtype)[1:] for _ in range(num_layers)]
+        for layer, (pk, pv) in enumerate(prompt):
+            cache.write_range(layer, 0, pk, pv)
+        cache.commit(prompt_len)
+        attns = [make_backend(backend, layer, dtype) for layer in range(num_layers)]
+        if backend == "cudnn":
+            CuDNNAttention.clear_graph_cache()
+        served = set()
+        if backend == "trtllm":
+            if get_sm_version() in (100, 103):
+                names = {type(lib).__name__ for lib in attns[0]._fmha_manager.fmha_libs}
+                assert "FlashInferTrtllmGenFmha" in names, f"FMHA libraries built: {names}"
+            for attn in attns:
+                record_fmha_libraries(attn, served)
+        history = [([], []) for _ in range(num_layers)]
+        empty = prompt[0][0].new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
+        size = CHUNK // num_causal_blocks
+        saw_stale = False
+        for step in range(4):  # rotates the table and leaves stale tokens
+            saw_stale |= cache.history_tokens > WINDOW
+            for layer, attn in enumerate(attns):
+                q, k, v = rand_qkv(CHUNK, dtype)
+                out = attn.forward(
+                    q[None],
+                    k[None],
+                    v[None],
+                    batch_size=1,
+                    seq_len=CHUNK,
+                    kv=cache.plan(CHUNK, size),
+                ).reshape(CHUNK, NUM_HEADS, HEAD_DIM)
+                torch.cuda.synchronize()
+                hk = torch.cat(history[layer][0]) if history[layer][0] else empty
+                hv = torch.cat(history[layer][1]) if history[layer][1] else empty
+                pk, pv = prompt[layer]
+                for i in range(num_causal_blocks):
+                    lo, hi = i * size, (i + 1) * size
+                    expected = exact_reference(q, pk, pv, hk, hv, k, v, lo, hi)
+                    torch.testing.assert_close(
+                        out[lo:hi],
+                        expected,
+                        rtol=2e-2,
+                        atol=2e-2,
+                        msg=f"step {step} layer {layer} causal block {i}",
+                    )
+                history[layer][0].append(k)
+                history[layer][1].append(v)
+            cache.commit(CHUNK)
+        assert saw_stale, "test geometry should hold stale tokens at some step"
+        if backend == "trtllm":
+            assert served == {expected_fmha_library(dtype, num_causal_blocks)}
+        else:
+            assert len(CuDNNAttention._graph_cache) == 1, "every layer should share one graph"
+    finally:
+        cache.shutdown()
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_causal_blocks_at_any_alignment(cache, backend):
     """The clean pass: one launch, four causal blocks of 10 sharing pages mid-way,
@@ -291,7 +407,7 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
     def keys(n):
         return torch.randn(n, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
 
-    cache.open(pin_tokens=prompt + sink, **GEOMETRY)
+    cache.open(cache.test_spec, pin_tokens=prompt + sink)
     cache.write_range(0, 0, keys(prompt), indicator_values(watch, 0, prompt))
     cache.commit(prompt)
     for c in range(commits):
@@ -327,7 +443,7 @@ def test_each_block_sees_exactly_its_window(cache, backend, num_causal_blocks, c
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
-    """``seq_len`` counts the real tokens: a padded chunk behaves like the unpadded one."""
+    """The plan counts the real tokens: a padded chunk behaves like the unpadded one."""
     if lacks_kernel(backend, cache):
         pytest.skip("no paged context kernel for this page size in this build")
     torch.manual_seed(6)
@@ -340,8 +456,8 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
         k[None],
         v[None],
         batch_size=1,
-        seq_len=CHUNK,
-        kv_cache=cache,
+        seq_len=CHUNK + pad,
+        kv=cache.plan(CHUNK),
     ).reshape(CHUNK + pad, NUM_HEADS, HEAD_DIM)
     torch.cuda.synchronize()
     expected = reference_attention(
@@ -355,7 +471,10 @@ def test_padding_tokens_are_neither_written_nor_attended(cache, backend):
     torch.testing.assert_close(v_back, v[:CHUNK])
     for bad in (0, CHUNK + pad + 1):
         with pytest.raises(ValueError):
-            attn.forward(q[None], k[None], v[None], batch_size=1, seq_len=bad, kv_cache=cache)
+            cache.plan(bad)
+    with pytest.raises(ValueError, match="exceed"):  # more real tokens than rows
+        short = (x[None, : CHUNK - 1] for x in (q, k, v))
+        attn.forward(*short, batch_size=1, seq_len=CHUNK - 1, kv=cache.plan(CHUNK))
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -430,28 +549,18 @@ def test_graph_replay_survives_commit(cache, backend):
 
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_graph_runner_keys_cached_forwards(backend):
-    """Through VisualGen's CUDAGraphRunner, the way a model runs: with the real token
-    count, the causal block size and the cache registered as extra keys, forwards of
-    equal tensor shapes but different causal block sizes get their own graphs, and commits
-    between forwards replay them (the cache's device state needs no recapture)."""
+    """Through VisualGen's CUDAGraphRunner, the way a model runs: with the plan's graph
+    key registered as an extra key, forwards of equal tensor shapes but different causal
+    block sizes get their own graphs, and commits between forwards replay them (the
+    cache's device state needs no recapture)."""
     torch.manual_seed(7)
     cache = make_cache(32)
     attn = make_backend(backend)
     runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
-    for name in ("seq_len", "causal_block_size"):
-        runner.register_extra_key_fn(name, lambda *a, _n=name, **k: k.get(_n))
-    runner.register_extra_key_fn("kv_cache", lambda *a, **k: id(k.get("kv_cache")))
+    runner.register_extra_key_fn("kv", lambda *a, kv=None, **k: kv.graph_key if kv else None)
 
-    def step(q, k, v, *, seq_len, causal_block_size, kv_cache):
-        out = attn.forward(
-            q[None],
-            k[None],
-            v[None],
-            batch_size=1,
-            seq_len=seq_len,
-            kv_cache=kv_cache,
-            causal_block_size=causal_block_size,
-        )
+    def step(q, k, v, *, kv):
+        out = attn.forward(q[None], k[None], v[None], batch_size=1, seq_len=q.shape[0], kv=kv)
         return out.reshape(q.shape[0], NUM_HEADS, HEAD_DIM)
 
     graphed = runner.wrap(step)
@@ -462,7 +571,7 @@ def test_graph_runner_keys_cached_forwards(backend):
         for i in range(6):
             size = CHUNK if i % 2 == 0 else CHUNK // 4  # denoising step, then clean pass
             q, k, v = rand_qkv(CHUNK)
-            out = graphed(q, k, v, seq_len=CHUNK, causal_block_size=size, kv_cache=cache)
+            out = graphed(q, k, v, kv=cache.plan(CHUNK, size))
             torch.cuda.synchronize()
             hk = torch.cat(history_k) if history_k else empty
             hv = torch.cat(history_v) if history_v else empty
@@ -485,15 +594,14 @@ def test_graph_runner_keys_cached_forwards(backend):
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_graph_survives_reopen_with_a_longer_prefix(backend):
     """A graph captured on a rollout with a short pinned prefix replays correctly on a
-    later rollout of the same geometry whose prefix spans more pages, so nothing the
-    kernels read may be sized to the first rollout's resident capacity."""
+    later rollout of the same spec whose prefix spans more pages, so nothing the
+    kernels read may depend on the first rollout's prefix."""
     torch.manual_seed(6)
     long_prefix = 512  # outgrows the first rollout's capacity by several kernel tiles
     cache = make_cache(32, pin_tokens=long_prefix)
     attn = make_backend(backend)
     try:
         open_with_prompt(cache, 9)
-        first_capacity = cache.capacity
         q, k, v = rand_qkv(CHUNK)  # static buffers the graph reads
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
@@ -514,7 +622,7 @@ def test_graph_survives_reopen_with_a_longer_prefix(backend):
             cache.commit(cache.max_staged_tokens)
             history_k.append(hk)
             history_v.append(hv)
-        assert cache.staging_offset + CHUNK > first_capacity, "keys must outgrow the first rollout"
+        assert cache.fixed_tokens == long_prefix
         q2, k2, v2 = rand_qkv(CHUNK)
         q.copy_(q2), k.copy_(k2), v.copy_(v2)
         graph.replay()
@@ -601,11 +709,10 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
     assert not attn.attn.support_kv_cache()
     assert make_backend("cudnn").support_kv_cache()
     assert make_backend("trtllm").support_kv_cache()
-    q = torch.zeros(1, 8, NUM_HEADS * HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    open_with_prompt(cache, 9)
+    q = torch.zeros(1, CHUNK, NUM_HEADS * HEAD_DIM, device=DEVICE, dtype=DTYPE)
     with pytest.raises(NotImplementedError, match="does not support a K/V cache"):
-        attn._attn_impl(q, q, q, kv_cache=cache, seq_len=8)
-    with pytest.raises(ValueError, match="pass seq_len"):
-        attn._attn_impl(q, q, q, kv_cache=cache)
+        attn._attn_impl(q, q, q, kv=cache.plan(CHUNK))
 
 
 def test_trtllm_refuses_a_page_size_without_a_kernel(cache, monkeypatch):
@@ -648,9 +755,8 @@ def test_padding_with_causal_blocks_over_stale_history(cache, backend):
             k[None],
             v[None],
             batch_size=1,
-            seq_len=CHUNK,
-            kv_cache=cache,
-            causal_block_size=size,
+            seq_len=CHUNK + pad,
+            kv=cache.plan(CHUNK, size),
         )
         .reshape(CHUNK + pad, NUM_HEADS, HEAD_DIM)
     )
@@ -673,10 +779,15 @@ def test_causal_blocks_of_one_and_two_whole_pages(backend, causal_block_size):
     their starts and ends fall on page boundaries, through several rotations."""
     torch.manual_seed(10)
     prompt, window, chunk = 8, 96, 128
-    geometry = dict(window_tokens=window, max_staged_tokens=chunk, causal_block_sizes=(128, 64, 32))
-    cache = make_cache(32, pin_tokens=prompt, geometry=geometry)
+    spec = spec_for(
+        max_pin_tokens=prompt,
+        causal_blocks={128: 1, 64: 2, 32: 4},
+        window_tokens=window,
+        chunk=chunk,
+    )
+    cache = make_cache(32, spec=spec)
     try:
-        pk, pv = open_with_prompt(cache, prompt, geometry)
+        pk, pv = open_with_prompt(cache, prompt)
         attn = make_backend(backend)
         history_k, history_v = [], []
         empty = pk.new_zeros((0, NUM_KV_HEADS, HEAD_DIM))
@@ -715,7 +826,7 @@ def test_cache_path_refusals(cache, backend):
     open_with_prompt(cache, 9)
     attn = make_backend(backend)
     q, k, v = rand_qkv(CHUNK)
-    common = dict(seq_len=CHUNK, kv_cache=cache)
+    common = dict(seq_len=CHUNK, kv=cache.plan(CHUNK))
     with pytest.raises(ValueError):  # two videos
         attn.forward(
             torch.stack([q, q]), torch.stack([k, k]), torch.stack([v, v]), batch_size=2, **common
@@ -730,11 +841,46 @@ def test_cache_path_refusals(cache, backend):
             **common,
         )
     with pytest.raises(ValueError, match="not declared"):
-        attn.forward(q[None], k[None], v[None], batch_size=1, causal_block_size=8, **common)
+        cache.plan(CHUNK, 8)
     if backend == "trtllm":
         attn.sparse_params = object()  # any sparse attention configuration
         with pytest.raises(NotImplementedError, match="sparse"):
             attn.forward(q[None], k[None], v[None], batch_size=1, **common)
+
+
+@pytest.mark.parametrize("pad", [0, 6], ids=["unpadded", "padded"])
+def test_trtllm_reads_fused_qkv_slices_without_a_copy(cache, monkeypatch, pad):
+    """q/k/v sliced from one qkv_proj output reach the kernel as that buffer, padded or
+    not, and give the same output as separate tensors, which are concatenated."""
+    if lacks_kernel("trtllm", cache):
+        pytest.skip("no paged context kernel for this page size in this build")
+    open_with_prompt(cache, 9)
+    attn = make_backend("trtllm")
+    rows = CHUNK + pad
+    q_dim, kv_dim = NUM_HEADS * HEAD_DIM, NUM_KV_HEADS * HEAD_DIM
+    fused = torch.randn(1, rows, q_dim + 2 * kv_dim, device=DEVICE, dtype=DTYPE)
+    q, k, v = (x.view(1, rows, -1, HEAD_DIM) for x in fused.split([q_dim, kv_dim, kv_dim], dim=-1))
+    kernel_inputs = []
+    parent_forward = BaseTrtllmAttention.forward
+
+    def recording_forward(self, *args, **kwargs):
+        kernel_inputs.append(kwargs["q"])
+        return parent_forward(self, *args, **kwargs)
+
+    monkeypatch.setattr(BaseTrtllmAttention, "forward", recording_forward)
+
+    def forward(q, k, v):
+        return attn.forward(q, k, v, batch_size=1, seq_len=rows, kv=cache.plan(CHUNK)).reshape(
+            rows, NUM_HEADS, HEAD_DIM
+        )
+
+    out_fused = forward(q, k, v)
+    assert kernel_inputs[-1].data_ptr() == fused.data_ptr(), "expected the qkv_proj buffer"
+    # The same tokens again, as separate tensors: staged in place of the first ones.
+    out_separate = forward(q.clone(), k.clone(), v.clone())
+    assert kernel_inputs[-1].untyped_storage().data_ptr() != fused.untyped_storage().data_ptr()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_fused, out_separate, rtol=0, atol=0)
 
 
 def test_trtllm_metadata_lives_on_the_cache():
@@ -793,8 +939,7 @@ def test_packed_qkv_matches_separate_tensors_on_the_cache_path():
                     batch_size=1,
                     seq_len=CHUNK,
                     seq_len_kv=CHUNK,
-                    kv_cache=cache,
-                    causal_block_size=CHUNK // 4,
+                    kv=cache.plan(CHUNK, CHUNK // 4),
                 )
             torch.cuda.synchronize()
             positions = torch.arange(
