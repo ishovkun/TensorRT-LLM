@@ -197,8 +197,16 @@ def row_layout(channels: int, fold_single: bool = True) -> tuple[int, int]:
 
 
 def blocks_per_sm(k: int, in_wino: bool, order: int, out: int) -> int:
+    """Resident blocks per SM the kernel is compiled for (mirrors ``blocksPerSm`` in the
+    kernel source, including the ``VAEWINO_IN_BLOCKS`` experiment knob)."""
     if out == OUT_ROWS:
         return 4 if k <= 2 else 3
+    if in_wino and order == 4:
+        for d in _extra_defines():
+            if d.startswith("-DVAEWINO_IN_BLOCKS="):
+                knob = int(d.split("=", 1)[1])
+                if knob:
+                    return knob
     if k >= 4 or order == 4:
         return 2
     return 4 if (not in_wino and k <= 2) else 3
