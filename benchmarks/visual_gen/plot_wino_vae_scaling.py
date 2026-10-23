@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU-count scaling of the Wan VAE backends from bench_wan_vae.py runs.
 
-One line per backend, x = GPUs (world size, log2 axis), y = median GPU time (linear, from 0), one
-panel per (op, shape).
+One line per backend, x = GPUs (world size, log2 axis), y = median GPU time (linear from 0, or
+log2 with ``--logy``, where equal slopes mean equal parallel efficiency), one panel per (op, shape).
 
 The runs are bench_wan_vae.py outputs (``run_*.json``) taken on one node at world sizes 1, 2,
 4, 8 with the same ``--label`` prefix; a backend's point at a world size is its most recent
@@ -82,6 +82,7 @@ def main() -> None:
     parser.add_argument("--out", required=True, help="PNG path")
     parser.add_argument("--title", default="Wan VAE scaling over GPUs")
     parser.add_argument("--note", action="append", default=[], help="backend=text footnote")
+    parser.add_argument("--logy", action="store_true", help="log2 y axes (log-log panels)")
     args = parser.parse_args()
     points = _load(Path(args.run_dir), args.label_prefix)
     if not points:
@@ -135,7 +136,10 @@ def main() -> None:
         ax.set_xscale("log", base=2)
         ax.set_xticks(sizes)
         ax.set_xticklabels([str(n) for n in sizes])
-        ax.set_ylim(bottom=0, top=ax.get_ylim()[1] * 1.12)  # headroom for the point labels
+        if args.logy:
+            ax.set_yscale("log", base=2)
+        else:
+            ax.set_ylim(bottom=0, top=ax.get_ylim()[1] * 1.12)  # headroom for the point labels
         ax.tick_params(labelsize=13)
         ax.set_xlabel("GPUs", fontsize=14)
         ax.set_ylabel("median GPU time [ms]", fontsize=14)
