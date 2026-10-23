@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU-count scaling of the Wan VAE backends from bench_wan_vae.py runs.
 
-One line per backend, x = GPUs (world size), y = median GPU time, one panel per (op, shape).
+One line per backend, x = GPUs (world size, log2 axis), y = median GPU time (linear, from 0), one
+panel per (op, shape).
 
 The runs are bench_wan_vae.py outputs (``run_*.json``) taken on one node at world sizes 1, 2,
 4, 8 with the same ``--label`` prefix; a backend's point at a world size is its most recent
@@ -31,11 +32,24 @@ SERIES = (
 # steady-state step latency, as there).
 from plot_wino_vae_ladder import COLUMNS as _LADDER_COLUMNS  # noqa: E402
 
+# Short panel titles: the scaling panels are drawn for slides, where the ladder's long titles
+# do not fit four to a row.
+_SHORT = {
+    "t2i": "image 1024x1024",
+    "t2v_720p": "720p, 189 frames",
+    "edge_480p": "480p, 121 frames",
+    "bimanual_sim": {"encode": "bimanual: 1 image 480p", "decode": "bimanual step: 8 frames 480p"},
+}
+
 PANELS = tuple(
-    (op, shape, title)
+    (
+        op,
+        shape,
+        f"{op}: " + (_SHORT[column][op] if isinstance(_SHORT[column], dict) else _SHORT[column]),
+    )
     for op in ("encode", "decode")  # one row per op: encode on top, decode below
     for column in ("t2i", "t2v_720p", "edge_480p", "bimanual_sim")
-    for shape, _field, title in (_LADDER_COLUMNS[column][op],)
+    for shape, _field, _title in (_LADDER_COLUMNS[column][op],)
 )
 
 
@@ -82,7 +96,7 @@ def main() -> None:
     panels = [p for p in PANELS if any(k[1] == p[1] and k[2] == p[0] for k in points)]
     cols = 4
     rows_n = -(-len(panels) // cols)
-    fig, axes = plt.subplots(rows_n, cols, figsize=(6.2 * cols, 4.6 * rows_n), squeeze=False)
+    fig, axes = plt.subplots(rows_n, cols, figsize=(6.2 * cols, 5.0 * rows_n), squeeze=False)
     colors = {name: f"C{i}" for i, (_, name) in enumerate(dict(SERIES).items())}
     # Backends sharing a display name form one line (vLLM-Omni: the fast path at one GPU, the
     # sharded decode beyond), the most recent point winning where both measured a size.
@@ -101,23 +115,30 @@ def main() -> None:
                 continue
             xs = sorted(pts)
             ys = [pts[n] for n in xs]
-            ax.plot(xs, ys, marker="o", color=colors[name], label=name)
+            ax.plot(xs, ys, marker="o", markersize=7, linewidth=2.5, color=colors[name], label=name)
+            # Every WinoVae point is labelled; the other lines only at one GPU, where they start
+            # apart (their multi-GPU points converge and the labels would collide).
             for x, y in zip(xs, ys):
+                if name != "WinoVae" and x != xs[0]:
+                    continue
                 ax.annotate(
-                    f"{y:.0f}",
+                    f"{y:.0f}" if y >= 10 else f"{y:.1f}",
                     (x, y),
                     textcoords="offset points",
-                    xytext=(0, 5),
-                    ha="center",
-                    fontsize=7,
+                    xytext=(0, 9) if name == "WinoVae" else (9, 2),
+                    ha="center" if name == "WinoVae" else "left",
+                    fontsize=12,
+                    color=colors[name],
+                    fontweight="bold" if name == "WinoVae" else "normal",
                 )
-        ax.set_title(title, fontsize=10)
+        ax.set_title(title, fontsize=15)
         ax.set_xscale("log", base=2)
-        ax.set_yscale("log", base=2)
         ax.set_xticks(sizes)
         ax.set_xticklabels([str(n) for n in sizes])
-        ax.set_xlabel("GPUs")
-        ax.set_ylabel("median GPU time [ms]")
+        ax.set_ylim(bottom=0, top=ax.get_ylim()[1] * 1.12)  # headroom for the point labels
+        ax.tick_params(labelsize=13)
+        ax.set_xlabel("GPUs", fontsize=14)
+        ax.set_ylabel("median GPU time [ms]", fontsize=14)
         ax.grid(True, which="both", alpha=0.3)
     for ax in list(axes.flat)[len(panels) :]:
         ax.axis("off")
@@ -131,12 +152,12 @@ def main() -> None:
         seen.keys(),
         loc="upper center",
         ncol=len(seen),
-        bbox_to_anchor=(0.5, 0.925),
-        fontsize=11,
+        bbox_to_anchor=(0.5, 0.93),
+        fontsize=16,
     )
     note = "; ".join(args.note)
-    fig.suptitle(args.title + (f"\n{note}" if note else ""), y=0.995)
-    fig.tight_layout(rect=(0, 0, 1, 0.89))
+    fig.suptitle(args.title + (f"\n{note}" if note else ""), y=0.995, fontsize=17)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
     fig.savefig(args.out, dpi=140)
     print(f"wrote {args.out}")
 
