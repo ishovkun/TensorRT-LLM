@@ -30,6 +30,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
 
+def test_rejects_temporal_factor_mismatch():
+    with pytest.raises(ValueError, match="scale_factor_temporal=8"):
+        WinoVae({**SMALL_CONFIG, "scale_factor_temporal": 8})
+
+
 def _pair(options: WinoVaeOptions | None = None) -> tuple[WanVAE, WinoVae]:
     torch.manual_seed(0)
     native = WanVAE(SMALL_CONFIG)

@@ -7,19 +7,98 @@ axis (:class:`FrameGeometry`): the norm kernels write their slabs and frame-buff
 that layout, the Kernel Factory convolutions return their products in it, and only the border
 lines travel between neighbouring ranks. Edge ranks keep zeros in their outer halo (the global
 zero padding of the convolution).
+
+The border lines travel one of two ways. Direct: the buffers live in symmetric memory
+(:class:`DirectFrames`), every rank maps its neighbours' buffers, and the norm kernel that
+fills a buffer stores its border lines into the neighbours' halo lines as it goes
+(:class:`~.jit_norm.HaloPush`); one barrier per exchange then orders those stores before the
+conv reads them. NCCL: the border lines are packed into send buffers, traded with batched
+point-to-point sends and unpacked into the halo lines. The direct way needs the ranks in one
+peer-access domain (NVLink); the NCCL way works anywhere and serves the eager paths.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm
 import torch.nn.functional as F
 
-from .jit_norm import FrameGeometry
+from .jit_norm import FrameGeometry, HaloPush
 
 
 def _align_up(n: int, align: int) -> int:
     return -(-n // align) * align
+
+
+@dataclass(frozen=True)
+class PeerFrames:
+    """A neighbour's frame buffer as this rank sees it: ``frames`` is a view of the
+    neighbour's memory as ``[comps, groups, rows, cols, C]`` (its own rows and cols);
+    ``line`` the index, along the split axis, of the halo line that holds this rank's border;
+    ``lo`` / ``n`` the first logical index and the count along the other axis."""
+
+    frames: torch.Tensor
+    line: int
+    lo: int
+    n: int
+
+
+@dataclass
+class DirectFrames:
+    """A frame buffer the ranks allocated together in symmetric memory. ``frames`` is this
+    rank's buffer as ``[comps, groups, rows, cols, C]`` (zero outside the logical positions
+    at allocation; only the neighbours write the halo lines afterwards); ``left`` / ``right``
+    are the neighbours' buffers (None without a neighbour)."""
+
+    frames: torch.Tensor
+    handle: object
+    axis: str
+    left: PeerFrames | None
+    right: PeerFrames | None
+
+    def push(self, group0: int = 0, groups: int | None = None) -> HaloPush:
+        """The kernel-side destinations of the border lines for groups ``[group0, group0 +
+        groups)`` of the buffer (all groups by default)."""
+
+        def line(peer: PeerFrames | None) -> torch.Tensor | None:
+            if peer is None:
+                return None
+            f = peer.frames if groups is None else peer.frames[:, group0 : group0 + groups]
+            if self.axis == "h":
+                return f[:, :, peer.line, peer.lo : peer.lo + peer.n, :]
+            return f[:, :, peer.lo : peer.lo + peer.n, peer.line, :]
+
+        return HaloPush(0 if self.axis == "h" else 1, line(self.left), line(self.right))
+
+    def barrier(self) -> None:
+        """Every rank's stores into this buffer are visible once this returns on the stream:
+        the conv may read the halo lines."""
+        self.handle.barrier(channel=0)
+
+
+def push_border(push: HaloPush, phys: torch.Tensor, geo: FrameGeometry) -> None:
+    """Host-side counterpart of the kernel's halo push for frames written without it: copy
+    the first and last logical line of ``phys [groups, rows, cols, C]`` into the neighbours'
+    halo lines (a single-component push)."""
+    for side in (push.left, push.right):
+        if side is not None and side.shape[0] != 1:
+            raise ValueError("push_border handles a single-component push")
+    lines = phys.unsqueeze(0)
+    if push.axis == 0:
+        cols = slice(geo.col0, geo.col0 + geo.width)
+        first = lines[:, :, geo.row0, cols, :]
+        last = lines[:, :, geo.row0 + geo.height - 1, cols, :]
+    else:
+        rows = slice(geo.row0, geo.row0 + geo.height)
+        first = lines[:, :, rows, geo.col0, :]
+        last = lines[:, :, rows, geo.col0 + geo.width - 1, :]
+    if push.left is not None:
+        push.left.copy_(first)
+    if push.right is not None:
+        push.right.copy_(last)
 
 
 class Shard:
@@ -29,7 +108,9 @@ class Shard:
     process group of the VAE ranks (the attention gather); ``adj_groups[i]`` is the group of
     ranks ``i`` and ``i + 1``, through which neighbours trade border lines with batched
     point-to-point sends (measured 10% faster end to end than two-rank all-gathers: a 720p
-    decode exchanges ~2900 lines).
+    decode exchanges ~2900 lines). ``halo``: "direct" (the producer kernels store the border
+    lines into the neighbours' symmetric-memory buffers; an error when the ranks cannot map
+    each other's memory), "nccl", or "auto" (direct when it can be set up, else NCCL).
     """
 
     def __init__(
@@ -39,9 +120,12 @@ class Shard:
         axis: str,
         pg: dist.ProcessGroup,
         adj_groups: list[dist.ProcessGroup | None],
+        halo: str = "auto",
     ) -> None:
         if axis not in ("h", "w"):
             raise ValueError("axis must be 'h' or 'w'")
+        if halo not in ("auto", "nccl", "direct"):
+            raise ValueError("halo must be 'auto', 'nccl' or 'direct'")
         if not 0 <= rank < world_size:
             raise ValueError("rank out of range")
         if len(adj_groups) != world_size - 1:
@@ -66,6 +150,127 @@ class Shard:
         # Every rank's extent along the split axis in latent units (set by the wrapper at each
         # split); None means equal shards.
         self.extents: list[int] | None = None
+        # Direct halo exchange: the symmetric-memory group, the slab buffer rings (two
+        # buffers per layout, see ``direct_slabs``) and each ring's next buffer.
+        self._group_name: str | None = None
+        self.direct = halo != "nccl" and self._enable_direct(required=halo == "direct")
+        self._rings: dict[tuple, list[DirectFrames]] = {}
+        self._turn: dict[tuple, int] = {}
+        # Replaced buffers and the stream point after their last use; freed once passed.
+        self._retired: list[tuple[DirectFrames, torch.cuda.Event]] = []
+
+    def _enable_direct(self, required: bool) -> bool:
+        """Symmetric memory over the VAE group: a rendezvous maps every rank's buffer into
+        every other rank (one peer-access domain). When it fails the exchanges use NCCL,
+        unless the direct way was asked for explicitly."""
+        try:
+            name = str(self.pg.group_name)
+            probe = symm.empty(1024, dtype=torch.uint8, device=torch.cuda.current_device())
+            symm.rendezvous(probe, name)
+        except (RuntimeError, AttributeError) as exc:
+            if required:
+                raise RuntimeError(
+                    "halo_exchange='direct' needs the VAE ranks in one peer-access domain "
+                    "(symmetric memory rendezvous failed)"
+                ) from exc
+            return False
+        self._group_name = name
+        return True
+
+    def begin_call(self) -> None:
+        """Start of a model call: every slab ring hands out its buffers from the first again,
+        so a captured call replays the same buffer sequence; retired buffers whose last use
+        has completed are released."""
+        self._turn.clear()
+        self._retired = [(buf, ev) for buf, ev in self._retired if not ev.query()]
+
+    def retire(self, buf: DirectFrames) -> None:
+        """Keep ``buf`` alive until the work queued on the current stream so far (its last
+        reads) has run; symmetric memory is unmapped on release, not stream-ordered."""
+        ev = torch.cuda.Event()
+        ev.record()
+        self._retired.append((buf, ev))
+
+    def frame_key(self, height: int, width: int) -> tuple:
+        """A description of the logical ``height x width`` frame that is the same on every
+        rank (every rank's extent along the split axis, the other axis as is)."""
+        if self.axis == "h":
+            return (tuple(self.output_extents(height)), width)
+        return (height, tuple(self.output_extents(width)))
+
+    def peer_geometry(self, rank: int, geo: FrameGeometry, align: int) -> FrameGeometry:
+        """The frame layout rank ``rank`` (in the VAE group) uses for the frame this rank lays
+        out as ``geo`` with ``align``: the same logical frame with that rank's extent."""
+        if self.axis == "h":
+            return self.geometry(self.output_extents(geo.height)[rank], geo.width, align)
+        return self.geometry(geo.height, self.output_extents(geo.width)[rank], align)
+
+    def direct_frames(
+        self,
+        comps: int,
+        groups: int,
+        geo: FrameGeometry,
+        align: int,
+        channels: int,
+        dtype: torch.dtype,
+    ) -> DirectFrames:
+        """Allocate a ``[comps, groups, rows, cols, C]`` frame buffer in symmetric memory
+        together with the other ranks (a collective: every rank calls this at the same point
+        with the same logical frame). The buffers have one size, the largest shard's; this
+        rank's view uses its own layout ``geo``, the neighbours' views theirs."""
+        if not self.direct:
+            raise RuntimeError("direct halo exchange is not enabled on this shard")
+        geos = [self.peer_geometry(r, geo, align) for r in range(self.world_size)]
+        numel = max(comps * groups * g.frame * channels for g in geos)
+        buf = symm.empty(numel, dtype=dtype, device=torch.cuda.current_device())
+        buf.zero_()
+        handle = symm.rendezvous(buf, self._group_name)
+
+        def frames(flat: torch.Tensor, g: FrameGeometry) -> torch.Tensor:
+            return flat[: comps * groups * g.frame * channels].view(
+                comps, groups, g.rows, g.cols, channels
+            )
+
+        def peer(rank: int, lower: bool) -> PeerFrames:
+            g = geos[rank]
+            remote = frames(handle.get_buffer(rank, (numel,), dtype), g)
+            # A lower-rank neighbour holds this rank's first line in its high-side halo, a
+            # higher-rank one holds this rank's last line in its low-side halo.
+            if self.axis == "h":
+                line = g.row0 + g.height if lower else g.row0 - 1
+                return PeerFrames(remote, line, g.col0, g.width)
+            line = g.col0 + g.width if lower else g.col0 - 1
+            return PeerFrames(remote, line, g.row0, g.height)
+
+        return DirectFrames(
+            frames(buf, geo),
+            handle,
+            self.axis,
+            peer(self.rank - 1, True) if self.rank > 0 else None,
+            peer(self.rank + 1, False) if self.rank + 1 < self.world_size else None,
+        )
+
+    def direct_slabs(
+        self,
+        comps: int,
+        groups: int,
+        geo: FrameGeometry,
+        align: int,
+        channels: int,
+        dtype: torch.dtype,
+    ) -> DirectFrames:
+        """The next slab buffer for a Winograd conv's input of this layout, from a ring of two
+        per layout. Two suffice: with a barrier per exchange a neighbour runs at most one
+        exchange ahead, so the buffer it writes is never the one this rank's conv still
+        reads. The ring index resets at every model call (``begin_call``); the output gather
+        that ends a call keeps calls from overlapping."""
+        key = (comps, groups, channels, dtype, align, self.frame_key(geo.height, geo.width))
+        turn = self._turn.get(key, 0)
+        self._turn[key] = 1 - turn
+        ring = self._rings.setdefault(key, [])
+        if len(ring) <= turn:
+            ring.append(self.direct_frames(comps, groups, geo, align, channels, dtype))
+        return ring[turn]
 
     def set_extents(self, extents: list[int]) -> None:
         self.extents = None if len(set(extents)) == 1 else list(extents)

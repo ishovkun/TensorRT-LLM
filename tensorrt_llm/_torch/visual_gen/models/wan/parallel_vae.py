@@ -370,7 +370,14 @@ class ParallelWinoVae(ParallelVAEBase):
 
     def _parallelize_modules(self) -> None:
         axis = "h" if self.spec.split_dim == "height" else "w"
-        self.shard = Shard(self.rank, self.world_size, axis, self.pg, self._adj_groups)
+        self.shard = Shard(
+            self.rank,
+            self.world_size,
+            axis,
+            self.pg,
+            self._adj_groups,
+            halo=self.vae_backend.options.halo_exchange,
+        )
         self.vae_backend.set_shard(self.shard)
 
     def _split_uneven(self, x: torch.Tensor, align: int) -> torch.Tensor:

@@ -52,6 +52,8 @@ SMALL_CONFIG = {
     "scale_factor_spatial": 16,
 }
 
+# "direct" halo exchange is demanded, not left to "auto": a rendezvous failure must fail the
+# test rather than silently run the NCCL path.
 ALL_ON = {
     "fused_norm": True,
     "fused_residual": True,
@@ -64,10 +66,23 @@ ALL_ON = {
     "fused_attention": True,
     "fold_encoder_tail": True,
     "fused_output": True,
+    "halo_exchange": "direct",
 }
+ALL_ON_NCCL = {**ALL_ON, "halo_exchange": "nccl"}
 ALL_OFF: dict = {}
-SLABS_ONLY = {"fused_norm": True, "fused_residual": True, "fused_bias": True, "conv_slabs": True}
-OPTION_SETS = {"all_on": ALL_ON, "all_off": ALL_OFF, "slabs": SLABS_ONLY}
+SLABS_ONLY = {
+    "fused_norm": True,
+    "fused_residual": True,
+    "fused_bias": True,
+    "conv_slabs": True,
+    "halo_exchange": "direct",
+}
+OPTION_SETS = {
+    "all_on": ALL_ON,
+    "all_on_nccl": ALL_ON_NCCL,
+    "all_off": ALL_OFF,
+    "slabs": SLABS_ONLY,
+}
 
 
 def _init_worker(rank: int, world_size: int, port: int):
@@ -244,7 +259,7 @@ class TestParallelWinoVaeDecode:
 
     # Unequal shards: a 9 x 13 latent over four ranks is 3/2/2/2 rows or 4/3/3/3 columns.
     @pytest.mark.parametrize("split_dim", ["height", "width"])
-    @pytest.mark.parametrize("option_set", ["all_on", "all_off"])
+    @pytest.mark.parametrize("option_set", ["all_on", "all_on_nccl", "all_off"])
     def test_decode_4gpu_uneven(self, split_dim: str, option_set: str) -> None:
         _run(4, _logic_decode, split_dim, option_set, 5, (9, 13))
 

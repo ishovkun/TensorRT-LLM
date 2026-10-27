@@ -19,7 +19,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -39,10 +39,37 @@ OUT_SLABS, OUT_ROWS = 0, 1
 
 
 @dataclass(frozen=True)
+class HaloPush:
+    """Where a kernel that fills a frame buffer also stores the first and last logical line of
+    the split axis: into the neighbouring ranks' buffers, which hold them as halo lines.
+
+    ``axis`` 0: the frames are split along their height (rows travel), 1: along their width
+    (columns travel). ``left`` / ``right`` (the lower / higher rank; None without a neighbour)
+    are views of the neighbour's buffer over the destination line: ``[comps, groups, n, C]``
+    with ``n`` the line's positions and unit stride over the channels, so the view's data
+    pointer and strides are what the kernel needs and a host copy into the view is the same
+    transfer."""
+
+    axis: int
+    left: torch.Tensor | None
+    right: torch.Tensor | None
+
+    def __post_init__(self) -> None:
+        for side in (self.left, self.right):
+            if side is not None and (side.dim() != 4 or side.stride(3) != 1):
+                raise ValueError(
+                    "a halo destination is a [comps, groups, n, C] view with unit channel stride"
+                )
+
+
+@dataclass(frozen=True)
 class FrameGeometry:
     """Physical layout of a frame that carries halo rows / columns around its ``height`` x
     ``width`` logical positions: logical (i, j) sits at ``(i + row0) * cols + j + col0`` inside
-    ``rows * cols`` physical positions (spatially sharded models exchange the halos)."""
+    ``rows * cols`` physical positions (spatially sharded models exchange the halos).
+
+    ``push``: where the producer of such frames also stores their border lines (the
+    neighbouring ranks' halo lines); None when the halo lines are filled afterwards."""
 
     height: int
     width: int
@@ -50,6 +77,7 @@ class FrameGeometry:
     cols: int
     row0: int = 0
     col0: int = 0
+    push: HaloPush | None = field(default=None, compare=False)
 
     @property
     def frame(self) -> int:
@@ -61,7 +89,12 @@ class FrameGeometry:
 
     @property
     def identity(self) -> bool:
-        return self.rows == self.height and self.cols == self.width and self.offset == 0
+        return (
+            self.rows == self.height
+            and self.cols == self.width
+            and self.offset == 0
+            and self.push is None
+        )
 
     def __post_init__(self) -> None:
         if self.row0 + self.height > self.rows or self.col0 + self.width > self.cols:
@@ -230,6 +263,7 @@ class Variant:
     out_map: bool = False
     up_ft: int = 0
     up_ratio: int = 1
+    halo: bool = False
 
     def name(self) -> str:
         def b(v: bool) -> str:
@@ -240,7 +274,7 @@ class Variant:
             f"vaewino::vaeNormKernel<__nv_bfloat16, {td}, {self.order}, {_VEC}, {self.lanes}, {self.k}, "
             f"{b(self.reference)}, {b(self.has_bias)}, {b(self.has_in_bias)}, {b(self.has_residual)}, "
             f"{b(self.in_wino)}, {self.mid}, {self.out}, {b(self.padded)}, {b(self.in_map)}, "
-            f"{b(self.out_map)}, {self.up_ft}, {self.up_ratio}>"
+            f"{b(self.out_map)}, {self.up_ft}, {self.up_ratio}, {b(self.halo)}>"
         )
 
     def signature(self) -> str:
@@ -249,7 +283,8 @@ class Variant:
             f"({t} const*, {td} const*, {td}*, long long, long long, {t} const*, {t} const*, {t} const*, "
             f"{t} const*, "
             f"{t} const*, {t}*, {t}*, {t}*, long long, int, int, int, int, int, int, int, long long, int, int, "
-            f"long long, int, int, int, int, int, int, float, float)"
+            f"long long, int, int, int, int, int, int, float, float, "
+            f"void*, void*, long long, long long, long long, long long, int, int, int)"
         )
 
     @property
@@ -372,11 +407,39 @@ _ARG_TYPES = (
     *(ctypes.c_int,) * 6,
     ctypes.c_float,
     ctypes.c_float,
+    *(ctypes.c_void_p,) * 2,
+    *(ctypes.c_longlong,) * 4,
+    *(ctypes.c_int,) * 3,
 )
 
 
 def _addr(t: torch.Tensor | None) -> int:
     return 0 if t is None else t.data_ptr()
+
+
+def _halo_args(push: HaloPush | None, channels: int) -> tuple:
+    """The kernel's halo-push arguments: per side the destination's address, positions per
+    frame, positions between line positions and elements between components, then the axis."""
+    if push is None:
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0)
+    ptrs, frames, comps, steps = [], [], [], []
+    for side in (push.left, push.right):
+        if side is None:
+            ptrs.append(0)
+            frames.append(0)
+            comps.append(0)
+            steps.append(0)
+            continue
+        if side.shape[3] != channels:
+            raise ValueError("the halo destination does not match the channel count")
+        for d in (0, 1, 2):
+            if side.stride(d) % channels:
+                raise ValueError("the halo destination strides must be whole positions")
+        ptrs.append(side.data_ptr())
+        frames.append(side.stride(1) // channels)
+        comps.append(side.stride(0))
+        steps.append(side.stride(2) // channels)
+    return (*ptrs, *frames, *comps, *steps, push.axis)
 
 
 def _launch(
@@ -462,6 +525,7 @@ def _launch(
         ),
         float(scale),
         1e-12,
+        *_halo_args(out_geo.push if out_geo is not None else None, channels),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
     _check(
@@ -505,15 +569,18 @@ def wino_norm_silu(
     products_geometry: FrameGeometry | None = None,
     slab_geometry: FrameGeometry | None = None,
     upsample: UpsampleSource | None = None,
+    slabs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Temporal Winograd norm: frame layout ``[T, P, C]`` (``m``/``D`` as
     ``[T/order, P, C]``, cache ``[0..2, P, C]``). Returns ``(sum or None, y_tail, D)``.
 
     ``products_geometry`` / ``slab_geometry``: the products are read from, and the slabs
     written to, frames with halo rows or columns (``[T/order, rows * cols, C]``); the kernel
-    touches the logical positions only. With ``upsample`` (instead of ``x`` or ``m``) the
-    frames are formed from the packed upsample conv output while reading and written as the
-    sum."""
+    touches the logical positions only (and, with ``slab_geometry.push``, stores the border
+    lines into the neighbours' buffers as well). ``slabs``: a preallocated destination for
+    ``D`` (``[order + 2, T/order, slab positions, C]``, contiguous) instead of a fresh one.
+    With ``upsample`` (instead of ``x`` or ``m``) the frames are formed from the packed
+    upsample conv output while reading and written as the sum."""
     if upsample is not None:
         if x is not None or m is not None or residual is not None or in_bias is not None:
             raise ValueError("upsample replaces x, m, residual and in_bias")
@@ -560,9 +627,13 @@ def wino_norm_silu(
     out_sum = torch.empty((frames, positions, channels), **opts) if want_sum else None
     y_tail = torch.empty((2, positions, channels), **opts)
     slab_positions = slab_geometry.frame if slab_geometry is not None else positions
-    d = torch.empty(
-        (comps, frames // order, slab_positions, channels), device=src.device, dtype=slab_dtype
-    )
+    d_shape = (comps, frames // order, slab_positions, channels)
+    if slabs is None:
+        d = torch.empty(d_shape, device=src.device, dtype=slab_dtype)
+    else:
+        if tuple(slabs.shape) != d_shape or slabs.dtype != slab_dtype or not slabs.is_contiguous():
+            raise ValueError(f"slabs must be a contiguous {slab_dtype} tensor of shape {d_shape}")
+        d = slabs
     cache_frames = cache.shape[0] if cache is not None and cache.numel() else 0
     m_ptr, m_stride = 0, 0
     if m is not None:
@@ -586,6 +657,7 @@ def wino_norm_silu(
         products_geometry is not None,
         slab_geometry is not None,
         *_up_variant(upsample),
+        slab_geometry is not None and slab_geometry.push is not None,
     )
     _launch(
         variant,
@@ -692,6 +764,7 @@ def rms_norm_silu_rows(
         False,
         out_geometry is not None,
         *_up_variant(upsample),
+        out_geometry is not None and out_geometry.push is not None,
     )
     _launch(
         variant,

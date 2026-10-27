@@ -23,7 +23,7 @@ benchmark compares against.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 import torch
@@ -98,7 +98,7 @@ from .wino_vae_kernels import (
     winograd_spatial_weights,
     winograd_weights,
 )
-from .wino_vae_shard import Shard
+from .wino_vae_shard import DirectFrames, Shard, push_border
 
 
 @dataclass
@@ -192,7 +192,8 @@ class WinoVaeOptions:
     # tiles / rows = Cout) with the four component chunks pipelined under PDL, 10-20% faster
     # per conv in isolation where the GPU is below its power cap; "wa0" / "wb0" the same
     # chunks as plain serialized launches; "wb1" the default spelled out (one GEMM, static
-    # persistent schedule); "wb1d" the same on the dynamic schedule, measurements only.
+    # persistent schedule); "wb1s" the same with the input transform staged through shared
+    # memory; "wb1d" the same on the dynamic schedule, measurements only.
     winograd_spatial_kf_mode: str | None = None
     # The fused 1D-Winograd conv (Kernel Factory campaign 2) for the 256-output-channel convs
     # under the "kf" kernel; off = those convs stay on cuDNN.
@@ -203,7 +204,7 @@ class WinoVaeOptions:
     # Tile for the single-frame calls with a causal history (spatial Winograd alone, the three
     # taps summed in the GEMM). They replace a direct cuDNN conv3d, so F(2x2, 3x3), whose
     # per-conv error matches direct bf16, keeps the model's accuracy; F(4x4, 3x3) is faster
-    # and ~2x noisier per conv.
+    # and ~4x noisier per conv (2.5e-3 vs 6e-4 relative, fp16 slabs).
     winograd_spatial_single_tile: int = 2
     # Run the zero-history first frame (and every image) as spatial Winograd on the
     # current-frame tap instead of cuDNN conv2d. Faster at the 1024-channel levels with
@@ -233,10 +234,20 @@ class WinoVaeOptions:
     # straight into the preallocated output (one kernel per chunk) instead of
     # cat + unpatchify + clamp over the whole video. Needs the CUDA op; bf16, batch 1.
     fused_output: bool = False
+    # Spatially sharded runs: how the halo lines reach the neighbouring ranks. "direct": the
+    # norm kernels store the border lines straight into the neighbours' buffers (symmetric
+    # memory over NVLink) and one barrier per exchange replaces the pack copy, the NCCL
+    # send/receive and the unpack copy; "nccl": batched point-to-point sends; "auto":
+    # "direct" where the ranks can map each other's memory, else "nccl".
+    halo_exchange: str = "auto"
 
     def __post_init__(self) -> None:
         if self.norm_mode not in ("fp32", "reference"):
             raise ValueError(f"norm_mode must be 'fp32' or 'reference', got {self.norm_mode!r}")
+        if self.halo_exchange not in ("auto", "nccl", "direct"):
+            raise ValueError(
+                f"halo_exchange must be 'auto', 'nccl' or 'direct', got {self.halo_exchange!r}"
+            )
         if self.norm_kernel not in ("cuda", "triton"):
             raise ValueError(f"norm_kernel must be 'cuda' or 'triton', got {self.norm_kernel!r}")
         if self.cudnn_benchmark not in ("off", "on", "auto"):
@@ -255,10 +266,19 @@ class WinoVaeOptions:
             raise ValueError(
                 f"winograd_spatial_tile must be 2 or 4, got {self.winograd_spatial_tile!r}"
             )
-        if self.winograd_spatial_kf_mode not in (None, "wa", "wb", "wa0", "wb0", "wb1", "wb1d"):
+        if self.winograd_spatial_kf_mode not in (
+            None,
+            "wa",
+            "wb",
+            "wa0",
+            "wb0",
+            "wb1",
+            "wb1s",
+            "wb1d",
+        ):
             raise ValueError(
-                "winograd_spatial_kf_mode must be None, 'wa', 'wb', 'wa0', 'wb0' or 'wb1', "
-                f"got {self.winograd_spatial_kf_mode!r}"
+                "winograd_spatial_kf_mode must be None, 'wa', 'wb', 'wa0', 'wb0', 'wb1', 'wb1s' "
+                f"or 'wb1d', got {self.winograd_spatial_kf_mode!r}"
             )
         if self.winograd_temporal_order not in (2, 4):
             raise ValueError(
@@ -560,6 +580,8 @@ def _into(
     if out is not None and geometry is not None:
         g = geometry
         out[..., g.row0 : g.row0 + g.height, g.col0 : g.col0 + g.width].copy_(value)
+        if g.push is not None:
+            push_border(g.push, _frames_physical(out), g)
         return out
     if out is None:
         return value
@@ -622,12 +644,14 @@ class WinoVaeRMSNorm(nn.Module):
         cache: torch.Tensor | None,
         frames: int,
         slab_geometry: FrameGeometry | None = None,
+        slabs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor, WinoSlabs]:
         """Norm + SiLU that writes the Winograd slabs for the conv that follows.
 
         ``cache`` holds the last 0..2 normalized frames of the previous chunk as
         ``[1, C, n, H, W]``. Returns ``(sum or None, new cache [1, C, 2, H, W], slabs)``.
-        ``slab_geometry``: write the slabs into frames with halo lines (sharded decode)."""
+        ``slab_geometry``: write the slabs into frames with halo lines (sharded decode);
+        ``slabs``: a preallocated destination for them."""
         pending = x if isinstance(x, PendingAdd) else PendingAdd(x)
         h, w = pending.spatial
         bias = self.bias if isinstance(self.bias, torch.Tensor) else None
@@ -647,6 +671,7 @@ class WinoVaeRMSNorm(nn.Module):
             products_geometry=pending.geometry,
             slab_geometry=slab_geometry,
             upsample=pending.up.source() if pending.up is not None else None,
+            slabs=slabs,
         )
         if slab_geometry is None:
             slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d], d)
@@ -787,17 +812,22 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         self._wino_u_taps: dict[tuple[int, int, str], tuple[int, int, torch.Tensor]] = {}
         # Spatial sharding: this rank's slice and the halo exchanges (None: whole frames).
         self.shard: Shard | None = None
+        self._slab: torch.Tensor | None = None
+        self._slab_key: tuple | None = None
+        self._slab_pos = 0
         self._slab_geo: FrameGeometry | None = None
+        # The frame buffer as a symmetric-memory allocation (direct halo exchange).
+        self._slab_direct: DirectFrames | None = None
 
     # ---- frame buffer ("slab") for the causal history -------------------------------
     # The buffer holds [1, C, S, H, W] channels-last frames; frames [pos-2, pos) are the
     # causal history (zeros before the first chunk), the producer writes the chunk's T
     # frames at [pos, pos+T), the conv reads the window [pos-2, pos+T) with no copy. When
-    # the window would run off the end, the two history frames move to the front.
+    # the window would run off the end, the two history frames move to the front. The
+    # buffer outlives the clip: a new clip starts at the front again over zeroed history.
     kSlabChunks = 4
 
     def slab_reset(self) -> None:
-        self._slab = None
         self._slab_pos = 0
 
     def slab_begin(
@@ -831,14 +861,24 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         h, w = spatial
         geo = self.shard.geometry(h, w) if self.shard is not None else None
         rows, cols = (geo.rows, geo.cols) if geo is not None else (h, w)
-        slab = getattr(self, "_slab", None)
+        # The buffer's identity in terms every rank agrees on (an unequal split can change
+        # one rank's extent and not another's, and the direct allocation is collective).
+        key = (c, like.dtype, self.shard.frame_key(h, w) if self.shard is not None else (h, w))
+        slab = self._slab
 
         def allocate() -> torch.Tensor:
             # Zeros: the history frames and (sharded) the outer halo of the edge ranks.
+            depth = 2 + self.kSlabChunks * frames
+            if self._slab_direct is not None:
+                self.shard.retire(self._slab_direct)
+            if self.shard is not None and self.shard.direct:
+                self._slab_direct = self.shard.direct_frames(1, depth, geo, 1, c, like.dtype)
+                return self._slab_direct.frames[0].unsqueeze(0).permute(0, 4, 1, 2, 3)
+            self._slab_direct = None
             return torch.empty(
                 1,
                 c,
-                2 + self.kSlabChunks * frames,
+                depth,
                 rows,
                 cols,
                 dtype=like.dtype,
@@ -846,29 +886,40 @@ class WinoVaeCausalConv3d(nn.Conv3d):
                 memory_format=torch.channels_last_3d,
             ).zero_()
 
-        if (
-            slab is None
-            or slab.shape[1] != c
-            or tuple(slab.shape[3:]) != (rows, cols)
-            or slab.dtype != like.dtype
-        ):
+        if slab is None or self._slab_key != key:
             slab = allocate()
-            self._slab, self._slab_pos = slab, 2
+            self._slab, self._slab_key, self._slab_pos = slab, key, 2
+        elif self._slab_pos == 0:
+            # A new clip in the existing buffer: zero history in front of the first window.
+            slab[:, :, :2].zero_()
+            self._slab_pos = 2
         elif self._slab_pos + frames > slab.shape[2]:
             # Wrap: the two history frames move to the front (through a copy, the ranges
-            # may overlap); grow the buffer if this chunk is longer than the ones before.
+            # may overlap). A new buffer instead when this chunk is longer than the buffer
+            # holds, or when the neighbours push into this one: they run up to one exchange
+            # ahead and store their border lines into the new window [2, 2 + frames) as soon
+            # as they reach it, which must not overtake this copy of the history frames.
             hist = slab[:, :, self._slab_pos - 2 : self._slab_pos].clone()
-            if slab.shape[2] < 2 + frames:
+            if slab.shape[2] < 2 + frames or (
+                self._slab_direct is not None and self._slab_pos - 2 < 2 + frames
+            ):
                 slab = allocate()
                 self._slab = slab
             slab[:, :, :2].copy_(hist)
             self._slab_pos = 2
+        if self._slab_direct is not None:
+            geo = replace(geo, push=self._slab_direct.push(self._slab_pos, frames))
         self._slab_geo = geo
         return slab[:, :, self._slab_pos : self._slab_pos + frames]
 
     def slab_exchange(self, window: torch.Tensor) -> None:
-        """Fill the halo lines of a just-written window from the neighbouring ranks."""
-        if self.shard is not None:
+        """Complete the halo lines of a just-written window: wait for the neighbours' direct
+        stores, or trade the border lines over NCCL."""
+        if self.shard is None:
+            return
+        if self._slab_direct is not None:
+            self._slab_direct.barrier()
+        else:
             self.shard.exchange(_frames_physical(window), self._slab_geo)
 
     def slab_conv(self, frames: int) -> torch.Tensor:
@@ -1092,7 +1143,14 @@ class WinoVaeCausalConv3d(nn.Conv3d):
     def _spatial_kernel(self, h: int, w: int, order: int, dtype: torch.dtype) -> str:
         """Which conv runs the Winograd slabs of a logical ``h x w`` frame: "fused" (the
         fused 1D-Winograd 256-channel conv), "kf" (the Kernel Factory F(4x4) pipeline), "cute",
-        "cublas" (the portable spatial Winograd) or "cudnn" (conv2d per slab)."""
+        "cublas" (the portable spatial Winograd) or "cudnn" (conv2d per slab). On a shard the
+        choice is made for the largest shard's frame, so every rank picks the same kernel and
+        the same slab layout."""
+        if self.shard is not None:
+            if self.shard.axis == "h":
+                h = max(self.shard.output_extents(h))
+            else:
+                w = max(self.shard.output_extents(w))
         if self.winograd_spatial != "off" and self._use_kf_fused(h, w):
             return "fused"
         if self._use_kf_spatial(h, w) and self.spatial_eligible(h, w, kernel="kf"):
@@ -1103,21 +1161,47 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             return "cublas"
         return "cudnn"
 
+    def _slab_dtype(self) -> torch.dtype:
+        return torch.float16 if self.winograd_slab_dtype == torch.float16 else torch.bfloat16
+
+    def winograd_slab_align(self, h: int, w: int, order: int) -> int:
+        """Lines the physical extent of this conv's slab frames is a multiple of: the tile of
+        the kernel that will read them (the fused 256-channel conv takes 8-row x 32-column
+        tiles, the Kernel Factory pipeline 4-wide columns), 1 otherwise."""
+        kernel = self._spatial_kernel(h, w, order, self._slab_dtype())
+        if kernel == "fused":
+            return 8 if self.shard.axis == "h" else 32
+        if kernel == "kf" and self.shard.axis == "w":
+            return 4
+        return 1
+
     def winograd_slab_geometry(self, h: int, w: int, order: int) -> FrameGeometry | None:
         """The slab layout for a logical ``h x w`` frame under sharding: halo lines, with the
-        physical extent rounded up to the tile of the kernel that will read it (the fused
-        256-channel conv takes 8-row x 32-column tiles, the Kernel Factory pipeline 4-wide
-        columns). None without sharding."""
+        physical extent rounded up to :meth:`winograd_slab_align`. None without sharding."""
         if self.shard is None:
             return None
-        dtype = torch.float16 if self.winograd_slab_dtype == torch.float16 else torch.bfloat16
-        kernel = self._spatial_kernel(h, w, order, dtype)
-        align = 1
-        if kernel == "fused":
-            align = 8 if self.shard.axis == "h" else 32
-        elif kernel == "kf" and self.shard.axis == "w":
-            align = 4
-        return self.shard.geometry(h, w, align)
+        return self.shard.geometry(h, w, self.winograd_slab_align(h, w, order))
+
+    def winograd_slabs(
+        self, h: int, w: int, order: int, frames: int
+    ) -> tuple[FrameGeometry | None, torch.Tensor | None, DirectFrames | None]:
+        """What the norm kernel that feeds this conv writes its slabs into for a logical
+        ``h x w`` frame: the slab layout (None without sharding) and, with direct halo
+        exchange, the symmetric buffer ``[order + 2, frames / order, positions, C]`` to fill
+        (the layout then carries the neighbours' halo lines as its push) and that buffer's
+        handle for the barrier."""
+        if self.shard is None:
+            return None, None, None
+        align = self.winograd_slab_align(h, w, order)
+        geo = self.shard.geometry(h, w, align)
+        if not self.shard.direct:
+            return geo, None, None
+        comps, groups = order + 2, frames // order
+        buf = self.shard.direct_slabs(
+            comps, groups, geo, align, self.in_channels, self._slab_dtype()
+        )
+        slabs = buf.frames.view(comps, groups, geo.frame, self.in_channels)
+        return replace(geo, push=buf.push()), slabs, buf
 
     def forward_winograd(self, slabs: WinoSlabs) -> tuple[list[torch.Tensor], FrameGeometry | None]:
         """The ``order + 2`` 3x3 convs of the transformed slabs (bias left to the consumer):
@@ -1767,8 +1851,9 @@ class WinoVaeResidualBlock(nn.Module):
         order = self.options.temporal_order_for(frames)
         shard = self.conv1.shard
         idx = feat_idx[0]
+        geo1, into1, direct1 = self.conv1.winograd_slabs(h, w, order, frames)
         s, cache1, slabs = self.norm1.forward_silu_wino(
-            x, feat_cache[idx], frames, self.conv1.winograd_slab_geometry(h, w, order)
+            x, feat_cache[idx], frames, geo1, slabs=into1
         )
         feat_cache[idx] = cache1
         feat_idx[0] += 1
@@ -1783,21 +1868,27 @@ class WinoVaeResidualBlock(nn.Module):
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
         residual = self.conv_shortcut(x_in)
-        if shard is not None:
+        if direct1 is not None:
+            direct1.barrier()
+        elif shard is not None:
             shard.zero_outside(slabs.physical(), slabs.geometry)
             shard.exchange(slabs.physical(), slabs.geometry)
         m1, geo_m1 = self.conv1.forward_winograd(slabs)
 
         idx = feat_idx[0]
+        geo2, into2, direct2 = self.conv2.winograd_slabs(h, w, order, frames)
         _, cache2, slabs2 = self.norm2.forward_silu_wino(
             PendingAdd(None, None, self.conv1.bias, wino=m1, geometry=geo_m1),
             feat_cache[idx],
             frames,
-            self.conv2.winograd_slab_geometry(h, w, order),
+            geo2,
+            slabs=into2,
         )
         feat_cache[idx] = cache2
         feat_idx[0] += 1
-        if shard is not None:
+        if direct2 is not None:
+            direct2.barrier()
+        elif shard is not None:
             shard.zero_outside(slabs2.physical(), slabs2.geometry)
             shard.exchange(slabs2.physical(), slabs2.geometry)
         m2, geo_m2 = self.conv2.forward_winograd(slabs2)
@@ -2435,6 +2526,16 @@ class WinoVae(nn.Module):
             options = WinoVaeOptions()
         if isinstance(options, dict):
             options = WinoVaeOptions.from_dict(options)
+        time_stages = sum(bool(s) for s in config.temperal_downsample)
+        if (
+            config.scale_factor_temporal is not None
+            and config.scale_factor_temporal != 2**time_stages
+        ):
+            raise ValueError(
+                f"scale_factor_temporal={config.scale_factor_temporal} does not match "
+                f"temperal_downsample={config.temperal_downsample}, which compresses time "
+                f"by {2**time_stages}."
+            )
         self.config = config
         self.options = options
         self.z_dim = config.z_dim
@@ -2511,6 +2612,8 @@ class WinoVae(nn.Module):
         self._folded_tail.clear()
 
     def clear_cache(self) -> None:
+        if self.shard is not None:
+            self.shard.begin_call()
         self._conv_num = self._cached_conv_counts["decoder"]
         self._conv_idx = [0]
         self._feat_map: list[torch.Tensor | str | None] = [None] * self._conv_num

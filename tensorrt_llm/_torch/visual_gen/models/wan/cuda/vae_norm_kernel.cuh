@@ -97,6 +97,22 @@ struct VaeNormParams
     int upCin;
     float scale;
     float eps;
+    // Halo push (HALO): the output's first and last logical line along the split axis are
+    // stored a second time, into the neighbouring ranks' buffers (their halo lines). haloAxis
+    // 0: the frames are split along their height (rows travel), 1: along their width
+    // (columns travel). Per side (L: the lower rank, R: the higher; null without a
+    // neighbour): the peer's address of the destination line's first position (frame 0,
+    // component 0), its positions per frame, the positions between consecutive line
+    // positions and the elements between its slab components.
+    void* haloL;
+    void* haloR;
+    long long haloFrameL;
+    long long haloFrameR;
+    long long haloCompL;
+    long long haloCompR;
+    int haloStepL;
+    int haloStepR;
+    int haloAxis;
 };
 
 // T: activations (x, residual, cache, sum, yTail, y, gamma, bias); TD: slabs d and products m,
@@ -204,10 +220,12 @@ __host__ __device__ constexpr int sharedBytes(int channels)
 #endif
 
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO>
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO,
+    bool HALO>
 __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormParams const& p)
 {
     constexpr bool SLABS = OUT == kOutSlabs;
+    static_assert(!HALO || (OUT_MAP && !PADDED), "the halo push needs the output's frame geometry");
     // The frames come from the phase gather of a packed 2x2 upsample conv output (plus the
     // DupUp3D shortcut as the residual): UP_FT is the shortcut's temporal factor, UP_RATIO the
     // number of shortcut elements per output channel (factor / repeats).
@@ -470,6 +488,32 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
         int64_t const pos = sourcePos(opos);
         int64_t const posSrc = IN_MAP ? inIndex(pos) : pos;
         int64_t const posOut = OUT_MAP ? outIndex(opos) : opos;
+        // The halo push: the neighbour this position's line also goes to (none for interior
+        // positions) and the line position's row inside that neighbour's frame 0.
+        void* haloBase = nullptr;
+        int64_t haloFrame = 0, haloComp = 0, haloRow = 0;
+        if constexpr (HALO)
+        {
+            int const i = static_cast<int>(pos) / p.width;
+            int const j = static_cast<int>(pos) - i * p.width;
+            int const across = p.haloAxis ? j : i;
+            int const along = p.haloAxis ? i : j;
+            int const n = p.haloAxis ? p.width : p.height;
+            if (across == 0 && p.haloL != nullptr)
+            {
+                haloBase = p.haloL;
+                haloFrame = p.haloFrameL;
+                haloComp = p.haloCompL;
+                haloRow = static_cast<int64_t>(along) * p.haloStepL;
+            }
+            else if (across == n - 1 && p.haloR != nullptr)
+            {
+                haloBase = p.haloR;
+                haloFrame = p.haloFrameR;
+                haloComp = p.haloCompR;
+                haloRow = static_cast<int64_t>(along) * p.haloStepR;
+            }
+        }
         if constexpr (PADDED)
         {
             if (pos < 0)
@@ -769,6 +813,14 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                         setPair(yk, i, r);
                     }
                     storeVec(ySlot, k, yk);
+                    if constexpr (HALO && !SLABS)
+                    {
+                        if (haloBase != nullptr)
+                        {
+                            storeVec(
+                                gRowW(static_cast<T*>(haloBase), static_cast<int64_t>(t) * haloFrame + haloRow), k, yk);
+                        }
+                    }
                     if constexpr (SLABS)
                     {
                         auto emit = [&](auto sTag)
@@ -821,6 +873,15 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                                     setPair(o, i, acc);
                                 }
                                 storeVec(gRowW(ptrs.d + s * ptrs.compStride, drow), k, o);
+                                if constexpr (HALO)
+                                {
+                                    if (haloBase != nullptr)
+                                    {
+                                        storeVec(gRowW(static_cast<TD*>(haloBase) + s * haloComp,
+                                                     static_cast<int64_t>(t / R) * haloFrame + haloRow),
+                                            k, o);
+                                    }
+                                }
                             }
                         };
                         emit(cuda::std::integral_constant<int, 0>{});
@@ -897,12 +958,15 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
 // Entry point for the runtime-compiled kernel: every argument a scalar (the launcher passes a
 // typed argument list).
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO>
-__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>()) vaeNormKernel(T const* x, TD const* m,
-    TD* d, long long compStride, long long inCompStride, T const* residual, T const* inBias, T const* cache,
-    T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions, int channels, int frames,
-    int cacheFrames, int height, int width, int padH, int padW, long long inFrame, int inW, int inOff,
-    long long outFrame, int outW, int outOff, int upHeight, int upWidth, int upCrop, int upCin, float scale, float eps)
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO,
+    bool HALO>
+__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
+    vaeNormKernel(T const* x, TD const* m, TD* d, long long compStride, long long inCompStride, T const* residual,
+        T const* inBias, T const* cache, T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions,
+        int channels, int frames, int cacheFrames, int height, int width, int padH, int padW, long long inFrame,
+        int inW, int inOff, long long outFrame, int outW, int outOff, int upHeight, int upWidth, int upCrop, int upCin,
+        float scale, float eps, void* haloL, void* haloR, long long haloFrameL, long long haloFrameR,
+        long long haloCompL, long long haloCompR, int haloStepL, int haloStepR, int haloAxis)
 {
     Ptrs<T, TD> ptrs{};
     ptrs.x = x;
@@ -939,8 +1003,17 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>()) v
     p.upCin = upCin;
     p.scale = scale;
     p.eps = eps;
+    p.haloL = haloL;
+    p.haloR = haloR;
+    p.haloFrameL = haloFrameL;
+    p.haloFrameR = haloFrameR;
+    p.haloCompL = haloCompL;
+    p.haloCompR = haloCompR;
+    p.haloStepL = haloStepL;
+    p.haloStepR = haloStepR;
+    p.haloAxis = haloAxis;
     vaeNormBody<T, TD, R, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, IN_WINO, MID, OUT, PADDED, IN_MAP, OUT_MAP,
-        UP_FT, UP_RATIO>(ptrs, p);
+        UP_FT, UP_RATIO, HALO>(ptrs, p);
 }
 
 } // namespace vaewino
