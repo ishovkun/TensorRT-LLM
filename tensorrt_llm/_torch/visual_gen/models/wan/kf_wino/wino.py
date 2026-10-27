@@ -3,7 +3,9 @@
 #
 # Kernel Factory output (campaign wan-vae-spatial-conv, solution
 # wan_conv3x3_hybrid_wino_f4_direct_cutedsl, harvested Mon 19 Oct 2026). Kept byte-identical to
-# the harvest apart from this header and package-relative imports; wino_kf.py holds our glue.
+# the harvest apart from this header, package-relative imports and the 64-bit frame and tile
+# coordinates of the transforms (a 32-bit frame index times the frame stride overflows above
+# 2^31 elements, e.g. 1080x1920 x 512 channels from the third frame on); wino_kf.py holds our glue.
 
 # Separable Winograd F(MH x MW, 3x3) building blocks for the channels-last 3x3 conv.
 #
@@ -15,7 +17,7 @@
 # F(4x4) needs the well-conditioned F(4,3) point set below to keep fp16 error inside tolerance.
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Float16, Int32
+from cutlass import Float32, Float16, Int32, Int64
 import cuda.bindings.driver as cuda
 
 NT = 128  # threads per CTA for the transform kernels
@@ -142,7 +144,8 @@ def _in_body(mX: cute.Tensor, mV: cute.Tensor, L: Int32, N: cutlass.Constexpr,
         tw = t % TW
         r = t // TW
         th = r % TH
-        n = r // TH
+        n = Int64(r // TH)  # frame and tile coordinates in 64 bits: their strides reach 1e9 elements
+        t64 = Int64(t)
         # column (W) transform of each input row as it is loaded
         rows = []
         for a in cutlass.range_constexpr(AH):
@@ -164,7 +167,7 @@ def _in_body(mX: cute.Tensor, mV: cute.Tensor, L: Int32, N: cutlass.Constexpr,
             for i in cutlass.range_constexpr(AH):
                 of = cute.make_rmem_tensor((VEC,), Float16)
                 of.store(v[i].to(Float16))
-                cute.autovec_copy(of, _vec(mV, (1, 1, VEC), (i * AW + j, t, g)))
+                cute.autovec_copy(of, _vec(mV, (1, 1, VEC), (i * AW + j, t64, g)))
 
 
 def _in_vec(MH, MW):
@@ -248,13 +251,14 @@ def _out_xform_kernel(mM: cute.Tensor, mY: cute.Tensor, N: cutlass.Constexpr, H:
         tw = t % TW
         r = t // TW
         th = r % TH
-        n = r // TH
+        n = Int64(r // TH)  # frame and tile coordinates in 64 bits: their strides reach 1e9 elements
+        t64 = Int64(t)
         z = []
         for i in cutlass.range_constexpr(AH):
             m = []
             for j in cutlass.range_constexpr(AW):
                 frag = cute.make_rmem_tensor((VEC,), mM.element_type)
-                cute.autovec_copy(_vec(mM, (1, 1, VEC), (i * AW + j, t, g)), frag)
+                cute.autovec_copy(_vec(mM, (1, 1, VEC), (i * AW + j, t64, g)), frag)
                 m.append(frag.load().to(Float32))
             z.append(_lin(ATw, m))  # z[i][q]
         for q in cutlass.range_constexpr(MW):

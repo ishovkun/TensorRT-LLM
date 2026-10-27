@@ -727,19 +727,20 @@ _BT = torch.tensor([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], 
 _AT = torch.tensor([[1, 1, 1, 0], [0, 1, -1, -1]], dtype=torch.float32)
 
 
+# F(4x4, 3x3) on points (0, 1, -1, 2, -1/2, inf), as in the CUDA op and the Kernel Factory path.
 _BT4 = torch.tensor(
     [
-        [4, 0, -5, 0, 1, 0],
-        [0, -4, -4, 1, 1, 0],
-        [0, 4, -4, -1, 1, 0],
-        [0, -2, -1, 2, 1, 0],
+        [1, 1.5, -2, -1.5, 1, 0],
+        [0, -1, -2.5, -0.5, 1, 0],
+        [0, 1, 0.5, -2.5, 1, 0],
+        [0, -0.5, -1, 0.5, 1, 0],
         [0, 2, -1, -2, 1, 0],
-        [0, 4, 0, -5, 0, 1],
+        [0, 1, 1.5, -2, -1.5, 1],
     ],
     dtype=torch.float32,
 )
 _AT4 = torch.tensor(
-    [[1, 1, 1, 1, 1, 0], [0, 1, -1, 2, -2, 0], [0, 1, 1, 4, 4, 0], [0, 1, -1, 8, -8, 1]],
+    [[1, 1, 1, 1, 1, 0], [0, 1, -1, 2, -0.5, 0], [0, 1, 1, 4, 0.25, 0], [0, 1, -1, 8, -0.125, 1]],
     dtype=torch.float32,
 )
 _SPATIAL_MATS = {2: (_BT, _AT), 4: (_BT4, _AT4)}
@@ -807,8 +808,13 @@ def test_spatial_winograd_transforms(
     v_ref = _ref_spatial_in(frames, components, row0, row1, tile)
     assert v.shape == v_ref.shape
     assert v.dtype == torch.float16
-    # bf16 inputs times integer transform entries are exact in fp32: bitwise after rounding.
-    assert torch.equal(v.float(), v_ref.to(torch.float16).float())
+    if tile == 2:
+        # bf16 inputs times integer transform entries are exact in fp32: bitwise after rounding.
+        assert torch.equal(v.float(), v_ref.to(torch.float16).float())
+    else:
+        # F(4x4): the separable kernel and the einsum reference sum the six terms in a different
+        # order, so a handful of elements land one fp16 ulp apart.
+        torch.testing.assert_close(v.float(), v_ref.to(torch.float16).float(), rtol=1e-3, atol=1e-2)
 
     coords = (tile + 2) ** 2
     m = torch.randn(components * coords, v.shape[1], C, device="cuda").to(torch.float16)
@@ -823,6 +829,43 @@ def test_spatial_winograd_transforms(
         torch.testing.assert_close(got, ref.to(torch.bfloat16).float(), rtol=2e-2, atol=1e-2)
     untouched = torch.cat([out[:, : tile * row0], out[:, tile * row1 :]], dim=1)
     assert torch.isnan(untouched.float()).all()
+
+
+@spatial_op
+@pytest.mark.parametrize("C", [8, 64])
+@pytest.mark.parametrize("hw_tile", [((720, 1280), 2), ((1080, 1920), 4)])
+def test_spatial_winograd_transforms_large_frames(
+    C: int, hw_tile: tuple[tuple[int, int], int]
+) -> None:
+    """Frames whose tile count exceeds a 65535-wide grid dimension (720x1280 F(2x2): 460,800
+    tiles; 1080x1920 F(4x4): 129,600 tiles) with the whole frame as one strip, both channel
+    paths (plain for C = 8, staged for C % 64 == 0)."""
+    torch.manual_seed(0)
+    (h, w), tile = hw_tile
+    n, components = 2, 1
+    row1 = -(-h // tile)
+    frames = torch.randn(n, h, w, C, device="cuda").to(torch.bfloat16)
+    v = torch.ops.trtllm.vae_wino_spatial_in(frames, components, 0, row1, tile)
+    v_ref = _ref_spatial_in(frames, components, 0, row1, tile).to(torch.float16)
+    assert v.shape == v_ref.shape
+    if tile == 2:
+        assert torch.equal(v.float(), v_ref.float())
+    else:
+        # F(4x4): the separable kernel and the einsum reference sum the six terms in a different
+        # order, so a handful of the 7e7 elements differ by one fp16 ulp.
+        torch.testing.assert_close(v.float(), v_ref.float(), rtol=1e-3, atol=1e-2)
+        assert (v != v_ref).float().mean().item() < 1e-6
+    del v_ref
+    out = torch.full((n, h, w, C), float("nan"), device="cuda", dtype=torch.bfloat16)
+    torch.ops.trtllm.vae_wino_spatial_out(v, out, components, 0, row1, tile)
+    ref = _ref_spatial_out(v, n, h, w, components, 0, row1, tile)
+    assert not torch.isnan(out.float()).any()
+    if tile == 2:
+        assert torch.equal(out.float(), ref.to(torch.bfloat16).float())
+    else:
+        torch.testing.assert_close(
+            out.float(), ref.to(torch.bfloat16).float(), rtol=2e-2, atol=1e-2
+        )
 
 
 @spatial_op
@@ -993,7 +1036,7 @@ def test_spatial_winograd_conv_frame_dtypes(
 
 
 @spatial_op
-@pytest.mark.parametrize("mode", ["wa", "wb", "wa0", "wb0", "wb1", "wb1d", None])
+@pytest.mark.parametrize("mode", ["wa", "wb", "wa0", "wb0", "wb1", "wb1s", "wb1d", None])
 @pytest.mark.parametrize(
     "cin_cout_hw_pairs", [(64, 256, 6, 12, 4), (128, 256, 9, 16, 2), (512, 512, 24, 40, 2)]
 )
@@ -1030,7 +1073,7 @@ def test_spatial_winograd_kf_matches_reference(
 
 
 @spatial_op
-@pytest.mark.parametrize("mode", ["wb", "wb1", None])
+@pytest.mark.parametrize("mode", ["wb", "wb1", "wb1s", None])
 def test_spatial_winograd_kf_fp16_six_components(mode: str | None) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         kf_spatial_filters,
@@ -1060,6 +1103,156 @@ def test_spatial_winograd_kf_fp16_six_components(mode: str | None) -> None:
     assert got.dtype == torch.float16
     rel = ((got.float() - ref).norm() / ref.norm()).item()
     assert rel < 1e-2, f"rel_l2={rel:.2e}"
+
+
+@pytest.mark.parametrize(
+    "frames_h_w_c", [(4, 90, 160, 1024), (6, 60, 104, 512), (2, 9, 12, 64), (1, 4, 4, 64)]
+)
+def test_spatial_winograd_kf_staged_in_xform_matches(
+    frames_h_w_c: tuple[int, int, int, int],
+) -> None:
+    """The shared-memory-staged input transform reproduces wino.in_xform's V: identical up to
+    fp32 multiply-add contraction (at most one fp16 ulp on a handful of elements) and the sign
+    of zero at padding pixels; frames with partial tile rows / groups included."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import kf_wino_available
+
+    if not kf_wino_available():
+        pytest.skip("Kernel Factory spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream
+
+    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import wino, wino_in
+
+    torch.manual_seed(1)
+    frames, h, w, c = frames_h_w_c
+    x = torch.randn(frames, h, w, c, device="cuda").to(torch.float16)
+    tiles = frames * -(-h // 4) * (w // 4)
+    v_ref = torch.full((36, tiles, c), float("nan"), dtype=torch.float16, device="cuda")
+    v = torch.full_like(v_ref, float("nan"))
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    fn = cute.compile(
+        wino.in_xform,
+        from_dlpack(x, assumed_align=16),
+        from_dlpack(v_ref, assumed_align=16),
+        frames,
+        h,
+        w,
+        c,
+        4,
+        4,
+        0,
+        make_fake_stream(),
+    )
+    fn(from_dlpack(x, assumed_align=16), from_dlpack(v_ref, assumed_align=16), stream)
+    wino_in.in_xform_smem(x, v, 0)
+    torch.cuda.synchronize()
+    assert not torch.isnan(v).any()
+    diff = (v.float() - v_ref.float()).abs()
+    ulp = torch.maximum(v_ref.abs().float(), torch.tensor(2.0**-14, device="cuda")) * 2.0**-10
+    assert (diff <= ulp).all(), f"{int((diff > ulp).sum())} elements beyond one fp16 ulp"
+    assert (diff > 0).float().mean().item() < 1e-6
+
+
+def _kf_tile_v(x: torch.Tensor, n: int, th: int, tw: int, c0: int, c1: int) -> torch.Tensor:
+    """V[:, tile (n, th, tw), c0:c1] of the F(4x4, 3x3) input transform in fp32."""
+    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import wino
+
+    _, h, w, _ = x.shape
+    d = torch.zeros(6, 6, c1 - c0, dtype=torch.float32, device=x.device)
+    for a in range(6):
+        for b in range(6):
+            hh, ww = 4 * th - 1 + a, 4 * tw - 1 + b
+            if 0 <= hh < h and 0 <= ww < w:
+                d[a, b] = x[n, hh, ww, c0:c1].float()
+    bt = torch.tensor(wino.WINO[4]["BT"], dtype=torch.float32, device=x.device)
+    return torch.einsum("ia,abc,jb->ijc", bt, d, bt).reshape(36, c1 - c0)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_spatial_winograd_kf_in_xform_above_2_31_elements(staged: bool) -> None:
+    """Frames whose stride (H*W*C = 1.06e9) puts the third frame past 2^31 elements and a V of
+    7.2e9 elements: the transform's frame and tile coordinates must be 64-bit.  Checks the far
+    corners of V against the definition.  Needs ~21 GiB of device memory."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import kf_wino_available
+
+    if not kf_wino_available():
+        pytest.skip("Kernel Factory spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    if torch.cuda.get_device_properties(0).total_memory < 40 * 2**30:
+        pytest.skip("needs a 40 GiB GPU")
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream
+
+    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import wino, wino_in
+
+    n, h, w, c = 3, 1080, 1920, 512
+    th, tw = -(-h // 4), w // 4
+    tiles = n * th * tw
+    g = torch.Generator(device="cuda").manual_seed(2)
+    x = torch.randn(n, h, w, c, device="cuda", generator=g).to(torch.float16)
+    v = torch.empty(36, tiles, c, dtype=torch.float16, device="cuda")
+    assert x.numel() > 2**31 and v.numel() > 2**31
+    if staged:
+        wino_in.in_xform_smem(x, v, 0)
+    else:
+        args = (from_dlpack(x, assumed_align=16), from_dlpack(v, assumed_align=16))
+        fn = cute.compile(wino.in_xform, *args, n, h, w, c, 4, 4, 0, make_fake_stream())
+        fn(*args, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+    torch.cuda.synchronize()
+    for fn_, th_, tw_ in (
+        (0, 0, 0),
+        (2, th - 1, tw - 1),
+        (2, 0, 0),
+        (1, th // 2, tw // 2),
+        (0, th - 1, tw - 1),
+    ):
+        t = (fn_ * th + th_) * tw + tw_
+        for c0 in (0, c - 64):
+            got = v[:, t, c0 : c0 + 64].float()
+            ref = _kf_tile_v(x, fn_, th_, tw_, c0, c0 + 64)
+            torch.testing.assert_close(got, ref, rtol=2e-3, atol=2e-2)
+    del x, v
+    torch.cuda.empty_cache()
+
+
+def test_spatial_winograd_kf_out_xform_above_2_31_elements() -> None:
+    """The output transform at the same frame geometry: y's third frame lies past 2^31
+    elements; checks pixels of every frame against the definition.  Needs ~21 GiB."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import kf_wino_available
+
+    if not kf_wino_available():
+        pytest.skip("Kernel Factory spatial Winograd needs Blackwell and nvidia-cutlass-dsl")
+    if torch.cuda.get_device_properties(0).total_memory < 40 * 2**30:
+        pytest.skip("needs a 40 GiB GPU")
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream
+
+    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import wino
+
+    n, h, w, c = 3, 1080, 1920, 512
+    th, tw = -(-h // 4), w // 4
+    tiles = n * th * tw
+    g = torch.Generator(device="cuda").manual_seed(3)
+    m = torch.randn(36, tiles, c, device="cuda", generator=g).to(torch.float16)
+    y = torch.full((n, h, w, c), float("nan"), dtype=torch.float16, device="cuda")
+    args = (from_dlpack(m, assumed_align=16), from_dlpack(y, assumed_align=16))
+    fn = cute.compile(wino.out_xform, *args, n, h, w, c, 4, 4, 0, make_fake_stream())
+    fn(*args, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+    torch.cuda.synchronize()
+    at = torch.tensor(wino.WINO[4]["AT"], dtype=torch.float32, device="cuda")
+    for fn_, th_, tw_ in ((0, 0, 0), (2, th - 1, tw - 1), (2, 0, 0), (1, th // 2, tw // 2)):
+        t = (fn_ * th + th_) * tw + tw_
+        mt = m[:, t, :].float().view(6, 6, c)
+        ref = torch.einsum("ri,ijc,sj->rsc", at, mt, at)  # [4, 4, c]
+        for r in range(4):
+            if 4 * th_ + r < h:
+                got = y[fn_, 4 * th_ + r, 4 * tw_ : 4 * tw_ + 4, :].float()
+                torch.testing.assert_close(got, ref[r], rtol=2e-2, atol=1e-2)
+    assert not torch.isnan(y).any()
+    del m, y
+    torch.cuda.empty_cache()
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -1328,3 +1521,122 @@ def test_rows_and_combine_geometry_match_plain(C: int, axis: str) -> None:
         m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
         got = jit_norm.combine(None, m_phys, bias_c, res, T4, H, W, pad, pad, products_geometry=geo)
         assert torch.equal(got, ref)
+
+
+def _peer(comps: int, groups: int, h: int, w: int, axis: str, C: int, dtype, lower: bool):
+    """A neighbour's frame buffer (one more line along the split axis than ours, so its
+    strides differ) and the view of the halo line that must receive our border."""
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import PeerFrames
+
+    g = _halo_geometry(h + 1, w, axis) if axis == "h" else _halo_geometry(h, w + 1, axis)
+    buf = torch.full((comps, groups, g.rows, g.cols, C), 7.0, dtype=dtype, device="cuda")
+    if axis == "h":
+        line = g.row0 + g.height if lower else g.row0 - 1
+        peer = PeerFrames(buf, line, g.col0, g.width)
+        got = lambda: buf[:, :, line, g.col0 : g.col0 + g.width, :]  # noqa: E731
+    else:
+        line = g.col0 + g.width if lower else g.col0 - 1
+        peer = PeerFrames(buf, line, g.row0, g.height)
+        got = lambda: buf[:, :, g.row0 : g.row0 + g.height, line, :]  # noqa: E731
+    return buf, peer, got, line
+
+
+def _untouched(buf: torch.Tensor, axis: str, line: int) -> bool:
+    """Everything but the halo line still holds the sentinel."""
+    other = buf.clone()
+    if axis == "h":
+        other[:, :, line] = 7.0
+    else:
+        other[:, :, :, line] = 7.0
+    return bool(torch.all(other == 7.0))
+
+
+@cuda_op
+@pytest.mark.parametrize("C", [256, 48])
+@pytest.mark.parametrize("axis", ["h", "w"])
+@pytest.mark.parametrize("order", [2, 4])
+def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int) -> None:
+    """The kernel stores the border lines of its slab / row output into the neighbours'
+    buffers (here: local stand-ins with their own layout) and nothing else; the host-side
+    copy writes the same lines."""
+    from dataclasses import replace
+
+    from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_shard import DirectFrames, push_border
+
+    gen = torch.Generator(device="cuda").manual_seed(C + order)
+    H, W, T = 6, 10, 2 * order
+    P = H * W
+    bf = torch.bfloat16
+    rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
+    geo = _halo_geometry(H, W, axis)
+    gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
+    x = rnd(T, P, C)
+    cache = rnd(2, P, C)
+
+    # Slabs: [order + 2, T / order, positions, C] fp16.
+    comps, groups = order + 2, T // order
+    bl, left, got_l, line_l = _peer(comps, groups, H, W, axis, C, torch.float16, lower=True)
+    br, right, got_r, line_r = _peer(comps, groups, H, W, axis, C, torch.float16, lower=False)
+    mine = torch.empty((comps, groups, geo.rows, geo.cols, C), dtype=torch.float16, device="cuda")
+    push = DirectFrames(mine, None, axis, left, right).push()
+    _, _, d = jit_norm.wino_norm_silu(
+        x,
+        None,
+        None,
+        None,
+        cache,
+        gamma,
+        None,
+        C**0.5,
+        T,
+        order=order,
+        half_slabs=True,
+        slab_geometry=replace(geo, push=push),
+    )
+    phys = d.view(comps, groups, geo.rows, geo.cols, C)
+    if axis == "h":
+        first = phys[:, :, geo.row0, geo.col0 : geo.col0 + W]
+        last = phys[:, :, geo.row0 + H - 1, geo.col0 : geo.col0 + W]
+    else:
+        first = phys[:, :, geo.row0 : geo.row0 + H, geo.col0]
+        last = phys[:, :, geo.row0 : geo.row0 + H, geo.col0 + W - 1]
+    assert torch.equal(got_l(), first) and torch.equal(got_r(), last)
+    assert _untouched(bl, axis, line_l) and _untouched(br, axis, line_r)
+    # The host-side push (one component at a time) writes the same lines.
+    bl.fill_(7.0)
+    br.fill_(7.0)
+    for k in range(comps):
+        one = replace(push, left=push.left[k : k + 1], right=push.right[k : k + 1])
+        push_border(one, phys[k], geo)
+    assert torch.equal(got_l(), first) and torch.equal(got_r(), last)
+
+    # Rows: [T, positions, C] bf16 into a frame-buffer window of T frames.
+    bl, left, got_l, line_l = _peer(1, T, H, W, axis, C, bf, lower=True)
+    br, right, got_r, line_r = _peer(1, T, H, W, axis, C, bf, lower=False)
+    out = torch.full((T * geo.frame, C), 7.0, dtype=bf, device="cuda")
+    push = DirectFrames(out.view(1, T, geo.rows, geo.cols, C), None, axis, left, right).push()
+    jit_norm.rms_norm_silu_rows(
+        x.view(T * P, C),
+        gamma,
+        None,
+        C**0.5,
+        out=out,
+        frames=T,
+        out_geometry=replace(geo, push=push),
+    )
+    phys = out.view(1, T, geo.rows, geo.cols, C)
+    if axis == "h":
+        first = phys[:, :, geo.row0, geo.col0 : geo.col0 + W]
+        last = phys[:, :, geo.row0 + H - 1, geo.col0 : geo.col0 + W]
+    else:
+        first = phys[:, :, geo.row0 : geo.row0 + H, geo.col0]
+        last = phys[:, :, geo.row0 : geo.row0 + H, geo.col0 + W - 1]
+    assert torch.equal(got_l(), first) and torch.equal(got_r(), last)
+    assert _untouched(bl, axis, line_l) and _untouched(br, axis, line_r)
+    # A window in the middle of a deeper buffer: only its groups are addressed.
+    bl.fill_(7.0)
+    br.fill_(7.0)
+    deep = DirectFrames(out.view(1, T, geo.rows, geo.cols, C), None, axis, left, right)
+    narrow = deep.push(1, T - 2)
+    assert narrow.left.shape[1] == T - 2 and narrow.left.data_ptr() == push.left[:, 1].data_ptr()

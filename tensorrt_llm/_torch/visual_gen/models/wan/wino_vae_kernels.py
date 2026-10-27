@@ -424,17 +424,19 @@ def winograd_weights(
     return [g.to(out_dtype).contiguous(memory_format=torch.channels_last) for g in gs]
 
 
-# Spatial filter transforms G of F(2x2, 3x3) and F(4x4, 3x3) (Lavin & Gray; points 0, +-1, +-2
-# for the latter), applied in fp64 and rounded once.
+# Spatial filter transforms G of F(2x2, 3x3) (Lavin & Gray, points 0, +-1, inf) and F(4x4, 3x3)
+# (points 0, 1, -1, 2, -1/2, inf, shared with the Kernel Factory path: ~1.5x lower fp16 error than
+# Lavin & Gray's 0, +-1, +-2), applied in fp64 and rounded once. The matching B^T and A^T live in
+# cpp/tensorrt_llm/kernels/vaeWinoSpatialKernel.cu.
 _WINO_G = {
     2: torch.tensor([[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]], dtype=torch.float64),
     4: torch.tensor(
         [
-            [1 / 4, 0, 0],
-            [-1 / 6, -1 / 6, -1 / 6],
-            [-1 / 6, 1 / 6, -1 / 6],
-            [1 / 24, 1 / 12, 1 / 6],
-            [1 / 24, -1 / 12, 1 / 6],
+            [1, 0, 0],
+            [-1 / 3, -1 / 3, -1 / 3],
+            [1 / 3, -1 / 3, 1 / 3],
+            [1 / 15, 2 / 15, 4 / 15],
+            [-16 / 15, 8 / 15, -4 / 15],
             [0, 0, 1],
         ],
         dtype=torch.float64,
@@ -818,13 +820,15 @@ def wino_norm_silu_cuda(
     products_geometry: FrameGeometry | None = None,
     slab_geometry: FrameGeometry | None = None,
     upsample: UpsampleSource | None = None,
+    slabs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
     ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
     ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16. The
     geometries describe products / slabs that carry halo rows or columns (sharded decode);
-    ``upsample`` replaces ``x``: the frames are formed from the packed upsample conv output
-    while reading (:func:`upsample_source`) and returned as the sum."""
+    ``slabs`` is an optional preallocated ``D``. ``upsample`` replaces ``x``: the frames are
+    formed from the packed upsample conv output while reading (:func:`upsample_source`) and
+    returned as the sum."""
     return wino_norm_silu(
         x,
         m,
@@ -841,6 +845,7 @@ def wino_norm_silu_cuda(
         products_geometry=products_geometry,
         slab_geometry=slab_geometry,
         upsample=upsample,
+        slabs=slabs,
     )
 
 

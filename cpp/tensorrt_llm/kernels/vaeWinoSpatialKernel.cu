@@ -128,9 +128,12 @@ __device__ __forceinline__ float2 operator*(float k, float2 a)
     return make_float2(k * a.x, k * a.y);
 }
 
-// Lavin & Gray transforms, written out (interpolation points 0, +-1, +-2 for m = 4). Integer
-// coefficients: with bf16 / fp16 inputs every product and sum is exact in fp32 except the
-// final rounding, so the input transform is bitwise reproducible.
+// Winograd transforms written out. F(2x2, 3x3): Lavin & Gray, points (0, +-1, inf), integer
+// coefficients. F(4x4, 3x3): points (0, 1, -1, 2, -1/2, inf), the same set as the Kernel Factory
+// path; its coefficients are small dyadic fractions (1/2, 3/2, 5/2, 1/4, 1/8), so every product
+// with a bf16 / fp16 input is exact in fp32 and only the sums round. This set keeps the
+// transformed values about 3x smaller than the (0, +-1, +-2, inf) set and the fp16 error of
+// the stored V / M about 1.5x lower.
 // bt<M>(x, d): row x of B^T applied to the (m+2) values d; at<M>(r, t): row r of A^T.
 template <int M>
 struct WinoMath;
@@ -166,12 +169,12 @@ struct WinoMath<4>
     {
         switch (x)
         {
-        case 0: return 4.f * d[0] - 5.f * d[2] + d[4];
-        case 1: return -4.f * (d[1] + d[2]) + d[3] + d[4];
-        case 2: return 4.f * (d[1] - d[2]) - d[3] + d[4];
-        case 3: return -2.f * d[1] - d[2] + 2.f * d[3] + d[4];
-        case 4: return 2.f * d[1] - d[2] - 2.f * d[3] + d[4];
-        default: return 4.f * d[1] - 5.f * d[3] + d[5];
+        case 0: return d[0] + 1.5f * (d[1] - d[3]) - 2.f * d[2] + d[4];
+        case 1: return d[4] - d[1] - 2.5f * d[2] - 0.5f * d[3];
+        case 2: return d[4] + d[1] + 0.5f * d[2] - 2.5f * d[3];
+        case 3: return d[4] - d[2] + 0.5f * (d[3] - d[1]);
+        case 4: return d[4] - d[2] + 2.f * (d[1] - d[3]);
+        default: return d[5] + 1.5f * (d[2] - d[4]) - 2.f * d[3] + d[1];
         }
     }
 
@@ -180,9 +183,9 @@ struct WinoMath<4>
         switch (r)
         {
         case 0: return t[0] + t[1] + t[2] + t[3] + t[4];
-        case 1: return t[1] - t[2] + 2.f * (t[3] - t[4]);
-        case 2: return t[1] + t[2] + 4.f * (t[3] + t[4]);
-        default: return t[1] - t[2] + 8.f * (t[3] - t[4]) + t[5];
+        case 1: return t[1] - t[2] + 2.f * t[3] - 0.5f * t[4];
+        case 2: return t[1] + t[2] + 4.f * t[3] + 0.25f * t[4];
+        default: return t[1] - t[2] + 8.f * t[3] - 0.125f * t[4] + t[5];
         }
     }
 };
@@ -201,16 +204,17 @@ __global__ void __launch_bounds__(kThreads)
     Geometry const g = geometry<M>(p);
     int const C = p.channels;
     int const cvec = C / V;
-    // Grid: x over channel vectors, y over the strip's tiles, z over frames; the per-block
-    // tile and frame indices are uniform, so no thread does a 64-bit division.
-    int const cv = blockIdx.x * kThreads + threadIdx.x;
+    // Grid: x over (tile column, channel-vector block), y over the strip's tile rows, z over
+    // frames (see gridFor); the per-block tile and frame indices are uniform, so no thread does
+    // a 64-bit division.
+    int const j = blockIdx.x % g.tw;
+    int const cv = (blockIdx.x / g.tw) * kThreads + threadIdx.x;
     if (cv < cvec)
     {
         int const c0 = cv * V;
-        int const tile = blockIdx.y;
+        int const i = p.row0 + blockIdx.y;
         int const n = blockIdx.z;
-        int const i = p.row0 + tile / g.tw;
-        int const j = tile - (i - p.row0) * g.tw;
+        int const tile = blockIdx.y * g.tw + j;
         int const comp = n / g.pairs, pair = n - comp * g.pairs;
 
         Vec d[A][A];
@@ -305,12 +309,12 @@ __global__ void __launch_bounds__(kThreads)
 
     Geometry const g = geometry<M>(p);
     int const C = p.channels;
-    int const chunk = blockIdx.x; // channel chunk
-    int const group = blockIdx.y; // tile row x tile-column group
-    int const n = blockIdx.z;     // frame
+    // Grid: x over (tile-column group, channel chunk), y over the strip's tile rows, z over frames.
     int const groupsPerRow = (g.tw + kStagedTiles - 1) / kStagedTiles;
-    int const i = p.row0 + group / groupsPerRow;
-    int const j0 = (group - (i - p.row0) * groupsPerRow) * kStagedTiles;
+    int const chunk = blockIdx.x / groupsPerRow;
+    int const i = p.row0 + blockIdx.y;
+    int const j0 = (blockIdx.x % groupsPerRow) * kStagedTiles;
+    int const n = blockIdx.z;
     int const comp = n / g.pairs, pair = n - comp * g.pairs;
     int const row0 = M * i - 1, col0 = M * j0 - 1;
 
@@ -399,16 +403,15 @@ __global__ void __launch_bounds__(kThreads) vaeWinoSpatialOutputKernel(
     Geometry const g = geometry<M>(p);
     int const C = p.channels;
     int const cvec = C / V;
-    // Grid: x over channel vectors, y over the strip's tiles, z over frames; the per-block
-    // tile and frame indices are uniform, so no thread does a 64-bit division.
-    int const cv = blockIdx.x * kThreads + threadIdx.x;
+    // Grid as in the input kernel (see gridFor).
+    int const j = blockIdx.x % g.tw;
+    int const cv = (blockIdx.x / g.tw) * kThreads + threadIdx.x;
     if (cv < cvec)
     {
         int const c0 = cv * V;
-        int const tile = blockIdx.y;
+        int const i = p.row0 + blockIdx.y;
         int const n = blockIdx.z;
-        int const i = p.row0 + tile / g.tw;
-        int const j = tile - (i - p.row0) * g.tw;
+        int const tile = blockIdx.y * g.tw + j;
         int const comp = n / g.pairs, pair = n - comp * g.pairs;
 
         VecS mv[A * A];
@@ -472,13 +475,18 @@ __global__ void __launch_bounds__(kThreads) vaeWinoSpatialOutputKernel(
     }
 }
 
+// Grid of the plain input and the output kernels: x = tile columns x channel-vector blocks
+// (column fastest), y = the strip's tile rows, z = frames. Only x can exceed 65535; y and z are
+// bounded by the frame height and the frame count.
 dim3 gridFor(VaeWinoSpatialParams const& p)
 {
     int const lanes = p.tile == 2 ? Lanes<__nv_bfloat16, 2>::V : Lanes<__nv_bfloat16, 4>::V;
     int const cvec = p.channels / lanes;
-    int const tiles = (p.row1 - p.row0) * ((p.width + p.tile - 1) / p.tile);
-    TLLM_CHECK_WITH_INFO(tiles <= 65535 && p.frames <= 65535, "vaeWinoSpatial: too many tiles or frames for the grid");
-    return dim3((cvec + kThreads - 1) / kThreads, tiles, p.frames);
+    int const tw = (p.width + p.tile - 1) / p.tile;
+    int const rows = p.row1 - p.row0;
+    TLLM_CHECK_WITH_INFO(
+        rows <= 65535 && p.frames <= 65535, "vaeWinoSpatial: too many tile rows or frames for the grid");
+    return dim3(tw * ((cvec + kThreads - 1) / kThreads), rows, p.frames);
 }
 
 void check(VaeWinoSpatialParams const& p)
@@ -508,9 +516,11 @@ template <typename T, int M>
 void launchInputStaged(T const* frames, TS* v, VaeWinoSpatialParams const& p, cudaStream_t stream)
 {
     int const tw = (p.width + M - 1) / M;
-    int const groups = (p.row1 - p.row0) * ((tw + kStagedTiles - 1) / kStagedTiles);
-    TLLM_CHECK_WITH_INFO(groups <= 65535 && p.frames <= 65535, "vaeWinoSpatial: too many tiles or frames for the grid");
-    dim3 const grid(p.channels / kStagedChannels, groups, p.frames);
+    int const groupsPerRow = (tw + kStagedTiles - 1) / kStagedTiles;
+    int const rows = p.row1 - p.row0;
+    TLLM_CHECK_WITH_INFO(
+        rows <= 65535 && p.frames <= 65535, "vaeWinoSpatial: too many tile rows or frames for the grid");
+    dim3 const grid(groupsPerRow * (p.channels / kStagedChannels), rows, p.frames);
     vaeWinoSpatialInputStagedKernel<T, M><<<grid, kThreads, 0, stream>>>(frames, v, p);
 }
 
