@@ -630,11 +630,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 f"{sim.text_cache_max_len} tokens"
             )
         decoder = self._start_overlapped_decode(latents)
-        kv_cache.open(
+        with kv_cache.open(
             self._rollout_spec(history_frames, tokens_per_frame),
             pin_tokens=text_len + sim.sink_frames * tokens_per_frame,
-        )
-        try:
+        ):
             tf.write_prompt_kv(kv_cache, cond_ids, cond_mask, offload_context=offload)
             kv_cache.commit(text_len)
             steps = len(sim.sigmas)
@@ -687,8 +686,6 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                         offload_context=offload,
                     )
                     kv_cache.commit()
-        finally:
-            kv_cache.close()
         if decoder is not None:
             self._streamed_video = decoder.finish()
         self._release_scheduler_solver_state()
