@@ -33,6 +33,10 @@ from tensorrt_llm._torch.utils import relu2
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.cache import ForwardPlan
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.models.cosmos3.config_resolver import (
+    architecture_defaults,
+    fill_pretrained_config,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sim_packing import (
     SIM_CONFIG_KEY,
     FramePacking,
@@ -49,15 +53,9 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-# Some Cosmos3OmniTransformer checkpoint configs omit these fields; the values
-# match what other conversions carry explicitly.
-PRETRAINED_CONFIG_COMPAT_DEFAULTS = {
-    "position_embedding_type": "unified_3d_mrope",
-    "max_position_embeddings": 262144,
-    "temporal_compression_factor": 4,
-    "temporal_compression_factor_sound": 1,
-}
-
+PRETRAINED_CONFIG_COMPAT_DEFAULTS = architecture_defaults()
+"""Values the transformer assumes for construction attributes an export omits;
+owned by the precedence table in ``config_resolver``."""
 
 _PretrainedConfigT = TypeVar("_PretrainedConfigT")
 
@@ -65,11 +63,8 @@ _PretrainedConfigT = TypeVar("_PretrainedConfigT")
 def apply_pretrained_config_compat_defaults(
     pretrained_config: _PretrainedConfigT,
 ) -> _PretrainedConfigT:
-    """Fill missing schema fields in place (idempotent); returns the config."""
-    for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
-        if getattr(pretrained_config, key, None) is None:
-            setattr(pretrained_config, key, value)
-    return pretrained_config
+    """Fill missing construction attributes in place (idempotent); returns the config."""
+    return fill_pretrained_config(pretrained_config)
 
 
 def uses_static_fp8(model_config: DiffusionModelConfig) -> bool:

@@ -1,0 +1,377 @@
+{
+ "nvidia/Cosmos3-Edge": {
+  "model_index.json": {
+   "default_use_system_prompt": false,
+   "use_native_flow_schedule": true
+  },
+  "transformer/config.json": {
+   "temporal_compression_factor": 4
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Edge-Policy-DROID": {
+  "checkpoint.json": {
+   "policy": {
+    "action_chunk_size": 32,
+    "conditioning_fps": 15.0,
+    "domain_name": "droid_lerobot"
+   }
+  },
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "model_index.json": {
+   "default_use_system_prompt": false,
+   "use_native_flow_schedule": true
+  },
+  "transformer/config.json": {
+   "temporal_compression_factor": 4
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Nano": {
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "transformer/config.json": {
+   "max_position_embeddings": 262144,
+   "position_embedding_type": "unified_3d_mrope",
+   "temporal_compression_factor_sound": 1
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Nano-Policy-DROID": {
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "transformer/config.json": {
+   "max_position_embeddings": 262144,
+   "position_embedding_type": "unified_3d_mrope",
+   "temporal_compression_factor_sound": 1
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Nano-Sim-Bimanual": {
+  "checkpoint.json": {
+   "cosmos3_nano_sim_bimanual": {
+    "chunk_partition": [
+     1,
+     2
+    ],
+    "chunk_size": 2,
+    "conditioning": {
+     "action_tokens_per_frame": 4,
+     "default_embodiment": "agibotworld",
+     "embodiments": {
+      "abc_yam": {
+       "domain_id": 16,
+       "input_action_dim": 59
+      },
+      "agibot_gear_gripper": {
+       "domain_id": 15,
+       "input_action_dim": 59
+      },
+      "agibot_gear_gripper_ext": {
+       "domain_id": 15,
+       "input_action_dim": 59
+      },
+      "agibotworld": {
+       "domain_id": 15,
+       "input_action_dim": 59
+      },
+      "behavior1k_lerobot": {
+       "domain_id": 22,
+       "input_action_dim": 59
+      },
+      "camera_pose": {
+       "domain_id": 2,
+       "input_action_dim": 59
+      },
+      "hand_pose": {
+       "domain_id": 3,
+       "input_action_dim": 59
+      },
+      "molmoact2_yam": {
+       "domain_id": 16,
+       "input_action_dim": 59
+      },
+      "xdof_yam": {
+       "domain_id": 16,
+       "input_action_dim": 59
+      }
+     },
+     "input_contract": {
+      "action_dim": 59
+     }
+    },
+    "sink_frames": 0,
+    "text_cache_max_len": 512,
+    "video_temporal_causal": true,
+    "window_frames": null
+   }
+  },
+  "config.json": {
+   "cosmos3_nano_sim_bimanual": {
+    "chunk_size": 2,
+    "fixed_step_sampler_config": {
+     "t_list": [
+      1.0,
+      0.9375,
+      0.8333333333333334,
+      0.625
+     ]
+    },
+    "sink_frames": 0,
+    "text_cache_max_len": 1024,
+    "video_temporal_causal": true,
+    "window_frames": null
+   },
+   "model": {
+    "config": {
+     "teacher_forcing_frames_per_chunk": 2,
+     "video_temporal_causal": true,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "model_index.json": {
+   "_cosmos3_nano_sim_bimanual": {
+    "chunk_size": 2,
+    "sink_frames": 0,
+    "text_cache_max_len": 512,
+    "video_temporal_causal": true,
+    "window_frames": null
+   },
+   "default_use_system_prompt": true,
+   "use_native_flow_schedule": false
+  },
+  "scheduler/scheduler_config.json": {
+   "fixed_step_sampler_config": {
+    "t_list": [
+     1.0,
+     0.9375,
+     0.8333333333333334,
+     0.625
+    ]
+   }
+  },
+  "transformer/config.json": {
+   "cosmos3_nano_sim_bimanual": {
+    "chunk_size": 2,
+    "conditioning": {
+     "action_tokens_per_frame": 4,
+     "default_embodiment": "agibotworld",
+     "embodiments": {
+      "abc_yam": {
+       "domain_id": 16,
+       "input_action_dim": 59
+      },
+      "agibot_gear_gripper": {
+       "domain_id": 15,
+       "input_action_dim": 59
+      },
+      "agibot_gear_gripper_ext": {
+       "domain_id": 15,
+       "input_action_dim": 59
+      },
+      "agibotworld": {
+       "domain_id": 15,
+       "input_action_dim": 59
+      },
+      "behavior1k_lerobot": {
+       "domain_id": 22,
+       "input_action_dim": 59
+      },
+      "camera_pose": {
+       "domain_id": 2,
+       "input_action_dim": 59
+      },
+      "hand_pose": {
+       "domain_id": 3,
+       "input_action_dim": 59
+      },
+      "molmoact2_yam": {
+       "domain_id": 16,
+       "input_action_dim": 59
+      },
+      "xdof_yam": {
+       "domain_id": 16,
+       "input_action_dim": 59
+      }
+     },
+     "input_contract": {
+      "action_dim": 59
+     }
+    },
+    "fixed_step_sampler_config": {
+     "t_list": [
+      1.0,
+      0.9375,
+      0.8333333333333334,
+      0.625
+     ]
+    },
+    "sink_frames": 0,
+    "text_cache_max_len": 1024,
+    "vae_spatial_compression_factor": 16,
+    "video_temporal_causal": true,
+    "window_frames": null
+   },
+   "temporal_compression_factor": 4
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Super": {
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "transformer/config.json": {
+   "max_position_embeddings": 262144,
+   "position_embedding_type": "unified_3d_mrope",
+   "temporal_compression_factor_sound": 1
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Super-Image2Video": {
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "transformer/config.json": {
+   "max_position_embeddings": 262144,
+   "position_embedding_type": "unified_3d_mrope",
+   "temporal_compression_factor_sound": 1
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Super-Image2Video-4Step": {
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "scheduler/scheduler_config.json": {
+   "fixed_step_sampler_config": {
+    "t_list": [
+     1.0,
+     0.9375,
+     0.8333333333333334,
+     0.625
+    ]
+   }
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Super-Text2Image": {
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "transformer/config.json": {
+   "max_position_embeddings": 262144,
+   "position_embedding_type": "unified_3d_mrope",
+   "temporal_compression_factor_sound": 1
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ },
+ "nvidia/Cosmos3-Super-Text2Image-4Step": {
+  "config.json": {
+   "model": {
+    "config": {
+     "video_temporal_causal": false,
+     "vlm_config": {
+      "use_system_prompt": false
+     }
+    }
+   }
+  },
+  "scheduler/scheduler_config.json": {
+   "fixed_step_sampler_config": {
+    "t_list": [
+     1.0,
+     0.9375,
+     0.8333333333333334,
+     0.625
+    ]
+   }
+  },
+  "vae/config.json": {
+   "scale_factor_spatial": 16,
+   "scale_factor_temporal": 4
+  }
+ }
+}
