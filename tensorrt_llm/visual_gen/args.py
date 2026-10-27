@@ -571,6 +571,42 @@ class KVCacheConfig(StrictBaseModel):
         status="prototype",
         description="Fraction of the GPU memory left after the warmup peak that the K/V cache may take.",
     )
+    kv_cache_inference_size: Optional[int] = Field(
+        None,
+        ge=2,
+        status="prototype",
+        description=(
+            "Latent frames each generated frame may attend to, counting the attention sinks "
+            "and the frame itself: with 64 and 8 sinks, a frame sees the 8 sink frames and "
+            "the 55 frames before it. None: what the checkpoint declares (Cosmos3 Sim: full "
+            "history). Fixed for the engine's lifetime."
+        ),
+    )
+    attention_sink_size: Optional[int] = Field(
+        None,
+        ge=0,
+        status="prototype",
+        description=(
+            "Leading latent frames kept visible for the whole rollout once the window "
+            "slides past them. Requires kv_cache_inference_size. None: what the checkpoint "
+            "declares."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _sinks_fit_the_window(self) -> "KVCacheConfig":
+        if self.attention_sink_size is None:
+            return self
+        if self.kv_cache_inference_size is None:
+            if self.attention_sink_size != 0:
+                raise ValueError("attention_sink_size requires kv_cache_inference_size")
+            return self
+        if self.attention_sink_size > self.kv_cache_inference_size - 2:
+            raise ValueError(
+                f"attention_sink_size {self.attention_sink_size} leaves no recent frame in a "
+                f"kv_cache_inference_size of {self.kv_cache_inference_size}"
+            )
+        return self
 
 
 class CpuOffloadConfig(StrictBaseModel):

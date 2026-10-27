@@ -17,9 +17,9 @@ Pass the Hub ID or local path via `--model`:
 - [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano)
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
 - [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
-- [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
+- [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed.
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
-- [`nvidia/Cosmos3-Nano-Sim-Bimanual`](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Bimanual) — autoregressive simulator for bimanual manipulation: a first frame plus a recorded action trajectory produce the video the actions cause, chunk by chunk, each chunk attending to the finished frames through a paged K/V cache. Everything the rollout needs is read from the checkpoint: chunk size, the fixed few-step SDE schedule (guidance baked in), and the embodiment table (which robot body a row describes, how many values it holds, and its domain id; a request's `domain_id` may be one id or one per action row for trajectories that switch embodiment). Action values are sent already in the checkpoint's normalized space. 480p, up to 901 frames at 30 fps; requests beyond that are refused. Needs the `TRTLLM` or `CUDNN` attention backend and runs the chunk forward under CUDA graphs: use `configs/cosmos3-nano-sim-1gpu.yaml`. Guardrails apply as for every Cosmos3 checkpoint.
+- [`nvidia/Cosmos3-Nano-Sim-Bimanual`](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Bimanual) — autoregressive simulator for bimanual manipulation: a first frame plus a recorded action trajectory produce the video the actions cause, chunk by chunk, each chunk attending to the finished frames through a paged K/V cache. Everything the rollout needs is read from the checkpoint: chunk size, the fixed few-step SDE schedule (guidance baked in), and the embodiment table (which robot body a row describes, how many values it holds, and its domain id; a request's `domain_id` may be one id or one per action row for trajectories that switch embodiment). Action values are sent already in the checkpoint's normalized space. 480p at 30 fps. Deploy with `configs/cosmos3-nano-sim-1gpu.yaml` (see below). Guardrails apply as for every Cosmos3 checkpoint.
 - [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
 
 ### Static FP8 checkpoints
@@ -80,7 +80,7 @@ See `examples/visual_gen/configs/`:
 - `cosmos3-nano-1gpu.yaml` — 1 GPU
 - `cosmos3-super-4gpu.yaml` — 4 GPU, CFG + Ulysses + parallel VAE
 - `cosmos3-t2i-1gpu.yaml` — 1 GPU, text-to-image deployments (base or distilled): warms the deployed 1024×1024 single-frame shape instead of the omni video shape.
-- `cosmos3-nano-sim-1gpu.yaml` — 1 GPU, `Cosmos3-Nano-Sim-Bimanual`: K/V-cache-capable attention backend and the cache memory share.
+- `cosmos3-nano-sim-1gpu.yaml` — 1 GPU, `Cosmos3-Nano-Sim-Bimanual`. A K/V-cache-capable attention backend (`CUDNN`, the faster one, or `TRTLLM`), CUDA graphs over the chunk forward, the cache memory share, and the reference history window: `kv_cache_config.kv_cache_inference_size: 64` with `attention_sink_size: 8`, so each latent frame sees the first 8 latent frames of the video and the 55 before it. Without those two keys the rollout keeps full history, as the checkpoint declares, and a request longer than the K/V cache holds is refused.
 
 Example prompts live under `prompts/` (mirroring `cosmos3-internal/inputs/omni`).
 
@@ -102,6 +102,10 @@ A prompt file may hold any of three shapes:
 
 Structured captions are what the model cards ship and what the checkpoints were
 tuned on; they give noticeably cleaner output than a one-line summary.
+Whether the Cosmos3 system prompt is prepended is declared by the checkpoint
+(`model.config.vlm_config.use_system_prompt` in `config.json`, else
+`default_use_system_prompt` in `model_index.json`); `--use_system_prompt` /
+`--no-use_system_prompt` override it per request.
 `--negative_prompt` defaults to `cosmos3_negative_prompt.json` in this directory.
 The bundled Action prompts contain the caption metadata for their documented
 domain and 16:9 reference. Update the nested timing and canvas fields along with

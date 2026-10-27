@@ -28,7 +28,9 @@ from typing import Any, Optional, Sequence
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
+from tensorrt_llm.math_utils import ceil_div
 
 from ...cache import BlockCausalKVCacheManager, RolloutSpec
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
@@ -36,19 +38,21 @@ from ...pipeline_registry import register_pipeline
 from ...utils import postprocess_video_tensor
 from ..wan.vae_loader import load_wan_vae
 from .action import normalize_action_mode
+from .config_resolver import Cosmos3Config
 from .defaults import VIDEO_RES_SIZE_INFO
 from .pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from .sim_packing import SIM_CONFIG_KEY
+
+# Tokens per K/V cache page. The cache takes any power of two; the attention kernels
+# decide: trtllm-gen ships its paged context kernels for 32-token pages, cuDNN's paged
+# graph takes any size. The pool is built only after the backend confirms the size.
+KV_TOKENS_PER_PAGE = 32
 
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
-
-
-def _optional_int(value: Any) -> Optional[int]:
-    return None if value is None else int(value)
 
 
 def split_row_domain_ids(domain_id: Any) -> tuple[Any, Optional[tuple[int, ...]]]:
@@ -74,114 +78,72 @@ class SimEmbodiment:
 
 @dataclass(frozen=True)
 class Cosmos3SimSettings:
-    """The rollout geometry a Sim checkpoint declares in ``transformer/config.json``
-    under ``cosmos3_nano_sim_bimanual``. Every field but the noise schedule has a
-    declared default, so older exports that omit a key still resolve.
-
-    Frames are latent frames throughout.
-    """
+    """The rollout geometry of a Sim checkpoint, taken from the resolved
+    :class:`Cosmos3Config`. Frames are latent frames throughout."""
 
     sigmas: tuple[float, ...]
     """The fixed denoising schedule, ``fixed_step_sampler_config.t_list``."""
-    chunk_frames: int = 4
+    chunk_frames: int
     """Latent frames generated together after the first chunk."""
-    chunk_partition: tuple[int, ...] = (1, 4)
-    """Frames per chunk from the start: the first chunk is one frame, then fours."""
-    window_frames: Optional[int] = 96
-    """Frames the history holds, counting the chunk's own first frame. ``None``:
-    the checkpoint declares unbounded history and the pipeline sizes the window
-    from the memory left after warmup."""
-    sink_frames: int = 0
-    """Leading frames pinned for the whole rollout; 0 on this checkpoint."""
-    text_cache_max_len: int = 512
+    chunk_partition: tuple[int, ...]
+    """Leading chunk sizes from the start; the last repeats."""
+    history_frames: Optional[int]
+    """Recent frames before a chunk that it attends to, sinks excluded: the window.
+    ``None``: full history; the pipeline sizes the cache from the memory left after
+    warmup."""
+    sink_frames: int
+    """Leading frames pinned for the whole rollout."""
+    text_cache_max_len: int
     """Most prompt tokens the fixed region may hold; longer prompts are rejected."""
-    action_tokens_per_frame: int = 4
+    action_tokens_per_frame: int
     """Action rows packed before each frame's vision tokens."""
-    video_temporal_causal: bool = True
-    max_pixels: int = 640 * 640
-    """Largest frame the checkpoint serves, in pixels: the 480p bucket."""
-    max_pixel_frames: int = 901
-    """Longest clip the checkpoint serves, in pixel frames."""
+    video_temporal_causal: bool
     embodiments: dict[str, SimEmbodiment] = field(default_factory=dict)
     """Embodiments declared under ``conditioning.embodiments``, by lower-case name."""
     default_embodiment: Optional[str] = None
     """``conditioning.default_embodiment``: used when a request names no domain."""
 
-    @property
-    def history_frames(self) -> Optional[int]:
-        """Finished frames a chunk may read: the window less its own first frame;
-        ``None`` when the checkpoint leaves the window to the pipeline."""
-        return None if self.window_frames is None else self.window_frames - 1
-
-    def max_latent_frames(self, temporal_compression_factor: int) -> int:
-        return (self.max_pixel_frames - 1) // temporal_compression_factor + 1
-
-    def largest_frame(self) -> tuple[int, int]:
-        """``(height, width)`` of the biggest 480p bucket shape within ``max_pixels``:
-        the shape warmup runs, so the measured peak covers every served frame."""
-        shapes = [
-            (h, w) for (w, h) in VIDEO_RES_SIZE_INFO["480"].values() if h * w <= self.max_pixels
-        ]
-        if not shapes:
-            raise ValueError(f"no 480p bucket shape fits max_pixels={self.max_pixels}")
+    @staticmethod
+    def largest_frame() -> tuple[int, int]:
+        """``(height, width)`` of the biggest 480p bucket shape: the default warmup
+        shape when the user config lists no warmup resolutions."""
+        shapes = [(h, w) for (w, h) in VIDEO_RES_SIZE_INFO["480"].values()]
         return max(shapes, key=lambda hw: hw[0] * hw[1])
 
     @classmethod
-    def from_pretrained_config(cls, pretrained_config: Any) -> "Cosmos3SimSettings":
-        block = _get(pretrained_config, SIM_CONFIG_KEY)
-        if block is None:
+    def from_config(cls, config: Cosmos3Config) -> "Cosmos3SimSettings":
+        if not config.is_autoregressive:
             raise ValueError(
                 f"Not a Cosmos3 Sim checkpoint: transformer/config.json has no "
                 f"'{SIM_CONFIG_KEY}' block."
             )
-        sampler = _get(block, "fixed_step_sampler_config") or {}
-        t_list = _get(sampler, "t_list")
-        if not t_list:
-            raise ValueError(
-                f"'{SIM_CONFIG_KEY}.fixed_step_sampler_config.t_list' is missing or empty; "
-                "the Sim rollout needs its fixed denoising schedule."
-            )
-        chunk_frames = int(_get(block, "chunk_size", cls.chunk_frames))
-        partition = _get(block, "chunk_partition") or (1, chunk_frames)
-        conditioning = _get(block, "conditioning") or {}
+        action, chunking, kv = config.action, config.chunking, config.kv_cache
         # Schema 3 names the width per embodiment (`raw_action_dim`); schema 5 has
         # `input_action_dim` per embodiment and one `input_contract.action_dim`.
-        contract_dim = _get(_get(conditioning, "input_contract") or {}, "action_dim")
         embodiments = {}
-        for name, spec in (_get(conditioning, "embodiments") or {}).items():
+        for name, spec in action.embodiments.items():
             width = _get(spec, "input_action_dim")
             if width is None:
-                width = _get(spec, "raw_action_dim", contract_dim)
+                width = _get(spec, "raw_action_dim", action.input_action_dim)
             domain_id = _get(spec, "domain_id")
             embodiments[str(name).lower()] = SimEmbodiment(
                 domain_id=None if domain_id is None else int(domain_id),
                 action_dim=None if width is None else int(width),
             )
-        default_embodiment = _get(conditioning, "default_embodiment")
-        settings = cls(
-            sigmas=tuple(float(s) for s in t_list),
-            chunk_frames=chunk_frames,
-            chunk_partition=tuple(int(n) for n in partition),
-            window_frames=_optional_int(_get(block, "window_frames", cls.window_frames)),
-            max_pixels=int(_get(block, "max_pixels", cls.max_pixels)),
-            max_pixel_frames=int(_get(block, "max_num_frames", cls.max_pixel_frames)),
-            sink_frames=int(_get(block, "sink_frames", cls.sink_frames)),
-            text_cache_max_len=int(_get(block, "text_cache_max_len", cls.text_cache_max_len)),
-            action_tokens_per_frame=int(
-                _get(conditioning, "action_tokens_per_frame", cls.action_tokens_per_frame)
-            ),
-            video_temporal_causal=bool(
-                _get(block, "video_temporal_causal", cls.video_temporal_causal)
-            ),
+        return cls(
+            sigmas=config.sampling.fixed_sigmas,
+            chunk_frames=chunking.chunk_frames,
+            chunk_partition=chunking.partition,
+            history_frames=kv.history_frames,
+            sink_frames=kv.sink_frames,
+            text_cache_max_len=config.prompt.text_cache_max_len,
+            action_tokens_per_frame=action.tokens_per_frame,
+            video_temporal_causal=chunking.video_temporal_causal,
             embodiments=embodiments,
-            default_embodiment=None
-            if default_embodiment is None
-            else str(default_embodiment).lower(),
+            default_embodiment=action.default_embodiment,
         )
-        settings.validate()
-        return settings
 
-    def action_contract(
+    def resolve_embodiment(
         self,
         domain_name: Optional[str],
         domain_id: Optional[int],
@@ -219,33 +181,6 @@ class Cosmos3SimSettings:
             raw_action_dim = spec.action_dim
         return name, domain_id, raw_action_dim
 
-    def validate(self) -> None:
-        window = self.window_frames if self.window_frames is not None else 1
-        if min(self.chunk_frames, window, self.text_cache_max_len, self.max_pixels) <= 0:
-            raise ValueError(f"Cosmos3 Sim settings must be positive: {self}")
-        if self.max_pixel_frames <= 0:
-            raise ValueError(f"max_num_frames must be positive: {self.max_pixel_frames}")
-        if not self.chunk_partition or any(n <= 0 for n in self.chunk_partition):
-            raise ValueError(
-                f"chunk_partition must be positive frame counts: {self.chunk_partition}"
-            )
-        if self.chunk_partition[-1] != self.chunk_frames:
-            raise ValueError(
-                f"chunk_partition {self.chunk_partition} must end with chunk_size {self.chunk_frames}"
-            )
-        if self.sink_frames < 0 or (
-            self.window_frames is not None and self.sink_frames >= self.window_frames
-        ):
-            raise ValueError(f"sink_frames {self.sink_frames} must be below window_frames")
-        if not self.video_temporal_causal:
-            raise ValueError(
-                "Cosmos3 Sim requires video_temporal_causal; this checkpoint declares it false"
-            )
-        if any(not 0.0 < s <= 1.0 for s in self.sigmas) or list(self.sigmas) != sorted(
-            self.sigmas, reverse=True
-        ):
-            raise ValueError(f"t_list must decrease within (0, 1]: {self.sigmas}")
-
     def chunk_ranges(self, num_latent_frames: int) -> list[tuple[int, int]]:
         """Latent frame ranges ``[f0, f1)`` of the rollout's chunks, in order: the
         partition's chunks first, then ``chunk_frames`` at a time, the last possibly
@@ -265,19 +200,23 @@ class Cosmos3SimSettings:
 class _OverlappedDecode:
     """Pixel frames of a rollout, decoded chunk by chunk on a side stream as the
     chunks finish. Each submitted latent slice is read on the side stream after the
-    main stream wrote it; ``finish`` joins the streams and returns the uint8 video
-    ``[1, T, H, W, 3]`` the pipeline would otherwise decode after the rollout.
+    main stream wrote it. Its uint8 frames are copied straight into one pinned host
+    buffer, so GPU memory does not grow with the video's length; ``finish`` returns
+    that buffer, ``[1, T, H, W, 3]``, the video the pipeline would otherwise decode
+    after the rollout.
 
     The side stream may live on another GPU holding its own copy of the VAE: each
-    chunk's latents (a few hundred KB) hop over as they finish and the frames hop
-    back once at the end, so the decode leaves the generator's GPU alone."""
+    chunk's latents (a few hundred KB) hop over as they finish, so the decode leaves
+    the generator's GPU alone."""
 
-    def __init__(self, pipe, vae, stream: torch.cuda.Stream) -> None:
+    def __init__(self, pipe, vae, stream: torch.cuda.Stream, num_pixel_frames: int) -> None:
         self.pipe = pipe
         self.vae = vae
         self.stream = stream
         self.device = stream.device
-        self.chunks: list[torch.Tensor] = []
+        self.num_pixel_frames = num_pixel_frames
+        self.host: Optional[torch.Tensor] = None
+        self.written = 0
         self.held: list[torch.Tensor] = []
         with torch.cuda.device(self.device), torch.cuda.stream(stream):
             vae.decode_stream_start()
@@ -291,20 +230,31 @@ class _OverlappedDecode:
             if chunk.device != self.device:
                 chunk = chunk.to(self.device, non_blocking=True)
             z = self.pipe._scale_latents_for_decode(chunk)
-            frames = self.vae.decode_stream_step(z)
-            self.chunks.append(postprocess_video_tensor(frames))
+            frames = postprocess_video_tensor(self.vae.decode_stream_step(z))
+            if self.host is None:
+                _, _, height, width, channels = frames.shape
+                self.host = torch.empty(
+                    (1, self.num_pixel_frames, height, width, channels),
+                    dtype=frames.dtype,
+                    pin_memory=prefer_pinned(),
+                )
+            t = frames.shape[1]
+            # The copy is queued on the side stream; the frames' memory goes back to
+            # that stream's pool and is reused only by work ordered after the copy.
+            self.host[:, self.written : self.written + t].copy_(frames, non_blocking=True)
+            self.written += t
 
     def finish(self) -> torch.Tensor:
-        main = torch.cuda.current_stream()
         with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
             self.vae.decode_stream_end()
-            video = torch.cat(self.chunks, dim=1)
-        main.wait_stream(self.stream)
-        if video.device != main.device:
-            video = video.to(main.device)
-        video.record_stream(main)
-        self.chunks.clear()
+        self.stream.synchronize()  # the host buffer is read on the CPU from here on
         self.held.clear()
+        if self.written != self.num_pixel_frames:
+            raise RuntimeError(
+                f"Cosmos3 Sim streamed decode wrote {self.written} of "
+                f"{self.num_pixel_frames} pixel frames."
+            )
+        video, self.host = self.host, None
         return video
 
 
@@ -320,21 +270,11 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     def __init__(self, pipeline_config):
         super().__init__(pipeline_config)
-        self.sim = Cosmos3SimSettings.from_pretrained_config(
-            pipeline_config.primary_pretrained_config
-        )
-        # Finished frames a chunk may read: settled once by warmup from the memory
-        # left at the largest served shape, capped at the longest clip. A window the
-        # checkpoint block declares is informational; the references run full history.
-        self._history_frames: Optional[int] = None
-        if self.sim.window_frames is not None:
-            logger.info(
-                f"Cosmos3 Sim checkpoint declares window_frames={self.sim.window_frames}; "
-                "running full history within the memory budget instead."
-            )
-        # One cache is resident at a time, keyed by its frame geometry.
-        self._sim_cache_obj: Optional[BlockCausalKVCacheManager] = None
-        self._sim_cache_key: Optional[int] = None
+        self.sim: Optional[Cosmos3SimSettings] = None  # set by load_standard_components
+        # The page pool's size, settled once by warmup from the memory left after the
+        # peak; what it holds in frames depends on each request's frame geometry.
+        self._pool_tokens: Optional[int] = None
+        self._kv_cache: Optional[BlockCausalKVCacheManager] = None
         # Finished chunks are decoded on this stream while later chunks denoise; on
         # another GPU when one is named, with its own VAE instance.
         self._decode_stream: Optional[torch.cuda.Stream] = None
@@ -345,6 +285,15 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     def load_standard_components(self, checkpoint_dir, device, skip_components=None):
         super().load_standard_components(checkpoint_dir, device, skip_components)
+        # The full checkpoint (every file, not only the transformer config) decides.
+        self.sim = Cosmos3SimSettings.from_config(self.cosmos3_config)
+        if self.sim.history_frames is None:
+            logger.info("Cosmos3 Sim: full history, the K/V cache is sized from free memory.")
+        else:
+            logger.info(
+                f"Cosmos3 Sim: each chunk attends to {self.sim.sink_frames} sink frames and "
+                f"the {self.sim.history_frames} latent frames before it."
+            )
         if self._decode_device is not None and getattr(self, "vae", None) is not None:
             logger.info(f"Cosmos3 Sim: decoding on {self._decode_device}")
             self._decode_vae = load_wan_vae(
@@ -364,12 +313,12 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         action width an embodiment has on this model."""
         domain_id, row_ids = split_row_domain_ids(domain_id)
         if normalize_action_mode(action_mode) is not None:
-            domain_name, domain_id, raw_action_dim = self.sim.action_contract(
+            domain_name, domain_id, raw_action_dim = self.sim.resolve_embodiment(
                 domain_name, domain_id, raw_action_dim
             )
             if row_ids is not None:
                 for d in set(row_ids):
-                    self.sim.action_contract(None, d, raw_action_dim)
+                    self.sim.resolve_embodiment(None, d, raw_action_dim)
         resolved = super()._resolve_request(
             action_mode=action_mode,
             domain_name=domain_name,
@@ -395,15 +344,30 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         return prepared
 
     def check_envelope(self, height: int, width: int, num_frames: int) -> None:
-        """Refuse what the checkpoint does not serve. The cache was sized at the
-        largest served shape, so a bigger request would not have been measured."""
-        sim = self.sim
-        if height * width > sim.max_pixels or num_frames > sim.max_pixel_frames:
-            raise ValueError(
-                f"Cosmos3 Sim serves at most {sim.max_pixels} pixels per frame "
-                f"({'x'.join(map(str, reversed(sim.largest_frame())))}) and "
-                f"{sim.max_pixel_frames} frames; got {width}x{height}, {num_frames} frames."
-            )
+        """Refuse, before any compute, a rollout the K/V cache cannot hold at this frame
+        geometry: a configured window that does not fit the pool, or a full-history
+        rollout longer than the pool affords. Nothing to check before the pool is sized."""
+        if self._pool_tokens is None:
+            return
+        history = self._history_frames_for(self._tokens_per_frame(height, width))
+        self._check_history_fits(self._latent_frames(num_frames), history)
+
+    def _latent_frames(self, num_pixel_frames: int) -> int:
+        return (num_pixel_frames - 1) // self.vae_scale_factor_temporal + 1
+
+    def _check_history_fits(self, num_latent_frames: int, history_frames: int) -> None:
+        """Full history (no window declared): the last frame reads every frame before
+        it, so the pool must hold ``num_latent_frames - 1`` frames. Longer rollouts are
+        refused rather than run over a window nobody asked for."""
+        if self.sim.history_frames is not None or num_latent_frames - 1 <= history_frames:
+            return
+        longest = history_frames * self.vae_scale_factor_temporal + 1
+        requested = (num_latent_frames - 1) * self.vae_scale_factor_temporal + 1
+        raise ValueError(
+            f"Cosmos3 Sim runs full history and its K/V cache holds {history_frames} latent "
+            f"frames of history at this frame size: at most {longest} pixel frames, got "
+            f"{requested}. Raise kv_cache_config.free_gpu_memory_fraction or shorten the request."
+        )
 
     # ------------------------------------------------------------------ warmup and sizing
 
@@ -413,17 +377,26 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     @property
     def default_warmup_num_frames(self):
-        return [self.sim.max_pixel_frames]
+        """The shortest rollout that runs every chunk shape: the partition's chunks,
+        then a one-frame tail. Kernels and graphs do not depend on the rollout's
+        length, and the decoded video is kept in host memory, so a longer warmup
+        would measure nothing more."""
+        latent = sum(self.sim.chunk_partition) + 1
+        return [(latent - 1) * self.vae_scale_factor_temporal + 1]
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
-        """Warm up at the given shape over a two-chunk cache, measure the peak, and
-        size the window from what is left, the way the LLM executor sizes its K/V
-        pool. A second warmup shape reuses the window already settled."""
-        if self._history_frames is not None:
+        """The first warmup shape runs twice: once over a pool just large enough for it,
+        to measure the peak memory everything but the cache needs, and once over the
+        pool sized from what is left, so the graphs captured are the ones served. Later
+        shapes run once over the settled pool."""
+        if self._pool_tokens is not None:
             super()._run_warmup(height, width, num_frames, steps)
             return
         fraction = self.pipeline_config.kv_cache.free_gpu_memory_fraction
-        self._history_frames = 2 * self.sim.chunk_frames
+        tokens_per_frame = self._tokens_per_frame(height, width)
+        self._pool_tokens = self.pool_tokens_for_history(
+            self._measuring_history(num_frames), tokens_per_frame
+        )
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -434,38 +407,99 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             free, total = torch.cuda.mem_get_info()
             outside_torch = max(0, (total - free) - stats["allocated_bytes.all.current"])
             peak = stats["allocated_bytes.all.peak"] + outside_torch
-            temp_cache = self._sim_cache_obj.pool_bytes if self._sim_cache_obj is not None else 0
+            measuring_pool = self._kv_cache.pool_bytes if self._kv_cache is not None else 0
         finally:
-            self._shutdown_sim_cache()
-        available = int((total - peak + temp_cache) * fraction)
-        tokens_per_frame = self._tokens_per_frame(height, width)
-        cap = self.sim.max_latent_frames(self.vae_scale_factor_temporal) - 1
-        frames = self.history_frames_for_budget(available, tokens_per_frame, cap)
+            self._shutdown_kv_cache()
+        available = int((total - peak + measuring_pool) * fraction)
+        self._pool_tokens = self._pool_tokens_for_bytes(available)
         gib = 1 << 30
-        if frames < self.sim.chunk_frames:
+        history = self._history_frames_for(tokens_per_frame)
+        if history < self.sim.chunk_frames:
             raise RuntimeError(
                 f"Cosmos3 Sim cannot hold one chunk of history: warmup peak {peak / gib:.2f} GiB "
                 f"of {total / gib:.2f} GiB leaves {available / gib:.2f} GiB for the K/V cache at "
-                f"free_gpu_memory_fraction={fraction}; {frames} frames of {tokens_per_frame} tokens fit, "
-                f"{self.sim.chunk_frames} are needed."
+                f"free_gpu_memory_fraction={fraction}; {history} frames of {tokens_per_frame} "
+                f"tokens fit, {self.sim.chunk_frames} are needed."
             )
-        self._history_frames = frames
         logger.info(
-            f"Cosmos3 Sim K/V window: {frames} latent frames (cap {cap}). Warmup peak "
-            f"{peak / gib:.2f} GiB of {total / gib:.2f} GiB, {available / gib:.2f} GiB for the cache "
-            f"at fraction {fraction}, {tokens_per_frame} tokens per frame at {width}x{height}."
+            f"Cosmos3 Sim K/V cache: {self._pool_tokens // KV_TOKENS_PER_PAGE} pages of "
+            f"{KV_TOKENS_PER_PAGE} tokens ({self._pool_bytes_for_tokens(self._pool_tokens) / gib:.2f} GiB): "
+            f"{history} latent frames of history at {width}x{height} ({tokens_per_frame} tokens "
+            f"per frame). Warmup peak {peak / gib:.2f} GiB of {total / gib:.2f} GiB, fraction {fraction}."
+        )
+        super()._run_warmup(height, width, num_frames, steps)
+
+    def _measuring_history(self, num_pixel_frames: int) -> int:
+        """History the measuring pool holds: enough for the warmup rollout itself, for
+        the configured window (the request check asks for it), and never below two
+        chunks. The pool's own bytes are added back to the budget, so its size does
+        not bias the measurement."""
+        return max(
+            2 * self.sim.chunk_frames,
+            self._latent_frames(num_pixel_frames) - 1,
+            self.sim.history_frames or 0,
         )
 
-    def history_frames_for_budget(self, budget_bytes: int, tokens_per_frame: int, cap: int) -> int:
-        """Most frames of history whose cache fits ``budget_bytes``, at most ``cap``."""
-        lo, hi = 0, max(cap, 0)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if self._cache_bytes(mid, tokens_per_frame) <= budget_bytes:
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
+    def _kv_geometry(self) -> dict:
+        tf = self.transformer
+        return dict(
+            num_layers=len(tf.gen_layers),
+            num_kv_heads=tf.cache_kv_heads,
+            head_dim=tf.gen_layers[0].cross_attention.head_dim,
+            dtype=self.dtype,
+        )
+
+    def _pool_bytes_for_tokens(self, pool_tokens: int) -> int:
+        return BlockCausalKVCacheManager.bytes_for_pool_tokens(pool_tokens, **self._kv_geometry())
+
+    def _pool_tokens_for_bytes(self, budget_bytes: int) -> int:
+        """Pool tokens (whole pages) whose K/V fit ``budget_bytes``. The pool allocator
+        maps whole physical chunks of at most 32 MiB, so the mapped size may exceed the
+        budget by less than one chunk; the budget is a fraction of free memory and
+        leaves far more than that."""
+        g = self._kv_geometry()
+        bytes_per_token = (
+            g["num_layers"]
+            * 2
+            * g["num_kv_heads"]
+            * g["head_dim"]
+            * torch.tensor([], dtype=g["dtype"]).element_size()
+        )
+        return budget_bytes // (KV_TOKENS_PER_PAGE * bytes_per_token) * KV_TOKENS_PER_PAGE
+
+    def pool_tokens_for_history(self, history_frames: int, tokens_per_frame: int) -> int:
+        """Pool tokens a rollout with this much history needs at this frame geometry."""
+        return BlockCausalKVCacheManager.pool_tokens_for(
+            self._rollout_spec(history_frames, tokens_per_frame),
+            tokens_per_page=KV_TOKENS_PER_PAGE,
+        )
+
+    def _history_frames_for(self, tokens_per_frame: int) -> int:
+        """Frames of history a rollout at this frame geometry gets from the pool: the
+        configured window, which must fit, or for full history the most that fit."""
+        window = self.sim.history_frames
+        if window is not None:
+            needed = self.pool_tokens_for_history(window, tokens_per_frame)
+            if needed > self._pool_tokens:
+                raise ValueError(
+                    f"Cosmos3 Sim's window of {window} latent frames needs {needed} pool tokens "
+                    f"at {tokens_per_frame} tokens per frame; the K/V cache holds "
+                    f"{self._pool_tokens}. Raise kv_cache_config.free_gpu_memory_fraction or "
+                    "use a smaller frame."
+                )
+            return window
+        # The pool holds (ceil((pins + window + staged) / page) + 1 + private) pages, where
+        # the private pages of the causal blocks do not depend on the window: every page
+        # left after them, the spare and the fixed tokens is window.
+        tpp = KV_TOKENS_PER_PAGE
+        spec = self._rollout_spec(1, tokens_per_frame)
+        fixed = spec.max_pin_tokens + spec.max_staged_tokens
+        private_tokens = (
+            self.pool_tokens_for_history(1, tokens_per_frame)
+            - (ceil_div(fixed + tokens_per_frame, tpp) + 1) * tpp
+        )
+        window_pages = (self._pool_tokens - private_tokens) // tpp - 1
+        return max(0, (window_pages * tpp - fixed) // tokens_per_frame)
 
     def _rollout_spec(self, history_frames: int, tokens_per_frame: int) -> RolloutSpec:
         """The rollout's cache geometry: the window, one chunk staged per forward, and the
@@ -482,30 +516,18 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             max_pin_tokens=sim.text_cache_max_len + sim.sink_frames * tokens_per_frame,
         )
 
-    def _cache_bytes(self, history_frames: int, tokens_per_frame: int) -> int:
-        tf = self.transformer
-        return BlockCausalKVCacheManager.pool_bytes_for(
-            self._rollout_spec(history_frames, tokens_per_frame),
-            num_layers=len(tf.gen_layers),
-            num_kv_heads=tf.cache_kv_heads,
-            head_dim=tf.gen_layers[0].cross_attention.head_dim,
-            dtype=self.dtype,
-            tokens_per_page=32,
-        )
-
     def _tokens_per_frame(self, height: int, width: int) -> int:
         s = self.vae_scale_factor_spatial
         Hp, Wp, _, _ = self.transformer._pad_to_patch_size(height // s, width // s)
         return self.sim.action_tokens_per_frame + Hp * Wp
 
-    def _shutdown_sim_cache(self) -> None:
-        if self._sim_cache_obj is not None:
+    def _shutdown_kv_cache(self) -> None:
+        if self._kv_cache is not None:
             # Graphs captured over this cache read its pages and tables by address.
             for runner in self._cuda_graph_runners.values():
                 runner.clear()
-            self._sim_cache_obj.shutdown()
-            self._sim_cache_obj = None
-            self._sim_cache_key = None
+            self._kv_cache.shutdown()
+            self._kv_cache = None
 
     # ------------------------------------------------------------------ CUDA graphs
 
@@ -534,45 +556,36 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
     # ------------------------------------------------------------------ the rollout
 
-    def _sim_cache(self, tokens_per_frame: int) -> BlockCausalKVCacheManager:
-        """The resident cache for this frame geometry, kept across requests:
-        ``close()``/``open()`` keep its device tensors, so graphs captured over it
-        stay valid. A request with another geometry replaces it; two pools would
-        split the memory the window was sized for."""
-        if self._sim_cache_obj is not None and self._sim_cache_key == tokens_per_frame:
-            return self._sim_cache_obj
-        self._shutdown_sim_cache()
-        if self._history_frames is None:
-            # Warmup was skipped, so nothing measured the peak: size the window from
-            # what is free right now, as the LLM executor does without estimation.
+    def _kv_cache_manager(self) -> BlockCausalKVCacheManager:
+        """The one resident page pool, built once and kept across requests of every
+        frame geometry: ``close()``/``open()`` keep its device tensors, so graphs
+        captured over it stay valid, and a request's spec takes the pages it needs."""
+        if self._kv_cache is not None:
+            return self._kv_cache
+        if self._pool_tokens is None:
+            # Warmup was skipped, so nothing measured the peak: size the pool from what
+            # is free right now, as the LLM executor does without estimation.
             free, _ = torch.cuda.mem_get_info()
             fraction = self.pipeline_config.kv_cache.free_gpu_memory_fraction
-            cap = self.sim.max_latent_frames(self.vae_scale_factor_temporal) - 1
-            self._history_frames = self.history_frames_for_budget(
-                int(free * fraction), tokens_per_frame, cap
-            )
+            self._pool_tokens = self._pool_tokens_for_bytes(int(free * fraction))
             logger.warning(
-                f"Cosmos3 Sim K/V window sized without warmup: {self._history_frames} latent "
-                f"frames from {free / (1 << 30):.2f} GiB free at fraction {fraction}."
-            )
-        if self._history_frames < self.sim.chunk_frames:
-            raise RuntimeError(
-                f"Cosmos3 Sim K/V window of {self._history_frames} frames is below one chunk "
-                f"({self.sim.chunk_frames} frames)."
+                f"Cosmos3 Sim K/V cache sized without warmup: {self._pool_tokens} pool tokens "
+                f"from {free / (1 << 30):.2f} GiB free at fraction {fraction}."
             )
         tf = self.transformer
-        self._sim_cache_obj = BlockCausalKVCacheManager(
-            num_layers=len(tf.gen_layers),
-            num_kv_heads=tf.cache_kv_heads,
-            head_dim=tf.gen_layers[0].cross_attention.head_dim,
-            dtype=self.dtype,
-            tokens_per_page=32,
-            pool_tokens=BlockCausalKVCacheManager.pool_tokens_for(
-                self._rollout_spec(self._history_frames, tokens_per_frame), tokens_per_page=32
-            ),
+        attention = tf.gen_layers[0].cross_attention.attn
+        if not attention.support_kv_cache_page_size(KV_TOKENS_PER_PAGE, self.dtype):
+            raise RuntimeError(
+                f"the {tf.gen_layers[0].cross_attention.attn_backend} attention backend has no "
+                f"kernel for {KV_TOKENS_PER_PAGE}-token K/V pages with head_dim "
+                f"{attention.head_dim} in {self.dtype} on this GPU; use the CUDNN backend."
+            )
+        self._kv_cache = BlockCausalKVCacheManager(
+            tokens_per_page=KV_TOKENS_PER_PAGE,
+            pool_tokens=self._pool_tokens,
+            **self._kv_geometry(),
         )
-        self._sim_cache_key = tokens_per_frame
-        return self._sim_cache_obj
+        return self._kv_cache
 
     def _denoise_request(
         self,
@@ -605,7 +618,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         velocity_mask = prepared.velocity_mask
         offload = self.offloader.context_if_requested
 
-        cache = self._sim_cache(tokens_per_frame)
+        kv_cache = self._kv_cache_manager()
+        history_frames = self._history_frames_for(tokens_per_frame)
+        self._check_history_fits(num_latent_frames, history_frames)
         tf.reset_cache()
         timer.mark_denoise_start()
         text_len = int(cond_mask.sum().item())
@@ -615,13 +630,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 f"{sim.text_cache_max_len} tokens"
             )
         decoder = self._start_overlapped_decode(latents)
-        cache.open(
-            self._rollout_spec(self._history_frames, tokens_per_frame),
+        kv_cache.open(
+            self._rollout_spec(history_frames, tokens_per_frame),
             pin_tokens=text_len + sim.sink_frames * tokens_per_frame,
         )
         try:
-            tf.write_prompt_kv(cache, cond_ids, cond_mask, offload_context=offload)
-            cache.commit(text_len)
+            tf.write_prompt_kv(kv_cache, cond_ids, cond_mask, offload_context=offload)
+            kv_cache.commit(text_len)
             steps = len(sim.sigmas)
             step_kwargs = self.sampling.scheduler_step_kwargs(generator)
             zero_t = torch.zeros(1, device=self.device)
@@ -639,7 +654,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                         out = tf.forward_causal(
                             x,
                             t_vec,
-                            kv_cache=cache,
+                            kv_cache=kv_cache,
                             first_frame=f0,
                             text_len=text_len,
                             action_latents=chunk_actions,
@@ -660,7 +675,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                     tf.forward_causal(
                         x,
                         zero_t,
-                        kv_cache=cache,
+                        kv_cache=kv_cache,
                         first_frame=f0,
                         text_len=text_len,
                         action_latents=chunk_actions,
@@ -671,9 +686,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                         timestep=zero_t,
                         offload_context=offload,
                     )
-                    cache.commit()
+                    kv_cache.commit()
         finally:
-            cache.close()
+            kv_cache.close()
         if decoder is not None:
             self._streamed_video = decoder.finish()
         self._release_scheduler_solver_state()
@@ -696,7 +711,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             return None
         if self._decode_stream is None:
             self._decode_stream = torch.cuda.Stream(device=self._decode_device)
-        return _OverlappedDecode(self, self._decode_vae or vae, self._decode_stream)
+        num_pixel_frames = (latents.shape[2] - 1) * self.vae_scale_factor_temporal + 1
+        return _OverlappedDecode(
+            self, self._decode_vae or vae, self._decode_stream, num_pixel_frames
+        )
 
     def _decode_latents(self, latents):
         video = self._streamed_video

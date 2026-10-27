@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from cosmos3_sim_testing import sim_settings
 from diffusers import FlowMatchEulerDiscreteScheduler
 from utils.llm_data import get_checkpoint
 
@@ -39,7 +40,6 @@ from tensorrt_llm._torch.visual_gen.config import (
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import _PreparedLatents
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_sim import (
     Cosmos3NanoSimBimanualPipeline,
-    Cosmos3SimSettings,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sim_packing import SIM_CONFIG_KEY
@@ -64,6 +64,7 @@ SIM_BLOCK = {
     "window_frames": WINDOW_FRAMES,
     "sink_frames": 0,
     "text_cache_max_len": MAX_TEXT,
+    "video_temporal_causal": True,
     "fixed_step_sampler_config": {"t_list": [1.0, 0.9375, 0.8333, 0.625]},
     "conditioning": {"action_tokens_per_frame": A},
 }
@@ -427,10 +428,12 @@ def make_sim_pipeline(model, cuda_graphs: bool = False):
     pipe.vae = None  # no decoder in these tests: the rollout decodes nothing
     pipe._parallel_vae_enabled = False
     pipe._rank = 0
-    pipe.sim = Cosmos3SimSettings.from_pretrained_config({SIM_CONFIG_KEY: SIM_BLOCK})
-    pipe._history_frames = pipe.sim.window_frames - 1  # the tests pin a small window
-    pipe._sim_cache_obj = None
-    pipe._sim_cache_key = None
+    pipe.sim = sim_settings(SIM_BLOCK)
+    pipe._kv_cache = None
+    # The tests pin a small window; the pool holds exactly it at the test geometry.
+    pipe._pool_tokens = pipe.pool_tokens_for_history(
+        pipe.sim.history_frames, A + (H // 2) * (W // 2)
+    )
     pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         {
             "num_train_timesteps": 1000,
@@ -507,8 +510,8 @@ def rollout(
         )
     torch.cuda.synchronize()
     assert audio is None and do_audio is False and actions is prepared.action_latents
-    cache = pipe._sim_cache_obj
-    assert pipe._sim_cache_key == A + (H // 2) * (W // 2)
+    cache = pipe._kv_cache
+    assert cache.pool_tokens == pipe._pool_tokens
     return out, latents, cache
 
 

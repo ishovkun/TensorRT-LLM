@@ -18,18 +18,25 @@
 # Shared by offline examples (--visual_gen_args) and trtllm-serve.
 #
 # The causal rollout reads finished frames from a paged K/V cache, which needs
-# an attention backend that can attend over it: TRTLLM (trtllm-gen) or CUDNN.
-# Chunk size, denoising schedule, history window and action layout come from
-# the checkpoint. Warmup runs the largest shape the checkpoint serves and sizes
-# the cache from the memory left; kv_cache_config.free_gpu_memory_fraction is
-# the share of that memory the cache may take.
+# an attention backend that can attend over it: CUDNN or TRTLLM (trtllm-gen).
+# cuDNN's paged kernel is the faster of the two on this shape.
+# Chunk size, denoising schedule and action layout come from the checkpoint.
+#
+# The history window is the reference recipe (cosmos-framework and vLLM-Omni):
+# each latent frame attends to 64 latent frames counting itself, of which the
+# first 8 of the video stay visible for the whole rollout, so a frame sees those
+# 8 and the 55 before it. Remove both keys to run the checkpoint's own setting,
+# full history; the cache is then sized from the memory left after warmup
+# (free_gpu_memory_fraction of it) and longer requests are refused.
 attention_config:
-  backend: TRTLLM
+  backend: CUDNN
 parallel_config:
   cfg_size: 1
   ulysses_size: 1
 kv_cache_config:
   free_gpu_memory_fraction: 0.9
+  kv_cache_inference_size: 64
+  attention_sink_size: 8
 # The chunk forward replays as CUDA graphs (one per chunk shape and pass).
 cuda_graph_config:
   enable: true
