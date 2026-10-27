@@ -65,9 +65,10 @@ def wino_spatial_conv_kf(
     GEMM rows are output channels with the tile count split into 256/224/192-wide column
     tiles, both as four per-component chunks pipelined under PDL; "wa0" / "wb0" = the same
     chunks as plain serialized launches; "wb1" = "wb" layout as one GEMM over all components
-    without PDL (the default); "wb1d" = the same on the CLC dynamic schedule (not reproducible
-    under contention, measurements only); every other form runs the static persistent GEMM;
-    ``None`` picks by shape."""
+    without PDL (the default); "wb1s" = "wb1" with the input transform that stages the pixel
+    box through shared memory (``kf_wino.wino_in``); "wb1d" = "wb1" on the CLC dynamic schedule
+    (not reproducible under contention, measurements only); every other form runs the static
+    persistent GEMM; ``None`` picks by shape."""
     comps, pairs, positions, cin = d.shape
     cout = u.shape[2]
     x = d.view(comps * pairs, height, width, cin)
@@ -81,6 +82,8 @@ def wino_spatial_conv_kf(
         _run_wb(x, u, y, comps, pairs, chunked=True, pdl=mode == "wb")
     elif mode == "wb1":
         _run_wb(x, u, y, comps, pairs, chunked=False, pdl=False)
+    elif mode == "wb1s":
+        _run_wb(x, u, y, comps, pairs, chunked=False, pdl=False, staged_in=True)
     elif mode == "wb1d":
         _run_wb(x, u, y, comps, pairs, chunked=False, pdl=False, dynamic=True)
     else:
@@ -151,11 +154,12 @@ def _run_wb(
     chunked: bool,
     pdl: bool,
     dynamic: bool = False,
+    staged_in: bool = False,
 ) -> None:
     import cuda.bindings.driver as cuda
     from cutlass.cute.runtime import from_dlpack
 
-    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import wb, wino
+    from tensorrt_llm._torch.visual_gen.models.wan.kf_wino import wb, wino, wino_in
     from tensorrt_llm._torch.visual_gen.models.wan.kf_wino.wino import (
         PDL_TRIGGER,
         PDL_WAIT_END,
@@ -193,7 +197,12 @@ def _run_wb(
     if not chunked:
         # One GEMM over all components; the dynamic schedule only on request (see
         # wb._gemm_kernel).
-        _xform_kernel("in", wino.in_xform, [x, v], (frames, height, width, cin, 4, 4, 0))(stream)
+        if staged_in:
+            wino_in.in_xform_smem(x, v, 0)
+        else:
+            _xform_kernel("in", wino.in_xform, [x, v], (frames, height, width, cin, 4, 4, 0))(
+                stream
+            )
         gemm(
             u.view(36 * comps, cout, cin),
             v.view(36 * comps, tiles, cin),
