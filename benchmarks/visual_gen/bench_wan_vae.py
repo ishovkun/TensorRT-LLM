@@ -268,6 +268,9 @@ def _try_capture(run_fn: Callable[[], torch.Tensor]) -> torch.cuda.CUDAGraph | N
         return None
 
 
+TOP_KERNELS = 15  # kernels kept in each timing record, largest first
+
+
 def _time_cupti(
     run_fn: Callable[[], Any], warmup: int, iters: int, use_graph: bool
 ) -> dict[str, Any]:
@@ -380,7 +383,7 @@ def _time_cupti(
             "max_us": ordered[-1],
         }
 
-    top = sorted(kernel_ns.items(), key=lambda kv: -kv[1])[:15]
+    top = sorted(kernel_ns.items(), key=lambda kv: -kv[1])[:TOP_KERNELS]
     return {
         "graph": graph is not None,
         "iters": iters,
@@ -465,6 +468,9 @@ def main() -> None:
         "decode(1), and the cold-start decode(1)",
     )
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument(
+        "--top-kernels", type=int, default=15, help="kernels kept per timing record, largest first"
+    )
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--no-graph", action="store_true")
@@ -485,6 +491,8 @@ def main() -> None:
         help="shard dimension of the parallel VAE when --world-size > 1",
     )
     args = parser.parse_args()
+    global TOP_KERNELS
+    TOP_KERNELS = args.top_kernels
 
     if args.world_size > 1 and "RANK" not in os.environ:
         # Launch the ranks under torchrun; this process only forwards the exit code.
