@@ -575,6 +575,11 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         returns ``[S, H*D]`` with zero rows past them."""
         plan.validate()
         kv_cache = plan.cache
+        if not isinstance(kv_cache, BlockCausalKVCacheManager):
+            raise NotImplementedError(
+                f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
+                f"{type(kv_cache).__name__}"
+            )
         if attention_mask != PredefinedAttentionMask.FULL:
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_attention_config is not None:
@@ -663,7 +668,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         return self.quant_attention_config is None
 
     def support_kv_cache(self) -> bool:
-        return True
+        return self.quant_attention_config is None and self.sparse_params is None
 
     def support_kv_cache_page_size(
         self, tokens_per_page: int, dtype: Optional[torch.dtype] = None

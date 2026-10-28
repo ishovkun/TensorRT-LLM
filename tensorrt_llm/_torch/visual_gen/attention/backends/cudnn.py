@@ -44,7 +44,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from ....attention.backends.interface import PredefinedAttentionMask
-from ...cache import ForwardPlan
+from ...cache import BlockCausalKVCacheManager, ForwardPlan
 from .interface import AttentionBackend, AttentionTensorLayout, as_fused_qkv, is_fused_qkv
 
 
@@ -615,6 +615,11 @@ class CuDNNAttention(AttentionBackend):
         """
         plan.validate()
         kv_cache = plan.cache
+        if not isinstance(kv_cache, BlockCausalKVCacheManager):
+            raise NotImplementedError(
+                f"{type(self).__name__} attends over a BlockCausalKVCacheManager only; got "
+                f"{type(kv_cache).__name__}"
+            )
         if self._resolve_mask(attention_mask, key_padding_mask):
             raise NotImplementedError("K/V cache attention is full attention over the cache.")
         if self.quant_dtype is not None:
@@ -955,7 +960,7 @@ class CuDNNAttention(AttentionBackend):
         return False
 
     def support_kv_cache(self) -> bool:
-        return True
+        return self.quant_dtype is None
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:

@@ -18,7 +18,11 @@ causal block page lists attention reads."""
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.cache import BlockCausalKVCacheManager, RolloutSpec
+from tensorrt_llm._torch.visual_gen.cache import (
+    BlockCausalKVCacheManager,
+    RolloutKVCacheInterface,
+    RolloutSpec,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -151,6 +155,11 @@ def page_list_keys(cache, layer, causal_block_size, i):
     return buf[page, 0, 0, slot, 0].float()
 
 
+def test_implements_the_rollout_interface():
+    assert issubclass(BlockCausalKVCacheManager, RolloutKVCacheInterface)
+    assert not BlockCausalKVCacheManager.__abstractmethods__
+
+
 def test_geometry_holds_fixed_window_stale_and_chunk(cache):
     tpb = cache.tokens_per_page
     assert cache.page_view_scale == NUM_LAYERS, "layers share a slot; one layer's view is strided"
@@ -160,6 +169,23 @@ def test_geometry_holds_fixed_window_stale_and_chunk(cache):
     assert cache.capacity == cache.num_pages * tpb
     # Worst case resident: full fixed region, window plus a page of stale, a chunk.
     assert cache.capacity >= tokens + tpb - 1
+
+
+def test_open_is_a_context_manager_that_closes_on_exit(cache):
+    """``with cache.open(...)`` yields the open cache and closes it on exit, also when
+    the block raises, so a failed request cannot leave the rollout open."""
+    with cache.open(cache.test_spec) as opened:
+        assert opened is cache and cache.is_open
+    assert not cache.is_open
+    with pytest.raises(RuntimeError, match="boom"):
+        with cache.open(cache.test_spec):
+            raise RuntimeError("boom")
+    assert not cache.is_open
+    with pytest.raises(RuntimeError, match="not open"):
+        with cache:  # entering needs an open rollout
+            pass
+    open_cache(cache)  # reopens cleanly after the exception
+    assert cache.is_open
 
 
 def test_open_backs_every_page_once_and_publishes_the_table(cache):

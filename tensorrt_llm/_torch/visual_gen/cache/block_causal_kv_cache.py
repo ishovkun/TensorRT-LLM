@@ -48,7 +48,7 @@ Why the window is not V2's:
   page table stays at ``num_pages`` pages.
 
 The fixed region is the first ``pin_tokens`` tokens of the sequence, declared
-by ``open``: every frame sees them for the whole rollout and they are never
+by ``open``: every causal block sees them for the whole rollout and they are never
 evicted. Tokens become fixed when they are committed, so nothing can be pinned
 after it was evicted. What those tokens are is the model's business. The
 rolling history slides: ``commit`` turns the staged tokens (written by forwards, not
@@ -73,9 +73,7 @@ storage positions here never grow past the resident capacity.
 
 from __future__ import annotations
 
-import collections.abc
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -92,6 +90,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
+from .rollout_kv_cache_interface import ForwardPlan, RolloutKVCacheInterface, RolloutSpec
+
 _DTYPES = {
     torch.bfloat16: tensorrt_llm.bindings.DataType.BF16,
     torch.float16: tensorrt_llm.bindings.DataType.HALF,
@@ -101,94 +101,6 @@ _DTYPES = {
 # integer id that normally comes from an LlmRequest; a rollout has none, so it
 # gets a fixed one, as V2's own guard-page and capture-dummy sequences do.
 _ROLLOUT_REQUEST_ID = 0
-
-
-@dataclass(frozen=True)
-class RolloutSpec:
-    """The geometry of a rollout: what ``open`` lays out in the pool and what every
-    forward of the rollout may ask for. The cache keeps device state per spec, so CUDA
-    graphs captured over a spec replay whenever it is opened again.
-
-    Args:
-        window_tokens: history each causal block may see before itself, in tokens
-            (``(window_frames - 1) * tokens_per_frame``).
-        max_staged_tokens: most tokens a forward may write before a commit
-            (``chunk_frames * tokens_per_frame``); a forward may write fewer.
-        causal_blocks: every causal block size a forward may use, mapped to the most
-            causal blocks of that size one forward cuts its tokens into. A denoising
-            step over a whole chunk is one causal block of ``max_staged_tokens``; the
-            clean pass is ``chunk_frames`` causal blocks of ``tokens_per_frame``. Each
-            size gets private pages for that many causal blocks.
-        max_pin_tokens: most tokens any ``open`` of this spec pins.
-    """
-
-    window_tokens: int
-    max_staged_tokens: int
-    causal_blocks: collections.abc.Mapping[int, int]
-    max_pin_tokens: int = 0
-
-    def __post_init__(self) -> None:
-        blocks = dict(sorted((int(size), int(n)) for size, n in dict(self.causal_blocks).items()))
-        object.__setattr__(self, "causal_blocks", MappingProxyType(blocks))
-        if min(self.window_tokens, self.max_staged_tokens) <= 0 or self.max_pin_tokens < 0:
-            raise ValueError(
-                "window_tokens and max_staged_tokens must be positive and max_pin_tokens "
-                "non-negative"
-            )
-        if not blocks or any(
-            size <= 0 or n <= 0 or size * n > self.max_staged_tokens for size, n in blocks.items()
-        ):
-            raise ValueError(
-                f"causal_blocks {blocks} must map positive sizes to positive counts whose "
-                f"tokens fit max_staged_tokens {self.max_staged_tokens}"
-            )
-
-    def __hash__(self) -> int:
-        return hash(
-            (
-                self.window_tokens,
-                self.max_staged_tokens,
-                tuple(self.causal_blocks.items()),
-                self.max_pin_tokens,
-            )
-        )
-
-    @property
-    def causal_block_sizes(self) -> Tuple[int, ...]:
-        """The declared causal block sizes, ascending."""
-        return tuple(self.causal_blocks)
-
-
-@dataclass(frozen=True)
-class ForwardPlan:
-    """One forward over the cache, the way attention takes it (``kv=``): the real new
-    tokens and how they are cut into causal blocks. Built by
-    ``BlockCausalKVCacheManager.plan`` for the open rollout.
-
-    ``num_tokens`` counts the real tokens of the forward across all ranks, before
-    sequence-parallel padding; rows past it are padding, neither cached nor attended.
-    ``graph_key`` holds every host value a forward captured in a CUDA graph bakes in,
-    so a graph runner keys on it; commits only rewrite device tensors and are not part
-    of it.
-    """
-
-    cache: "BlockCausalKVCacheManager"
-    spec: RolloutSpec
-    num_tokens: int
-    causal_block_size: int
-    num_causal_blocks: int
-
-    @property
-    def graph_key(self) -> Tuple:
-        return (id(self.cache), self.spec, self.num_tokens, self.causal_block_size)
-
-    def validate(self) -> None:
-        """Raise unless the plan's cache is open with the spec the plan was made for."""
-        if not self.cache.is_open or self.cache.spec != self.spec:
-            raise RuntimeError(
-                "this ForwardPlan was made for a rollout that is no longer open; make a new "
-                "one with cache.plan()"
-            )
 
 
 @dataclass
@@ -267,7 +179,7 @@ class _SpecState:
     staged_slots: torch.Tensor
 
 
-class BlockCausalKVCacheManager(KVCacheManagerV2):
+class BlockCausalKVCacheManager(KVCacheManagerV2, RolloutKVCacheInterface):
     """``KVCacheManagerV2`` driven as one long-lived sequence with a caller-owned page
     table.
 
@@ -279,6 +191,16 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
     Several streams (for example the two branches of classifier-free guidance) take
     one instance each.
 
+    A pipeline drives the rollout through ``RolloutKVCacheInterface`` (``open``,
+    ``plan``, ``commit``, ``close``, ``shutdown``) and puts the prompt in with
+    ``write_range(layer_idx, 0, k, v)`` on every layer followed by ``commit`` of its
+    length. The other members are the paged layout's own and serve its attention
+    backends, tests and benchmark: ``write_staged``, ``write_range`` past the fixed
+    region, ``zero_values``, ``kv_buffer``, ``table``/``page_table``,
+    ``causal_block_pages``/``causal_block_lengths``/``causal_block_offsets``,
+    ``cached_tokens``, ``staging_offset``, ``history_tokens``, ``capacity`` and the
+    pool sizing helpers.
+
     Terms, used the same way in this cache, its attention backends and its kernels.
     "Block" alone is never used: in the LLM code it means a page.
 
@@ -286,6 +208,8 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
       and the TRTLLM attention op call it a block (``tokens_per_block``,
       ``kv_cache_block_offsets``).
     - page table: the cache's map from logical pages to pool pages, ``page_table()``.
+    - rollout: one generated video, from ``open`` to ``close``: the fixed region and every
+      chunk generated after it, one chunk at a time. One instance holds one open rollout.
     - chunk: the frames one forward processes. Their tokens are the staged tokens.
     - causal block: a run of staged tokens with full attention among themselves,
       causal to earlier causal blocks and to the cache. One request in the TRTLLM
@@ -475,7 +399,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         # caller's; the entries hold the cache, so shutdown() clears them.
         self.attention_metadata: Dict[Tuple, object] = {}
         # The open spec and its fields; set by open().
-        self.spec: Optional[RolloutSpec] = None
+        self._spec: Optional[RolloutSpec] = None
         self.window_tokens = 0
         self.max_staged_tokens = 0
         self.causal_block_sizes: Tuple[int, ...] = ()
@@ -527,8 +451,9 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
 
     # ------------------------------------------------------------------ lifecycle
 
-    def open(self, spec: RolloutSpec, *, pin_tokens: int = 0) -> None:
-        """Start a rollout with this spec; the sequence starts empty.
+    def open(self, spec: RolloutSpec, *, pin_tokens: int = 0) -> "BlockCausalKVCacheManager":
+        """Start a rollout with this spec; the sequence starts empty. Returns the cache,
+        so ``with cache.open(spec, pin_tokens=n):`` closes the rollout on exit.
 
         Args:
             spec: the rollout's geometry. It must fit the pool: ``pool_tokens_for`` of
@@ -606,6 +531,14 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
             self._buffers = []
             self._remove_kv_cache(_ROLLOUT_REQUEST_ID)
             raise
+        return self
+
+    def __enter__(self) -> "BlockCausalKVCacheManager":
+        self._require_open()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _open_with_spec(
         self,
@@ -620,7 +553,7 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
         """The spec-dependent half of ``open``: bind the pages, allocate or reuse the
         spec's device state and write the kernel-facing tensors."""
         tpb = self.tokens_per_page
-        self.spec = spec
+        self._spec = spec
         self.window_tokens = spec.window_tokens
         self.max_staged_tokens = spec.max_staged_tokens
         self.causal_block_sizes = spec.causal_block_sizes
@@ -1334,6 +1267,11 @@ class BlockCausalKVCacheManager(KVCacheManagerV2):
     ) -> torch.Tensor:
         rows = self.get_batch_cache_indices(request_ids, layer_idx, num_blocks)
         return torch.tensor([p for row in rows for p in row], dtype=torch.int32)
+
+    @property
+    def spec(self) -> Optional[RolloutSpec]:
+        """The open rollout's spec; ``None`` before the first ``open``."""
+        return self._spec
 
     @property
     def is_open(self) -> bool:
