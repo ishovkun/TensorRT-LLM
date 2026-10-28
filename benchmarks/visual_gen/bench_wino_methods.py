@@ -24,7 +24,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from bench_wan_vae import _time_cupti  # noqa: E402
+from bench_wan_vae import _build, _real_pixels, _time_cupti  # noqa: E402
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     cuda_wino_spatial_available,
@@ -60,6 +60,74 @@ def _as_rows(out, comps: int, pairs: int, h: int, w: int, cout: int) -> torch.Te
     return out.reshape(comps, pairs, h * w, cout)
 
 
+# One conv per decoder level whose input the real decode captures: (layer name, module path).
+# The first ResBlock of up2 / up3 changes the channel count, so their second ResBlock is used.
+_REAL_CONVS = [
+    ("mid / up0\n1024 ch, 45×80", "decoder.mid_block.resnets.0.conv1"),
+    ("up1\n1024 ch, 90×160", "decoder.up_blocks.1.resnets.0.conv1"),
+    ("up2\n512 ch, 180×320", "decoder.up_blocks.2.resnets.1.conv1"),
+    ("up3\n256 ch, 360×640", "decoder.up_blocks.3.resnets.1.conv1"),
+]
+
+
+def _capture_real(checkpoint: str, video: str, frames: int, order: int):
+    """Real weights and real input slabs for one conv per decoder level.
+
+    Decodes a real clip through the native bf16 VAE with the checkpoint's weights and returns,
+    per level in ``_REAL_CONVS``, the conv's weight and the temporal-Winograd input slabs of its
+    first ``order + 2`` input frames: ``(name, cin, cout, h, w, order, d [comps, 1, h*w, cin]
+    fp16, weight)``.
+    """
+    from safetensors.torch import load_file
+
+    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import TEMPORAL_WINO
+
+    state_dict = load_file(str(Path(checkpoint) / "diffusion_pytorch_model.safetensors"))
+    pixels = _real_pixels(video, None, frames, 720, 1280)
+    ref = _build("diffusers", state_dict, torch.float32, {})
+    with torch.inference_mode():
+        latents = ref.encode(pixels, return_dict=False)[0].mode()
+    del ref, pixels
+    torch.cuda.empty_cache()
+    model = _build("native", state_dict, torch.bfloat16, {})
+    need = order + 2
+    grabbed: dict[str, list[torch.Tensor]] = {name: [] for name, _ in _REAL_CONVS}
+    hooks = []
+    for name, path in _REAL_CONVS:
+        module = model.get_submodule(path)
+
+        def pre(mod, args, kwargs, _name=name):
+            got = grabbed[_name]
+            x = args[0]
+            cache = args[1] if len(args) > 1 else kwargs.get("cache_x")
+            if not got and cache is not None:
+                got.append(cache.float())
+            if sum(t.shape[2] for t in got) < need:
+                got.append(x.float())
+
+        hooks.append(module.register_forward_pre_hook(pre, with_kwargs=True))
+    with torch.inference_mode():
+        model.decode(latents.to(torch.bfloat16), return_dict=False, temporal_chunk_size=1)
+    for h in hooks:
+        h.remove()
+    bt = torch.tensor(TEMPORAL_WINO[order]["BT"], dtype=torch.float32, device="cuda")
+    cases = []
+    for name, path in _REAL_CONVS:
+        x = torch.cat(grabbed[name], dim=2)[0, :, :need]  # [C, need, H, W]
+        c, _, h, w = x.shape
+        f = x.permute(1, 2, 3, 0).reshape(need, h * w, c)  # frames, pixels, channels
+        d = torch.einsum("ki,ipc->kpc", bt, f).to(torch.float16).unsqueeze(1).contiguous()
+        weight = model.get_submodule(path).weight.detach().to(torch.bfloat16)
+        cases.append((name, c, weight.shape[0], h, w, order, d, weight))
+        print(
+            f"captured {name.replace(chr(10), ' ')}: input {tuple(x.shape)} -> slabs {tuple(d.shape)}",
+            flush=True,
+        )
+    del model
+    torch.cuda.empty_cache()
+    return cases
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iters", type=int, default=20)
@@ -74,6 +142,16 @@ def main() -> None:
         "channels: fixed resolution over channel counts",
     )
     parser.add_argument("--channels", type=int, default=512, help="C_in = C_out for --sweep res")
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Diffusers VAE directory: with --video, the layer shapes take their weights and "
+        "input slabs from a real decode (one conv per decoder level) instead of Gaussian data",
+    )
+    parser.add_argument("--video", default=None, help="clip whose frames feed the real decode")
+    parser.add_argument(
+        "--real-frames", type=int, default=13, help="pixel frames of the clip to decode (4k+1)"
+    )
     parser.add_argument("--res", default="180x320", help="HxW for --sweep channels")
     parser.add_argument("--sizes", default=None, help="comma-separated HxW list for --sweep res")
     parser.add_argument(
@@ -92,7 +170,15 @@ def main() -> None:
     results = []
     if args.append and Path(args.out).exists():
         results = json.loads(Path(args.out).read_text())["layers"]
-    if args.sweep == "layers":
+    real = None
+    if args.checkpoint:
+        if not args.video:
+            raise ValueError("--checkpoint needs --video")
+        real = _capture_real(args.checkpoint, args.video, args.real_frames, 2)
+        cases = [
+            ((n, ci, co, h, w, o), SHIPPED[i]) for i, (n, ci, co, h, w, o, _, _) in enumerate(real)
+        ]
+    elif args.sweep == "layers":
         cases = [(LAYERS[i], SHIPPED[i]) for i in (int(s) for s in args.layers.split(","))]
     elif args.sweep == "res":
         c = args.channels
@@ -112,12 +198,15 @@ def main() -> None:
     else:
         h, w = (int(v) for v in args.res.split("x"))
         cases = [((f"{c} ch", c, c, h, w, 2), "") for c in (128, 256, 512, 1024)]
-    for (name, cin, cout, h, w, order), shipped in cases:
+    for index, ((name, cin, cout, h, w, order), shipped) in enumerate(cases):
         comps, pairs = order + 2, 1
-        d = torch.randn(comps, pairs, h * w, cin, device=device).to(torch.float16)
-        weight = (torch.randn(cout, cin, 3, 3, 3, device=device) / (27 * cin) ** 0.5).to(
-            torch.bfloat16
-        )
+        if real is not None:
+            d, weight = real[index][6], real[index][7]
+        else:
+            d = torch.randn(comps, pairs, h * w, cin, device=device).to(torch.float16)
+            weight = (torch.randn(cout, cin, 3, 3, 3, device=device) / (27 * cin) ** 0.5).to(
+                torch.bfloat16
+            )
         g16 = winograd_weights(weight, order, torch.float16)
         g32 = winograd_weights(weight, order, torch.float32)
         imgs16 = [d[k].view(pairs, h, w, cin).permute(0, 3, 1, 2) for k in range(comps)]

@@ -62,6 +62,8 @@ COSMOS_VAE_CONFIG: dict[str, Any] = {
 SHAPES: dict[str, tuple[int, int, int]] = {
     "t2i_1024": (1, 1024, 1024),
     "t2v_720p_189f": (189, 720, 1280),
+    # 720p over the frame count of the sample clips (real-input accuracy runs).
+    "t2v_720p_121f": (121, 720, 1280),
     "edge_480p_121f": (121, 480, 832),
     # Cosmos3-Nano-Sim-Bimanual streaming decode: 901 pixel frames = 226 latent frames,
     # decoded 2 latent frames (8 pixel frames) per step after a 1-frame cold start.
@@ -134,6 +136,39 @@ def _latent_shape(T: int, H: int, W: int) -> tuple[int, int, int, int, int]:
 
 def _pixel_shape(T: int, H: int, W: int) -> tuple[int, int, int, int, int]:
     return (1, 3, T, H, W)
+
+
+def _real_pixels(video: str | None, image: str | None, T: int, H: int, W: int) -> torch.Tensor:
+    """Real pixels as ``[1, 3, T, H, W]`` fp32 in [-1, 1] on the GPU.
+
+    The first T frames of ``video`` (or ``image`` when T == 1 and one is given), resized to
+    H x W with antialiasing.
+    """
+    import numpy as np
+
+    if T == 1 and image:
+        from PIL import Image
+
+        frames = [np.asarray(Image.open(image).convert("RGB"))]
+    else:
+        if not video:
+            raise ValueError(f"a {T}-frame shape needs --video")
+        import av
+
+        frames = []
+        with av.open(video) as container:
+            for frame in container.decode(video=0):
+                frames.append(frame.to_ndarray(format="rgb24"))
+                if len(frames) == T:
+                    break
+        if len(frames) < T:
+            raise ValueError(f"{video} has {len(frames)} frames, the shape needs {T}")
+    x = torch.from_numpy(np.stack(frames)).cuda().permute(0, 3, 1, 2).float() / 127.5 - 1  # T,3,h,w
+    if x.shape[-2:] != (H, W):
+        x = torch.nn.functional.interpolate(
+            x, size=(H, W), mode="bilinear", antialias=True, align_corners=False
+        )
+    return x.permute(1, 0, 2, 3).unsqueeze(0).contiguous()
 
 
 # ---------------------------------------------------------------------------
@@ -456,6 +491,24 @@ def main() -> None:
     )
     parser.add_argument("--winovae-opts", default="", help="comma list, e.g. fused_norm=1")
     parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Diffusers VAE directory (diffusion_pytorch_model.safetensors); default: random "
+        "weights from --seed",
+    )
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="video file for the encode input of multi-frame shapes (frames resized to the "
+        "shape; needs at least T frames); the decode input is then the fp32 reference's "
+        "encoding of those frames",
+    )
+    parser.add_argument(
+        "--image",
+        default=None,
+        help="image file for single-frame shapes (default: the video's first frame)",
+    )
+    parser.add_argument(
         "--decode-chunk",
         type=int,
         default=0,
@@ -566,18 +619,41 @@ def main() -> None:
     }
     print(json.dumps(meta, indent=1))
 
-    state_dict = _reference_state_dict(args.seed)
+    if args.checkpoint:
+        from safetensors.torch import load_file
+
+        state_dict = load_file(str(Path(args.checkpoint) / "diffusion_pytorch_model.safetensors"))
+        meta["checkpoint"] = args.checkpoint
+    else:
+        state_dict = _reference_state_dict(args.seed)
+    if args.video or args.image:
+        if args.skip_accuracy or args.ref_dtype == "none":
+            raise ValueError(
+                "real inputs need the fp32 reference (their decode input is its encoding)"
+            )
+        meta["video"], meta["image"] = args.video, args.image
     results: list[dict[str, Any]] = []
 
     for shape_name in shapes:
         T, H, W = SHAPES[shape_name]
         gen = torch.Generator(device="cuda").manual_seed(args.seed)
-        inputs = {
-            "decode": torch.randn(_latent_shape(T, H, W), generator=gen, device="cuda").to(dtype),
-            "encode": (torch.rand(_pixel_shape(T, H, W), generator=gen, device="cuda") * 2 - 1).to(
-                dtype
-            ),
-        }
+        if args.video or args.image:
+            pixels = _real_pixels(args.video, args.image, T, H, W)
+            model = _build("diffusers", state_dict, torch.float32, {})
+            with torch.inference_mode():
+                latents = model.encode(pixels.float(), return_dict=False)[0].mode()
+            del model
+            torch.cuda.empty_cache()
+            inputs = {"decode": latents.to(dtype), "encode": pixels.to(dtype)}
+        else:
+            inputs = {
+                "decode": torch.randn(_latent_shape(T, H, W), generator=gen, device="cuda").to(
+                    dtype
+                ),
+                "encode": (
+                    torch.rand(_pixel_shape(T, H, W), generator=gen, device="cuda") * 2 - 1
+                ).to(dtype),
+            }
         decode_chunk = args.decode_chunk or SHAPE_DECODE_CHUNK.get(shape_name, 1)
         for op in ops:
             if op not in inputs:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -59,6 +60,14 @@ def main() -> None:
     parser.add_argument("--title", default="Wan VAE: relative L2 error against the fp32 reference")
     parser.add_argument("--logy", action="store_true", help="log y axis")
     parser.add_argument(
+        "--shape",
+        action="append",
+        default=[],
+        metavar="COLUMN=SHAPE",
+        help="draw COLUMN from bench shape SHAPE instead of the ladder's (e.g. "
+        "t2v_720p=t2v_720p_121f); the label's frame count follows",
+    )
+    parser.add_argument(
         "--op",
         choices=("encode", "decode"),
         default=None,
@@ -86,6 +95,13 @@ def main() -> None:
         shape = COLUMNS[column][op][0]
         if shape == "bimanual_480x832_901f":
             shape = "bimanual_cond_480x832"
+        for item in args.shape:
+            col, _, override = item.partition("=")
+            if col == column:
+                shape = override
+                frames = re.search(r"_(\d+)f$", override)
+                if frames:
+                    label = re.sub(r"\d+f", frames.group(1) + "f", label)
         if any(k[1] == shape and k[2] == op for k in errors):
             groups.append((shape, op, label))
     names = list(dict(SERIES).items())
