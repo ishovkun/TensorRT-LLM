@@ -23,9 +23,9 @@ import cuda.bindings.driver as cuda
 NT = 128  # threads per CTA for the transform kernels
 
 # Programmatic-dependent-launch flags for the transform kernels (bit set):
-PDL_TRIGGER = 1    # release the next grid at kernel start (it only needs data we do not write)
+PDL_TRIGGER = 1  # release the next grid at kernel start (it only needs data we do not write)
 PDL_WAIT_START = 2  # wait for the previous grid before reading its output
-PDL_WAIT_END = 4    # CTA 0 waits for the previous grid before exiting (completion stays transitive)
+PDL_WAIT_END = 4  # CTA 0 waits for the previous grid before exiting (completion stays transitive)
 
 
 def _pdl_start(pdl):
@@ -41,32 +41,64 @@ WINO = {
         G=[[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]],
         AT=[[1, 1, 1, 0], [0, 1, -1, -1]],
     ),
-    # F(4,3) on points (0, 1, -1, 2, -1/2, inf): ~1.5x lower fp16 error than (0, +-1, +-2, inf)
+    # F(4,3) on points (0, +-3/2, +-5/8, inf): the real point set with the lowest fp16 rounding
+    # sensitivity (per-conv error 1.7e-3 against 2.5e-3 for (0, +-1, 2, -1/2, inf)); B^T and A^T
+    # are dyadic, so their products with bf16 / fp16 inputs are exact in fp32.
     4: dict(
-        BT=[[1, 3 / 2, -2, -3 / 2, 1, 0], [0, -1, -5 / 2, -1 / 2, 1, 0], [0, 1, 1 / 2, -5 / 2, 1, 0],
-            [0, -1 / 2, -1, 1 / 2, 1, 0], [0, 2, -1, -2, 1, 0], [0, 1, 3 / 2, -2, -3 / 2, 1]],
-        G=[[1, 0, 0], [-1 / 3, -1 / 3, -1 / 3], [1 / 3, -1 / 3, 1 / 3], [1 / 15, 2 / 15, 4 / 15],
-           [-16 / 15, 8 / 15, -4 / 15], [0, 0, 1]],
-        AT=[[1, 1, 1, 1, 1, 0], [0, 1, -1, 2, -1 / 2, 0], [0, 1, 1, 4, 1 / 4, 0], [0, 1, -1, 8, -1 / 8, 1]],
+        BT=[
+            [225 / 256, 0, -169 / 64, 0, 1, 0],
+            [0, -75 / 128, -25 / 64, 3 / 2, 1, 0],
+            [0, 75 / 128, -25 / 64, -3 / 2, 1, 0],
+            [0, -45 / 32, -9 / 4, 5 / 8, 1, 0],
+            [0, 45 / 32, -9 / 4, -5 / 8, 1, 0],
+            [0, 225 / 256, 0, -169 / 64, 0, 1],
+        ],
+        G=[
+            [256 / 225, 0, 0],
+            [128 / 1071, 64 / 357, 32 / 119],
+            [128 / 1071, -64 / 357, 32 / 119],
+            [-2048 / 2975, -256 / 595, -32 / 119],
+            [-2048 / 2975, 256 / 595, -32 / 119],
+            [0, 0, 1],
+        ],
+        AT=[
+            [1, 1, 1, 1, 1, 0],
+            [0, 3 / 2, -3 / 2, 5 / 8, -5 / 8, 0],
+            [0, 9 / 4, 9 / 4, 25 / 64, 25 / 64, 0],
+            [0, 27 / 8, -27 / 8, 125 / 512, -125 / 512, 1],
+        ],
     ),
 }
 
 
 def _bt4(d):
-    # factorized F(4,3) B^T for points (0, 1, -1, 2, -1/2, inf): 16 ops instead of 26
+    # factorized F(4,3) B^T for points (0, +-3/2, +-5/8, inf): the +-p rows share an even and an
+    # odd part, 22 ops instead of 30
     d0, d1, d2, d3, d4, d5 = d
-    e, f, s = d1 - d3, d4 - d2, d1 + d3
-    h = f + s * -0.75
-    return [(f - d2) + e * 1.5 + d0, h + d2 * -1.5 + e * -0.25, h + d2 * 1.5 + e * 1.75,
-            f + e * -0.5, f + e * 2.0, (d5 + f * -1.5) + (e - d3)]
+    e1 = d4 + d2 * -0.390625  # d4 - b^2 d2,        b = 5/8
+    o1 = d3 * 1.5 + d1 * -0.5859375  # a d3 - a b^2 d1,    a = 3/2
+    e2 = d4 + d2 * -2.25  # d4 - a^2 d2
+    o2 = d3 * 0.625 + d1 * -1.40625  # b d3 - a^2 b d1
+    return [
+        d0 * 0.87890625 + d2 * -2.640625 + d4,
+        e1 + o1,
+        e1 - o1,
+        e2 + o2,
+        e2 - o2,
+        d1 * 0.87890625 + d3 * -2.640625 + d5,
+    ]
 
 
 def _at4(m):
-    # factorized F(4,3) A^T: 12 ops instead of 18
+    # factorized F(4,3) A^T: 14 ops instead of 20
     m0, m1, m2, m3, m4, m5 = m
-    p, q = m1 + m2, m1 - m2
-    return [m0 + p + m3 + m4, q + m3 * 2.0 + m4 * -0.5, p + m3 * 4.0 + m4 * 0.25,
-            q + m3 * 8.0 + m4 * -0.125 + m5]
+    p, q, r, s = m1 + m2, m1 - m2, m3 + m4, m3 - m4
+    return [
+        m0 + p + r,
+        q * 1.5 + s * 0.625,
+        p * 2.25 + r * 0.390625,
+        q * 3.375 + s * 0.244140625 + m5,
+    ]
 
 
 def _lin(mat, v):
@@ -101,9 +133,16 @@ def _vec(mT, tile, coord):
 
 # ---------------------------------------------------------------- weight transform
 @cute.jit
-def _w_body(mWf: cute.Tensor, mU: cute.Tensor, L: Int32, K: cutlass.Constexpr,
-            C: cutlass.Constexpr, MH: cutlass.Constexpr, MW: cutlass.Constexpr,
-            VEC: cutlass.Constexpr):
+def _w_body(
+    mWf: cute.Tensor,
+    mU: cute.Tensor,
+    L: Int32,
+    K: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    VEC: cutlass.Constexpr,
+):
     Gh, Gw = WINO[MH]["G"], WINO[MW]["G"]
     AW = MW + 2
     CG = C // VEC
@@ -129,9 +168,18 @@ def _w_vec(MH, MW):
 
 # ---------------------------------------------------------------- input transform
 @cute.jit
-def _in_body(mX: cute.Tensor, mV: cute.Tensor, L: Int32, N: cutlass.Constexpr,
-             H: cutlass.Constexpr, W: cutlass.Constexpr, C: cutlass.Constexpr,
-             MH: cutlass.Constexpr, MW: cutlass.Constexpr, VEC: cutlass.Constexpr):
+def _in_body(
+    mX: cute.Tensor,
+    mV: cute.Tensor,
+    L: Int32,
+    N: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    VEC: cutlass.Constexpr,
+):
     BTh, BTw = WINO[MH]["BT"], WINO[MW]["BT"]
     AH, AW = MH + 2, MW + 2
     TH = (H + MH - 1) // MH
@@ -144,7 +192,9 @@ def _in_body(mX: cute.Tensor, mV: cute.Tensor, L: Int32, N: cutlass.Constexpr,
         tw = t % TW
         r = t // TW
         th = r % TH
-        n = Int64(r // TH)  # frame and tile coordinates in 64 bits: their strides reach 1e9 elements
+        n = Int64(
+            r // TH
+        )  # frame and tile coordinates in 64 bits: their strides reach 1e9 elements
         t64 = Int64(t)
         # column (W) transform of each input row as it is loaded
         rows = []
@@ -175,9 +225,17 @@ def _in_vec(MH, MW):
 
 
 @cute.kernel
-def _in_xform_kernel(mX: cute.Tensor, mV: cute.Tensor, N: cutlass.Constexpr, H: cutlass.Constexpr,
-                     W: cutlass.Constexpr, C: cutlass.Constexpr, MH: cutlass.Constexpr,
-                     MW: cutlass.Constexpr, PDL: cutlass.Constexpr):
+def _in_xform_kernel(
+    mX: cute.Tensor,
+    mV: cute.Tensor,
+    N: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    PDL: cutlass.Constexpr,
+):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     _pdl_start(PDL)
@@ -191,21 +249,42 @@ def _in_xform_kernel(mX: cute.Tensor, mV: cute.Tensor, N: cutlass.Constexpr, H: 
 
 
 @cute.jit
-def in_xform(mX: cute.Tensor, mV: cute.Tensor, N: cutlass.Constexpr, H: cutlass.Constexpr,
-             W: cutlass.Constexpr, C: cutlass.Constexpr, MH: cutlass.Constexpr,
-             MW: cutlass.Constexpr, PDL: cutlass.Constexpr, stream: cuda.CUstream):
+def in_xform(
+    mX: cute.Tensor,
+    mV: cute.Tensor,
+    N: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    PDL: cutlass.Constexpr,
+    stream: cuda.CUstream,
+):
     T = N * ((H + MH - 1) // MH) * (W // MW)
     nblk = (T * (C // _in_vec(MH, MW)) + NT - 1) // NT
     _in_xform_kernel(mX, mV, N, H, W, C, MH, MW, PDL).launch(
-        grid=[nblk, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0)
+        grid=[nblk, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0
+    )
 
 
 # ---------------------------------------------------------------- weight + first input chunk
 @cute.kernel
-def _wi_xform_kernel(mWf: cute.Tensor, mU: cute.Tensor, mX: cute.Tensor, mV: cute.Tensor,
-                     K: cutlass.Constexpr, N: cutlass.Constexpr, H: cutlass.Constexpr,
-                     W: cutlass.Constexpr, C: cutlass.Constexpr, MH: cutlass.Constexpr,
-                     MW: cutlass.Constexpr, NBW: cutlass.Constexpr, PDL: cutlass.Constexpr):
+def _wi_xform_kernel(
+    mWf: cute.Tensor,
+    mU: cute.Tensor,
+    mX: cute.Tensor,
+    mV: cute.Tensor,
+    K: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    NBW: cutlass.Constexpr,
+    PDL: cutlass.Constexpr,
+):
     # The weight and input transforms are independent: CTAs [0, NBW) do weights, the rest do
     # input tiles, so both streams of HBM traffic run concurrently in one grid.
     tidx, _, _ = cute.arch.thread_idx()
@@ -218,23 +297,43 @@ def _wi_xform_kernel(mWf: cute.Tensor, mU: cute.Tensor, mX: cute.Tensor, mV: cut
 
 
 @cute.jit
-def wi_xform(mWf: cute.Tensor, mU: cute.Tensor, mX: cute.Tensor, mV: cute.Tensor,
-             K: cutlass.Constexpr, N: cutlass.Constexpr, H: cutlass.Constexpr,
-             W: cutlass.Constexpr, C: cutlass.Constexpr, MH: cutlass.Constexpr,
-             MW: cutlass.Constexpr, PDL: cutlass.Constexpr, stream: cuda.CUstream):
+def wi_xform(
+    mWf: cute.Tensor,
+    mU: cute.Tensor,
+    mX: cute.Tensor,
+    mV: cute.Tensor,
+    K: cutlass.Constexpr,
+    N: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    C: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    PDL: cutlass.Constexpr,
+    stream: cuda.CUstream,
+):
     T = N * ((H + MH - 1) // MH) * (W // MW)
     nbw = (K * (C // _w_vec(MH, MW)) + NT - 1) // NT
     nbi = (T * (C // _in_vec(MH, MW)) + NT - 1) // NT
     _wi_xform_kernel(mWf, mU, mX, mV, K, N, H, W, C, MH, MW, nbw, PDL).launch(
-        grid=[nbw + nbi, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0)
+        grid=[nbw + nbi, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0
+    )
 
 
 # ---------------------------------------------------------------- output transform
 @cute.kernel
-def _out_xform_kernel(mM: cute.Tensor, mY: cute.Tensor, N: cutlass.Constexpr, H: cutlass.Constexpr,
-                      W: cutlass.Constexpr, K: cutlass.Constexpr, MH: cutlass.Constexpr,
-                      MW: cutlass.Constexpr, VEC: cutlass.Constexpr,
-        PDL: cutlass.Constexpr):
+def _out_xform_kernel(
+    mM: cute.Tensor,
+    mY: cute.Tensor,
+    N: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    K: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    VEC: cutlass.Constexpr,
+    PDL: cutlass.Constexpr,
+):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
     _pdl_start(PDL)
@@ -251,7 +350,9 @@ def _out_xform_kernel(mM: cute.Tensor, mY: cute.Tensor, N: cutlass.Constexpr, H:
         tw = t % TW
         r = t // TW
         th = r % TH
-        n = Int64(r // TH)  # frame and tile coordinates in 64 bits: their strides reach 1e9 elements
+        n = Int64(
+            r // TH
+        )  # frame and tile coordinates in 64 bits: their strides reach 1e9 elements
         t64 = Int64(t)
         z = []
         for i in cutlass.range_constexpr(AH):
@@ -281,11 +382,21 @@ def _out_xform_kernel(mM: cute.Tensor, mY: cute.Tensor, N: cutlass.Constexpr, H:
 
 
 @cute.jit
-def out_xform(mM: cute.Tensor, mY: cute.Tensor, N: cutlass.Constexpr, H: cutlass.Constexpr,
-              W: cutlass.Constexpr, K: cutlass.Constexpr, MH: cutlass.Constexpr,
-              MW: cutlass.Constexpr, PDL: cutlass.Constexpr, stream: cuda.CUstream):
+def out_xform(
+    mM: cute.Tensor,
+    mY: cute.Tensor,
+    N: cutlass.Constexpr,
+    H: cutlass.Constexpr,
+    W: cutlass.Constexpr,
+    K: cutlass.Constexpr,
+    MH: cutlass.Constexpr,
+    MW: cutlass.Constexpr,
+    PDL: cutlass.Constexpr,
+    stream: cuda.CUstream,
+):
     VEC = 8 if (MH + 2) * (MW + 2) <= 24 else 4
     T = N * ((H + MH - 1) // MH) * (W // MW)
     nblk = (T * (K // VEC) + NT - 1) // NT
     _out_xform_kernel(mM, mY, N, H, W, K, MH, MW, VEC, PDL).launch(
-        grid=[nblk, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0)
+        grid=[nblk, 1, 1], block=[NT, 1, 1], stream=stream, use_pdl=PDL != 0
+    )

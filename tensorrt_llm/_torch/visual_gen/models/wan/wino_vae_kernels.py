@@ -425,18 +425,19 @@ def winograd_weights(
 
 
 # Spatial filter transforms G of F(2x2, 3x3) (Lavin & Gray, points 0, +-1, inf) and F(4x4, 3x3)
-# (points 0, 1, -1, 2, -1/2, inf, shared with the Kernel Factory path: ~1.5x lower fp16 error than
-# Lavin & Gray's 0, +-1, +-2), applied in fp64 and rounded once. The matching B^T and A^T live in
+# (points 0, +-3/2, +-5/8, inf, shared with the Kernel Factory path: the real point set with the
+# lowest fp16 rounding sensitivity, 1.7e-3 per conv against 2.5e-3 for (0, +-1, 2, -1/2, inf)),
+# applied in fp64 and rounded once. The matching B^T and A^T live in
 # cpp/tensorrt_llm/kernels/vaeWinoSpatialKernel.cu.
 _WINO_G = {
     2: torch.tensor([[1, 0, 0], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5], [0, 0, 1]], dtype=torch.float64),
     4: torch.tensor(
         [
-            [1, 0, 0],
-            [-1 / 3, -1 / 3, -1 / 3],
-            [1 / 3, -1 / 3, 1 / 3],
-            [1 / 15, 2 / 15, 4 / 15],
-            [-16 / 15, 8 / 15, -4 / 15],
+            [256 / 225, 0, 0],
+            [128 / 1071, 64 / 357, 32 / 119],
+            [128 / 1071, -64 / 357, 32 / 119],
+            [-2048 / 2975, -256 / 595, -32 / 119],
+            [-2048 / 2975, 256 / 595, -32 / 119],
             [0, 0, 1],
         ],
         dtype=torch.float64,

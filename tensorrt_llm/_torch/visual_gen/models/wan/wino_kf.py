@@ -3,7 +3,7 @@
 """Spatial Winograd F(4x4, 3x3) for the Winograd pair path on Blackwell (sm100), on the Kernel
 Factory CuTe DSL kernels in ``kf_wino``: input transform, 36 batched tcgen05 GEMMs (fp16 in,
 fp32 accumulate, fp16 out), output transform, the transforms co-running with the GEMMs through
-programmatic dependent launch (PDL). Interpolation points (0, 1, -1, 2, -1/2, inf).
+programmatic dependent launch (PDL). Interpolation points (0, +-3/2, +-5/8, inf).
 
 A conv's four temporal components share one call: the frames of all components are one batch
 for the transforms, and the GEMMs run as four chunks (one per component filter) so chunk k+1's

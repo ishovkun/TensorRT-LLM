@@ -10,7 +10,8 @@
 #   2. input transform   V[c][p][ci]  = (B^T d B)[c] per 4x4 tile p (fp16)
 #   3. 36 batched GEMMs  M[c][p][co]  = sum_ci V[c][p][ci] U[c][co][ci]  (tcgen05, fp32 acc, fp16 out)
 #   4. output transform  y[n,h,w,co]  = (A^T M A) (bf16)
-# Interpolation points (0, 1, -1, 2, -1/2, inf): ~1.5x lower fp16 error than the canonical (0, +-1, +-2).
+# Interpolation points (0, +-3/2, +-5/8, inf): the real point set with the lowest fp16 rounding
+# sensitivity (1.7e-3 per conv; (0, +-1, 2, -1/2, inf) gives 2.5e-3, the canonical (0, +-1, +-2) 3.8e-3).
 from typing import Optional, Tuple, Type, Union
 import math
 import os
@@ -27,11 +28,12 @@ from cutlass import Int32, Float32, Float16, BFloat16
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-BT = [[1, 3/2, -2, -3/2, 1, 0], [0, -1, -5/2, -1/2, 1, 0], [0, 1, 1/2, -5/2, 1, 0],
-      [0, -1/2, -1, 1/2, 1, 0], [0, 2, -1, -2, 1, 0], [0, 1, 3/2, -2, -3/2, 1]]
-G = [[1, 0, 0], [-1/3, -1/3, -1/3], [1/3, -1/3, 1/3], [1/15, 2/15, 4/15],
-     [-16/15, 8/15, -4/15], [0, 0, 1]]
-AT = [[1, 1, 1, 1, 1, 0], [0, 1, -1, 2, -1/2, 0], [0, 1, 1, 4, 1/4, 0], [0, 1, -1, 8, -1/8, 1]]
+BT = [[225/256, 0, -169/64, 0, 1, 0], [0, -75/128, -25/64, 3/2, 1, 0], [0, 75/128, -25/64, -3/2, 1, 0],
+      [0, -45/32, -9/4, 5/8, 1, 0], [0, 45/32, -9/4, -5/8, 1, 0], [0, 225/256, 0, -169/64, 0, 1]]
+G = [[256/225, 0, 0], [128/1071, 64/357, 32/119], [128/1071, -64/357, 32/119],
+     [-2048/2975, -256/595, -32/119], [-2048/2975, 256/595, -32/119], [0, 0, 1]]
+AT = [[1, 1, 1, 1, 1, 0], [0, 3/2, -3/2, 5/8, -5/8, 0], [0, 9/4, 9/4, 25/64, 25/64, 0],
+      [0, 27/8, -27/8, 125/512, -125/512, 1]]
 
 TPB = 128  # threads per block for the transform kernels (all workload sizes divide evenly)
 
@@ -83,8 +85,9 @@ def _sandwich(L, d, R):
             for a in range(len(L))]
 
 
-# Factorized F(4x4) transforms on (f32, f32) pairs: B^T in 16 ops (vs 26 for the dense rows),
-# A^T in 12 (vs 18). Plain fp32 re-association of the same sums.
+# Factorized F(4x4) transforms on (f32, f32) pairs: B^T in 14 ops (vs 30 for the dense rows),
+# A^T in 13 (vs 26). The +-p rows share an even part (d4 - p^2 d2) and an odd part; plain fp32
+# re-association of the same sums.
 def _padd(a, b):
     return cute.arch.add_packed_f32x2(a, b)
 
@@ -99,23 +102,24 @@ def _pfma(a, c, b):  # a * c + b
 
 def _bt_vec(d):
     d0, d1, d2, d3, d4, d5 = d
-    e, f, s = _psub(d1, d3), _psub(d4, d2), _padd(d1, d3)
-    h = _pfma(s, -0.75, f)
-    return [_padd(_pfma(e, 1.5, _psub(f, d2)), d0),
-            _pfma(e, -0.25, _pfma(d2, -1.5, h)),
-            _pfma(e, 1.75, _pfma(d2, 1.5, h)),
-            _pfma(e, -0.5, f),
-            _pfma(e, 2.0, f),
-            _padd(_pfma(f, -1.5, d5), _psub(e, d3))]
+    e1 = _pfma(d2, -0.390625, d4)   # d4 - (5/8)^2 d2
+    e2 = _pfma(d2, -2.25, d4)       # d4 - (3/2)^2 d2
+    return [_pfma(d0, 0.87890625, _pfma(d2, -2.640625, d4)),
+            _pfma(d3, 1.5, _pfma(d1, -0.5859375, e1)),
+            _pfma(d3, -1.5, _pfma(d1, 0.5859375, e1)),
+            _pfma(d3, 0.625, _pfma(d1, -1.40625, e2)),
+            _pfma(d3, -0.625, _pfma(d1, 1.40625, e2)),
+            _pfma(d1, 0.87890625, _pfma(d3, -2.640625, d5))]
 
 
 def _at_vec(m):
     m0, m1, m2, m3, m4, m5 = m
-    p, q = _padd(m1, m2), _psub(m1, m2)
-    return [_padd(_padd(_padd(m0, p), m3), m4),
-            _pfma(m4, -0.5, _pfma(m3, 2.0, q)),
-            _pfma(m4, 0.25, _pfma(m3, 4.0, p)),
-            _padd(_pfma(m4, -0.125, _pfma(m3, 8.0, q)), m5)]
+    p, q, r, s = _padd(m1, m2), _psub(m1, m2), _padd(m3, m4), _psub(m3, m4)
+    z = _psub(m0, m0)
+    return [_padd(_padd(m0, p), r),
+            _pfma(q, 1.5, _pfma(s, 0.625, z)),
+            _pfma(p, 2.25, _pfma(r, 0.390625, z)),
+            _pfma(q, 3.375, _pfma(s, 0.244140625, m5))]
 
 
 def _sandwich_f(fn, d):

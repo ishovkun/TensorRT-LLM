@@ -129,11 +129,11 @@ __device__ __forceinline__ float2 operator*(float k, float2 a)
 }
 
 // Winograd transforms written out. F(2x2, 3x3): Lavin & Gray, points (0, +-1, inf), integer
-// coefficients. F(4x4, 3x3): points (0, 1, -1, 2, -1/2, inf), the same set as the Kernel Factory
-// path; its coefficients are small dyadic fractions (1/2, 3/2, 5/2, 1/4, 1/8), so every product
-// with a bf16 / fp16 input is exact in fp32 and only the sums round. This set keeps the
-// transformed values about 3x smaller than the (0, +-1, +-2, inf) set and the fp16 error of
-// the stored V / M about 1.5x lower.
+// coefficients. F(4x4, 3x3): points (0, +-3/2, +-5/8, inf), the same set as the Kernel Factory
+// path: the real point set with the lowest fp16 rounding sensitivity of the stored V / M (1.7e-3
+// per conv against 2.5e-3 for (0, +-1, 2, -1/2, inf)). Its B^T and A^T entries are dyadic, so
+// every product with a bf16 / fp16 input is exact in fp32 and only the sums round. The +-p rows
+// share an even and an odd part.
 // bt<M>(x, d): row x of B^T applied to the (m+2) values d; at<M>(r, t): row r of A^T.
 template <int M>
 struct WinoMath;
@@ -169,12 +169,12 @@ struct WinoMath<4>
     {
         switch (x)
         {
-        case 0: return d[0] + 1.5f * (d[1] - d[3]) - 2.f * d[2] + d[4];
-        case 1: return d[4] - d[1] - 2.5f * d[2] - 0.5f * d[3];
-        case 2: return d[4] + d[1] + 0.5f * d[2] - 2.5f * d[3];
-        case 3: return d[4] - d[2] + 0.5f * (d[3] - d[1]);
-        case 4: return d[4] - d[2] + 2.f * (d[1] - d[3]);
-        default: return d[5] + 1.5f * (d[2] - d[4]) - 2.f * d[3] + d[1];
+        case 0: return 0.87890625f * d[0] - 2.640625f * d[2] + d[4];
+        case 1: return (d[4] - 0.390625f * d[2]) + (1.5f * d[3] - 0.5859375f * d[1]);
+        case 2: return (d[4] - 0.390625f * d[2]) - (1.5f * d[3] - 0.5859375f * d[1]);
+        case 3: return (d[4] - 2.25f * d[2]) + (0.625f * d[3] - 1.40625f * d[1]);
+        case 4: return (d[4] - 2.25f * d[2]) - (0.625f * d[3] - 1.40625f * d[1]);
+        default: return 0.87890625f * d[1] - 2.640625f * d[3] + d[5];
         }
     }
 
@@ -183,9 +183,9 @@ struct WinoMath<4>
         switch (r)
         {
         case 0: return t[0] + t[1] + t[2] + t[3] + t[4];
-        case 1: return t[1] - t[2] + 2.f * t[3] - 0.5f * t[4];
-        case 2: return t[1] + t[2] + 4.f * t[3] + 0.25f * t[4];
-        default: return t[1] - t[2] + 8.f * t[3] - 0.125f * t[4] + t[5];
+        case 1: return 1.5f * (t[1] - t[2]) + 0.625f * (t[3] - t[4]);
+        case 2: return 2.25f * (t[1] + t[2]) + 0.390625f * (t[3] + t[4]);
+        default: return 3.375f * (t[1] - t[2]) + 0.244140625f * (t[3] - t[4]) + t[5];
         }
     }
 };

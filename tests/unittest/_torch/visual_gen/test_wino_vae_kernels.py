@@ -727,20 +727,25 @@ _BT = torch.tensor([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], 
 _AT = torch.tensor([[1, 1, 1, 0], [0, 1, -1, -1]], dtype=torch.float32)
 
 
-# F(4x4, 3x3) on points (0, 1, -1, 2, -1/2, inf), as in the CUDA op and the Kernel Factory path.
+# F(4x4, 3x3) on points (0, +-3/2, +-5/8, inf), as in the CUDA op and the Kernel Factory path.
 _BT4 = torch.tensor(
     [
-        [1, 1.5, -2, -1.5, 1, 0],
-        [0, -1, -2.5, -0.5, 1, 0],
-        [0, 1, 0.5, -2.5, 1, 0],
-        [0, -0.5, -1, 0.5, 1, 0],
-        [0, 2, -1, -2, 1, 0],
-        [0, 1, 1.5, -2, -1.5, 1],
+        [225 / 256, 0, -169 / 64, 0, 1, 0],
+        [0, -75 / 128, -25 / 64, 3 / 2, 1, 0],
+        [0, 75 / 128, -25 / 64, -3 / 2, 1, 0],
+        [0, -45 / 32, -9 / 4, 5 / 8, 1, 0],
+        [0, 45 / 32, -9 / 4, -5 / 8, 1, 0],
+        [0, 225 / 256, 0, -169 / 64, 0, 1],
     ],
     dtype=torch.float32,
 )
 _AT4 = torch.tensor(
-    [[1, 1, 1, 1, 1, 0], [0, 1, -1, 2, -0.5, 0], [0, 1, 1, 4, 0.25, 0], [0, 1, -1, 8, -0.125, 1]],
+    [
+        [1, 1, 1, 1, 1, 0],
+        [0, 3 / 2, -3 / 2, 5 / 8, -5 / 8, 0],
+        [0, 9 / 4, 9 / 4, 25 / 64, 25 / 64, 0],
+        [0, 27 / 8, -27 / 8, 125 / 512, -125 / 512, 1],
+    ],
     dtype=torch.float32,
 )
 _SPATIAL_MATS = {2: (_BT, _AT), 4: (_BT4, _AT4)}
@@ -852,9 +857,10 @@ def test_spatial_winograd_transforms_large_frames(
         assert torch.equal(v.float(), v_ref.float())
     else:
         # F(4x4): the separable kernel and the einsum reference sum the six terms in a different
-        # order, so a handful of the 7e7 elements differ by one fp16 ulp.
+        # order; with the dyadic (0, +-3/2, +-5/8) coefficients about 6e-5 of the 7e7 elements
+        # land one fp16 ulp apart.
         torch.testing.assert_close(v.float(), v_ref.float(), rtol=1e-3, atol=1e-2)
-        assert (v != v_ref).float().mean().item() < 1e-6
+        assert (v != v_ref).float().mean().item() < 2e-4
     del v_ref
     out = torch.full((n, h, w, C), float("nan"), device="cuda", dtype=torch.bfloat16)
     torch.ops.trtllm.vae_wino_spatial_out(v, out, components, 0, row1, tile)

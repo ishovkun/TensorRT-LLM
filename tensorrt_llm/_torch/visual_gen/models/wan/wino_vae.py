@@ -204,7 +204,7 @@ class WinoVaeOptions:
     # Tile for the single-frame calls with a causal history (spatial Winograd alone, the three
     # taps summed in the GEMM). They replace a direct cuDNN conv3d, so F(2x2, 3x3), whose
     # per-conv error matches direct bf16, keeps the model's accuracy; F(4x4, 3x3) is faster
-    # and ~4x noisier per conv (2.5e-3 vs 6e-4 relative, fp16 slabs).
+    # and ~3x noisier per conv (1.7e-3 vs 6e-4 relative, fp16 slabs).
     winograd_spatial_single_tile: int = 2
     # Run the zero-history first frame (and every image) as spatial Winograd on the
     # current-frame tap instead of cuDNN conv2d. Faster at the 1024-channel levels with
