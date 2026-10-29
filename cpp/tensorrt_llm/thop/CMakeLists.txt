@@ -161,9 +161,7 @@ add_th_common_family(
   sageQuantizeOp.cpp
   blockCausalLayoutOp.cpp
   rotateRowsOp.cpp
-  scatterKvSlotsOp.cpp
-  wanVaeNormSiluOp.cpp
-  wanVaeUpsampleOp.cpp)
+  scatterKvSlotsOp.cpp)
 
 add_th_common_family(
   th_common_decoding
