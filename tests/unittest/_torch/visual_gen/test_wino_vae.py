@@ -304,3 +304,27 @@ def test_fold_latent_affine_matches_eager() -> None:
     diff = (folded.float() - eager.float()).norm() / eager.float().norm().clamp_min(1e-12)
     assert diff.item() < 2e-2, f"rel_l2={diff.item():.3e}"
     assert not torch.equal(again.float(), folded.float())  # the fold is really off again
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="frame buffers need the CUDA norm kernel")
+def test_frame_buffer_grows_for_a_longer_chunk_in_a_new_clip() -> None:
+    """A clip decoded in short chunks sizes the convs' frame buffers; the next clip's longer
+    chunk must get a deeper buffer, not a window clipped at the end of the old one."""
+    native, fast = _pair(
+        WinoVaeOptions(
+            fused_norm=True,
+            fused_residual=True,
+            conv_slabs=True,
+            conv_out_frame_split=3,
+            first_frame_conv2d=True,
+        )
+    )
+    assert fast.options.use_slabs
+    _, latents = _inputs(21)
+    with torch.inference_mode():
+        expected = native.decode(latents, return_dict=False)[0].float()
+        fast.decode(latents, return_dict=False, temporal_chunk_size=1)
+        actual = fast.decode(latents, return_dict=False, temporal_chunk_size=5)[0].float()
+    rel_l2 = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
+    assert torch.isfinite(actual).all()
+    assert rel_l2.item() < 2e-2, f"rel_l2={rel_l2.item():.3e}"

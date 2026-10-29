@@ -890,8 +890,13 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             slab = allocate()
             self._slab, self._slab_key, self._slab_pos = slab, key, 2
         elif self._slab_pos == 0:
-            # A new clip in the existing buffer: zero history in front of the first window.
-            slab[:, :, :2].zero_()
+            # A new clip: zero history in front of the first window, in the existing buffer
+            # when the chunk fits (its depth was set by an earlier clip's chunk length).
+            if slab.shape[2] < 2 + frames:
+                slab = allocate()
+                self._slab = slab
+            else:
+                slab[:, :, :2].zero_()
             self._slab_pos = 2
         elif self._slab_pos + frames > slab.shape[2]:
             # Wrap: the two history frames move to the front (through a copy, the ranges
