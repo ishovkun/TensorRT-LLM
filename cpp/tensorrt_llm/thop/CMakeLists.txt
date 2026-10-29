@@ -158,7 +158,10 @@ add_th_common_family(
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   fusedDiTGateResidNormShiftScaleOp.cpp
-  sageQuantizeOp.cpp)
+  sageQuantizeOp.cpp
+  vaeUpsampleGatherOp.cpp
+  vaeFrameOpsOp.cpp
+  vaeWinoSpatialOp.cpp)
 
 add_th_common_family(
   th_common_decoding
