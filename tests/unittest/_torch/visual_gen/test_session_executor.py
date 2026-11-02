@@ -96,12 +96,9 @@ class CountingPipeline:
             raise ValueError("bad prompt")
         self.opened += 1
         state = SimpleNamespace(prompt=req.prompt[0], count=0)
-        outcome = AdvanceOutcome()
         if initial_slot is not None:
-            view = initial_slot.buffer("video", (1, 1, H, W, 3), torch.uint8)
-            view.fill_(255)
-            outcome.written = {"video": 1}
-        return state, outcome
+            initial_slot.buffer("video", (1, 1, H, W, 3), torch.uint8).fill_(255)
+        return state, AdvanceOutcome()
 
     def validate_input(self, state, name, value):
         pass
@@ -120,7 +117,7 @@ class CountingPipeline:
             view[..., 1] = control
             view[..., 2] = camera
         done = self.length is not None and state.count >= self.length
-        return AdvanceOutcome(written={"video": FRAMES}, done=done)
+        return AdvanceOutcome(done=done)
 
     def close_session(self, state):
         self.closed += 1

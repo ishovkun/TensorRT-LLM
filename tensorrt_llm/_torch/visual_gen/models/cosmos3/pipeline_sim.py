@@ -1147,7 +1147,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         if frames.is_cuda:
             event = torch.cuda.Event()
             event.record(torch.cuda.current_stream())
-        return AdvanceOutcome(written={"video": int(frames.shape[1])}, event=event)
+        return AdvanceOutcome(event=event)
 
     def close_session(self, state: "_SimSession") -> None:
         if state.decode_started:

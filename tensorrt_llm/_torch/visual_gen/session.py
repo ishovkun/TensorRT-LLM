@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import torch
@@ -33,10 +34,26 @@ import torch
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
 
-QUEUED = "queued"
-CURRENT = "current"
-HOST = "host"
-DEVICE = "device"
+
+class InputPolicy(str, Enum):
+    """How an input reaches an advance: ``QUEUED`` consumes one value per advance
+    and waits when none is there; ``CURRENT`` reads the newest value and never waits."""
+
+    QUEUED = "queued"
+    CURRENT = "current"
+
+
+class Placement(str, Enum):
+    """Where a stream is written: shared page-locked host memory or device memory."""
+
+    HOST = "host"
+    DEVICE = "device"
+
+
+QUEUED = InputPolicy.QUEUED
+CURRENT = InputPolicy.CURRENT
+HOST = Placement.HOST
+DEVICE = Placement.DEVICE
 
 DEFAULT_QUEUE_DEPTH = 8
 
@@ -64,23 +81,18 @@ class SessionLeaseExpired(SessionError):
 class InputSpec:
     """One named input the pipeline accepts during a session.
 
-    ``policy`` is ``"queued"`` (each advance consumes the next value; an empty queue
-    makes the worker wait) or ``"current"`` (each advance reads the newest value and
-    never waits). ``validate`` runs on rank 0 before admission and raises
-    ``ValueError`` for a bad value. ``queue_depth`` bounds a queued input;
-    ``max_bytes`` bounds one value of either kind (``None`` means unbounded).
+    ``validate`` runs on rank 0 before admission and raises ``ValueError`` for a
+    bad value. ``queue_depth`` bounds a queued input.
     """
 
     name: str
-    policy: str = QUEUED
+    policy: InputPolicy = InputPolicy.QUEUED
     validate: Optional[Callable[[Any], None]] = None
     default: Any = None
     queue_depth: int = DEFAULT_QUEUE_DEPTH
-    max_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
-        if self.policy not in (QUEUED, CURRENT):
-            raise ValueError(f"input {self.name!r}: policy must be {QUEUED!r} or {CURRENT!r}")
+        object.__setattr__(self, "policy", InputPolicy(self.policy))
         if self.queue_depth < 1:
             raise ValueError(f"input {self.name!r}: queue_depth must be at least 1")
 
@@ -91,9 +103,7 @@ class StreamSpec:
 
     ``max_shape`` is the largest tensor one result may carry for this stream; the
     slot pool sizes its buffers from it. ``axis`` is the dimension counted by
-    ``position`` (frames, samples or predictions). ``placement`` says where the
-    pipeline writes the stream: ``"host"`` (shared, page-locked host memory) or
-    ``"device"``.
+    ``position`` (frames, samples or predictions).
     """
 
     name: str
@@ -102,11 +112,10 @@ class StreamSpec:
     max_shape: Tuple[int, ...]
     axis: int = 1
     rate: Optional[float] = None
-    placement: str = HOST
+    placement: Placement = Placement.HOST
 
     def __post_init__(self) -> None:
-        if self.placement not in (HOST, DEVICE):
-            raise ValueError(f"stream {self.name!r}: placement must be {HOST!r} or {DEVICE!r}")
+        object.__setattr__(self, "placement", Placement(self.placement))
         if not self.max_shape or any(int(d) <= 0 for d in self.max_shape):
             raise ValueError(f"stream {self.name!r}: max_shape must be non-empty and positive")
         if not 0 <= self.axis < len(self.max_shape):
@@ -175,10 +184,9 @@ class SessionCapabilities:
             "inputs": [
                 {
                     "name": s.name,
-                    "policy": s.policy,
+                    "policy": s.policy.value,
                     "default": s.default,
                     "queue_depth": s.queue_depth,
-                    "max_bytes": s.max_bytes,
                 }
                 for s in self.inputs
             ],
@@ -190,7 +198,7 @@ class SessionCapabilities:
                     "max_shape": tuple(s.max_shape),
                     "axis": s.axis,
                     "rate": s.rate,
-                    "placement": s.placement,
+                    "placement": s.placement.value,
                 }
                 for s in self.streams
             ],
@@ -204,13 +212,11 @@ class SessionCapabilities:
 class AdvanceOutcome:
     """What ``pipeline.advance`` (and ``open_session``) hands back to the executor.
 
-    ``written`` maps each stream the pipeline wrote in the slot to the number of
-    units along the stream's axis. ``event`` is a CUDA event recorded after every
-    write into the slot, or ``None`` when all writes have completed on return.
-    ``done`` ends the session after this result.
+    ``event`` is a CUDA event recorded after every write into the slot, or ``None``
+    when all writes have completed on return. ``done`` ends the session after this
+    result. What was written is recorded by the slot itself.
     """
 
-    written: Dict[str, int] = field(default_factory=dict)
     event: Optional[torch.cuda.Event] = None
     done: bool = False
 
@@ -242,9 +248,6 @@ class SessionClose:
     session_id: int
 
 
-SessionCommand = (SessionOpen, SessionSubmit, SessionSlotReturn, SessionClose)
-
-
 @dataclass
 class SessionOpened:
     session_id: int
@@ -265,15 +268,15 @@ class SessionAdmitted:
 
 @dataclass
 class SessionResultMessage:
-    """One result. ``streams`` maps a stream name to ``(shape, dtype_str, nbytes)``
-    inside ``slots[slot_id][name]``; ``position`` maps it to ``(start, count)``.
-    The terminal result has ``slot_id=None`` and no streams."""
+    """One result. ``streams`` maps a stream name to the ``(shape, dtype)`` written
+    in ``slots[slot_id][name]``; ``position`` maps it to ``(start, count)``. The
+    terminal result has ``slot_id=None`` and no streams."""
 
     session_id: int
     sequence: int
     advance_index: Optional[int]
     slot_id: Optional[int]
-    streams: Dict[str, Tuple[Tuple[int, ...], str, int]]
+    streams: Dict[str, Tuple[Tuple[int, ...], str]]
     position: Dict[str, Tuple[int, int]]
     done: bool = False
     error: Optional[str] = None
@@ -302,7 +305,7 @@ class SessionState:
         self.session_id = session_id
         self.capabilities = capabilities
         self.queues: Dict[str, Deque[Any]] = {s.name: deque() for s in capabilities.queued_inputs}
-        self.queued_count: Dict[str, int] = {s.name: 0 for s in capabilities.queued_inputs}
+        self.admitted: Dict[str, int] = {s.name: 0 for s in capabilities.queued_inputs}
         self.live: Dict[str, Any] = {s.name: s.default for s in capabilities.live_inputs}
         self.next_advance = 0
         self.next_sequence = 0
@@ -324,41 +327,24 @@ class SessionState:
                 + ("closing" if self.closing else "a terminal result exists")
             )
         spec = self.capabilities.input(name)
-        if spec.max_bytes is not None:
-            nbytes = _value_nbytes(value)
-            if nbytes is not None and nbytes > spec.max_bytes:
-                raise ValueError(
-                    f"input {name!r}: value of {nbytes} bytes exceeds max_bytes {spec.max_bytes}"
-                )
         if spec.validate is not None:
             spec.validate(value)
-        if spec.policy == QUEUED:
-            length = self.capabilities.length
-            if length is not None and self.queued_count[name] >= length:
-                raise SessionEnded(
-                    f"input {name!r}: all {length} values of a finite session are already queued"
-                )
-            if len(self.queues[name]) >= spec.queue_depth:
-                raise SessionQueueFull(
-                    f"input {name!r}: queue holds {spec.queue_depth} values; retry after the next advance"
-                )
-            index = self.queued_count[name]
-            self.queues[name].append(value)
-            self.queued_count[name] = index + 1
-            return index
-        self.live[name] = value
-        return self.next_advance
-
-    def fill_queue(self, name: str, values: List[Any]) -> None:
-        """Admit a recorded input list at open; the input then accepts no later submit."""
-        spec = self.capabilities.input(name)
-        if spec.policy != QUEUED:
-            raise ValueError(f"input {name!r} is not queued; a recorded list needs a queued input")
-        for value in values:
-            if spec.validate is not None:
-                spec.validate(value)
-            self.queues[name].append(value)
-        self.queued_count[name] += len(values)
+        if spec.policy is InputPolicy.CURRENT:
+            self.live[name] = value
+            return self.next_advance
+        length = self.capabilities.length
+        if length is not None and self.admitted[name] >= length:
+            raise SessionEnded(
+                f"input {name!r}: all {length} values of a finite session are already queued"
+            )
+        if len(self.queues[name]) >= spec.queue_depth:
+            raise SessionQueueFull(
+                f"input {name!r}: queue holds {spec.queue_depth} values; retry after the next advance"
+            )
+        index = self.admitted[name]
+        self.queues[name].append(value)
+        self.admitted[name] = index + 1
+        return index
 
     # ---- advance
 
@@ -396,36 +382,30 @@ class SessionState:
         self,
         advance_index: Optional[int],
         slot_id: int,
-        written: Dict[str, int],
-        shapes: Dict[str, Tuple[Tuple[int, ...], torch.dtype, int]],
+        written: Dict[str, Tuple[Tuple[int, ...], torch.dtype]],
     ) -> SessionResultMessage:
-        """Validate what the pipeline wrote against the capabilities and build the
-        message; assigns each stream's start from its cursor and moves the cursor."""
+        """Build the message for what the slot recorded as written (stream name to
+        shape and dtype), checking each stream against its declaration; assigns each
+        stream's start from its cursor and moves the cursor by the shape's extent
+        along the stream axis."""
         caps = self.capabilities
         if not written:
             raise ValueError("a media result must carry at least one stream")
-        streams: Dict[str, Tuple[Tuple[int, ...], str, int]] = {}
+        streams: Dict[str, Tuple[Tuple[int, ...], str]] = {}
         position: Dict[str, Tuple[int, int]] = {}
-        for name, count in written.items():
+        for name, (shape, dtype) in written.items():
             spec = caps.stream(name)
-            if name not in shapes:
-                raise ValueError(f"stream {name!r} reported as written but nothing was written")
-            shape, dtype, nbytes = shapes[name]
             if dtype != spec.dtype:
                 raise ValueError(f"stream {name!r}: wrote {dtype}, declared {spec.dtype}")
             if len(shape) != len(spec.max_shape) or any(
                 int(a) > int(b) for a, b in zip(shape, spec.max_shape)
             ):
                 raise ValueError(f"stream {name!r}: shape {tuple(shape)} exceeds {spec.max_shape}")
-            if int(count) != int(shape[spec.axis]):
-                raise ValueError(
-                    f"stream {name!r}: reported {count} units but wrote {shape[spec.axis]} "
-                    f"along axis {spec.axis}"
-                )
-            streams[name] = (tuple(int(d) for d in shape), str(dtype), int(nbytes))
+            count = int(shape[spec.axis])
+            streams[name] = (tuple(int(d) for d in shape), str(dtype))
             start = self.cursors[name]
-            position[name] = (start, int(count))
-            self.cursors[name] = start + int(count)
+            position[name] = (start, count)
+            self.cursors[name] = start + count
         message = SessionResultMessage(
             session_id=self.session_id,
             sequence=self.next_sequence,
@@ -456,14 +436,6 @@ class SessionState:
     def discard_inputs(self) -> None:
         for queue in self.queues.values():
             queue.clear()
-
-
-def _value_nbytes(value: Any) -> Optional[int]:
-    if isinstance(value, torch.Tensor):
-        return value.numel() * value.element_size()
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return len(value)
-    return None
 
 
 def torch_dtype_from_str(name: str) -> torch.dtype:

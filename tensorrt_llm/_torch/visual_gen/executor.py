@@ -898,12 +898,9 @@ class DiffusionExecutor:
             SessionOpened(session_id, capabilities=caps.public(), slots=pool.export_handles())
         )
         if initial_slot is not None:
-            if outcome.written:
-                self.response_queue.put(
-                    state.media_result(
-                        None, initial_slot.slot_id, outcome.written, initial_slot.written()
-                    )
-                )
+            written = initial_slot.written()
+            if written:
+                self.response_queue.put(state.media_result(None, initial_slot.slot_id, written))
             else:
                 pool.release(initial_slot.slot_id)
         if outcome.done:
@@ -973,9 +970,10 @@ class DiffusionExecutor:
                 state.terminal_result(error=error or f"advance {index} failed on another rank")
             )
             return
-        if outcome.written:
+        written = slot.written()
+        if written:
             try:
-                message = state.media_result(index, slot.slot_id, outcome.written, slot.written())
+                message = state.media_result(index, slot.slot_id, written)
             except ValueError as e:
                 pool.release(slot.slot_id)
                 self.response_queue.put(state.terminal_result(error=str(e)))

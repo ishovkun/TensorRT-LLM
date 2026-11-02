@@ -24,13 +24,14 @@ memory shared through CUDA IPC.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-from tensorrt_llm._torch.visual_gen.session import DEVICE, SessionCapabilities, StreamSpec
+from tensorrt_llm._torch.visual_gen.session import Placement, SessionCapabilities, StreamSpec
 from tensorrt_llm.logger import logger
 
 
@@ -80,9 +81,10 @@ class DeliverySlot:
         buf.shape, buf.dtype, buf.nbytes = shape, dtype, nbytes
         return buf.storage[:nbytes].view(dtype).view(shape)
 
-    def written(self) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype, int]]:
+    def written(self) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype]]:
+        """Stream name to the shape and dtype written since the last reset."""
         return {
-            name: (buf.shape, buf.dtype, buf.nbytes)
+            name: (buf.shape, buf.dtype)
             for name, buf in self._buffers.items()
             if buf.shape is not None
         }
@@ -125,7 +127,7 @@ class SlotPool:
         self._free.reverse()  # reserve() pops from the end: slot 0 first
 
     def _allocate(self, spec: StreamSpec) -> _StreamBuffer:
-        if spec.placement == DEVICE:
+        if spec.placement is Placement.DEVICE:
             storage = torch.empty(spec.max_bytes, dtype=torch.uint8, device=self.device)
         else:
             storage = torch.empty(spec.max_bytes, dtype=torch.uint8)
@@ -227,8 +229,9 @@ class ClientSlotMap:
         return len(self._views)
 
     def view(
-        self, slot_id: int, name: str, shape: Tuple[int, ...], dtype: torch.dtype, nbytes: int
+        self, slot_id: int, name: str, shape: Tuple[int, ...], dtype: torch.dtype
     ) -> torch.Tensor:
+        nbytes = math.prod(int(d) for d in shape) * dtype.itemsize
         storage = self._views[slot_id][name]
         return storage[:nbytes].view(dtype).view(tuple(shape))
 

@@ -489,10 +489,10 @@ class BasePipeline(nn.Module):
     def advance(self, state: Any, inputs: Dict[str, Any], slot: "DeliverySlot") -> "AdvanceOutcome":
         """One unit of work. ``inputs`` holds one value per queued input and the
         current value of every live input. Write each produced stream into
-        ``slot.buffer(name, shape, dtype)`` and return the counts written, a CUDA
-        event recorded after the last write (``None`` when every write has
-        completed on return) and ``done``. Advances never overlap; a non-final
-        outcome must contain at least one stream."""
+        ``slot.buffer(name, shape, dtype)``; the slot records what was written.
+        Return a CUDA event recorded after the last write (``None`` when every
+        write has completed on return) and ``done``. Advances never overlap; a
+        non-final advance must write at least one stream."""
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def close_session(self, state: Any) -> None:

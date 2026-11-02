@@ -73,6 +73,8 @@ def test_capabilities_reject_bad_declarations():
     with pytest.raises(ValueError):
         InputSpec("x", "sometimes")
     with pytest.raises(ValueError):
+        StreamSpec("v", "video", torch.uint8, (1, 2), placement="pinned")
+    with pytest.raises(ValueError):
         StreamSpec("v", "video", torch.uint8, (0, 1))
     with pytest.raises(ValueError):
         StreamSpec("v", "video", torch.uint8, (1, 2), axis=5)
@@ -92,6 +94,7 @@ def test_public_form_is_picklable_and_callable_free():
     assert public["inputs"][0]["policy"] == "queued"
     assert public["streams"][0]["dtype"] == "torch.uint8"
     assert public["lockstep"] is True
+    assert public["streams"][0]["placement"] == "host"
     assert "validate" not in public["inputs"][0]
 
 
@@ -146,7 +149,8 @@ def test_advance_condition():
 def test_finite_session_exhausts_and_refuses_extra_values():
     state = SessionState(1, lockstep_caps(initial=False, length=2))
     state.initialized = True
-    state.fill_queue("controls", [1, 2])
+    assert state.admit("controls", 1) == 0
+    assert state.admit("controls", 2) == 1
     with pytest.raises(SessionEnded):
         state.admit("controls", 3)
     for _ in range(2):
@@ -176,23 +180,23 @@ def test_admission_refused_after_terminal_and_while_closing():
 
 def test_media_result_validates_and_advances_cursors():
     state = SessionState(3, steered_caps())
-    shapes = {
-        "video": ((1, 8, 4, 6, 3), torch.uint8, 8 * 4 * 6 * 3),
-        "audio": ((1, 2, 1000), torch.float32, 2 * 1000 * 4),
+    written = {
+        "video": ((1, 8, 4, 6, 3), torch.uint8),
+        "audio": ((1, 2, 1000), torch.float32),
     }
-    first = state.media_result(0, 0, {"video": 8, "audio": 1000}, shapes)
+    first = state.media_result(0, 0, written)
     assert first.sequence == 0 and first.advance_index == 0 and first.slot_id == 0
     assert first.position == {"video": (0, 8), "audio": (0, 1000)}
-    assert first.streams["video"] == ((1, 8, 4, 6, 3), "torch.uint8", 576)
-    second = state.media_result(1, 1, {"video": 8}, {"video": shapes["video"]})
+    assert first.streams["video"] == ((1, 8, 4, 6, 3), "torch.uint8")
+    second = state.media_result(1, 1, {"video": written["video"]})
     assert second.sequence == 1
     assert second.position == {"video": (8, 8)}  # audio omitted: its cursor stays
     with pytest.raises(ValueError):
-        state.media_result(2, 0, {"video": 7}, {"video": shapes["video"]})  # count mismatch
+        state.media_result(2, 0, {"video": ((1, 9, 4, 6, 3), torch.uint8)})  # over max_shape
     with pytest.raises(ValueError):
-        state.media_result(2, 0, {"video": 8}, {"video": ((1, 9, 4, 6, 3), torch.uint8, 1)})
+        state.media_result(2, 0, {"video": ((1, 8, 4, 6, 3), torch.float32)})  # wrong dtype
     with pytest.raises(ValueError):
-        state.media_result(2, 0, {}, {})
+        state.media_result(2, 0, {})
     terminal = state.terminal_result()
     assert terminal.done and terminal.error is None and terminal.sequence == 2
     assert state.terminal_result() is terminal  # exactly one
@@ -211,7 +215,7 @@ def test_slot_pool_reserve_release_and_views():
     assert pool.reserve() is None
     view = a.buffer("video", (1, 8, 4, 6, 3), torch.uint8)
     view.fill_(7)
-    assert a.written()["video"] == ((1, 8, 4, 6, 3), torch.uint8, 576)
+    assert a.written()["video"] == ((1, 8, 4, 6, 3), torch.uint8)
     with pytest.raises(ValueError):
         a.buffer("video", (1, 9, 4, 6, 3), torch.uint8)
     with pytest.raises(ValueError):
@@ -232,8 +236,8 @@ def test_client_map_sees_the_worker_write_without_a_copy():
     worker_view = slot.buffer("video", (1, 2, 4, 6, 3), torch.uint8)
     worker_view.fill_(0)
     worker_view[0, 1] = 9
-    shape, dtype, nbytes = slot.written()["video"]
-    client_view = client.view(0, "video", shape, dtype, nbytes)
+    shape, dtype = slot.written()["video"]
+    client_view = client.view(0, "video", shape, dtype)
     assert client_view.shape == (1, 2, 4, 6, 3)
     assert int(client_view[0, 1, 0, 0, 0]) == 9 and int(client_view[0, 0, 0, 0, 0]) == 0
     assert client_view.data_ptr() == worker_view.data_ptr()  # same process, same bytes
@@ -243,4 +247,4 @@ def test_client_map_sees_the_worker_write_without_a_copy():
 
 def test_outcome_defaults():
     outcome = AdvanceOutcome()
-    assert outcome.written == {} and outcome.event is None and not outcome.done
+    assert outcome.event is None and not outcome.done

@@ -455,9 +455,9 @@ class VisualGenSession:
     def _build_result(self, message: SessionResultMessage) -> SessionResult:
         outputs: Dict[str, torch.Tensor] = {}
         if message.slot_id is not None and self._channel.slots is not None:
-            for name, (shape, dtype_name, nbytes) in message.streams.items():
+            for name, (shape, dtype_name) in message.streams.items():
                 outputs[name] = self._channel.slots.view(
-                    message.slot_id, name, tuple(shape), torch_dtype_from_str(dtype_name), nbytes
+                    message.slot_id, name, tuple(shape), torch_dtype_from_str(dtype_name)
                 )
         return SessionResult(
             self.request_id,
