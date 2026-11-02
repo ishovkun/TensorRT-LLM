@@ -27,6 +27,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 import torch
+from diffusers.utils.torch_utils import randn_tensor
 
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
@@ -35,11 +36,13 @@ from tensorrt_llm.math_utils import ceil_div
 from ...cache import BlockCausalKVCacheManager, RolloutSpec
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from ...pipeline_registry import register_pipeline
-from ...utils import postprocess_video_tensor
+from ...session import QUEUED, AdvanceOutcome, InputSpec, SessionCapabilities, StreamSpec
+from ...utils import make_noise_generator, postprocess_video_tensor
 from ..wan.vae_loader import load_wan_vae
-from .action import normalize_action_mode
+from .action import load_action_tensor, normalize_action_mode, pad_action_to_dim
 from .config_resolver import Cosmos3Config
 from .defaults import VIDEO_RES_SIZE_INFO
+from .guardrails import check_video_safety
 from .pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from .sim_packing import SIM_CONFIG_KEY
 
@@ -268,6 +271,70 @@ class _ChunkDecoder:
             )
         video, self.host = self.host, None
         return video
+
+
+@dataclass
+class _SimRollout:
+    """One open rollout: the request, the opened K/V cache and what every chunk needs."""
+
+    request: Any
+    prepared: Any
+    seed: int
+    kv_cache: BlockCausalKVCacheManager
+    text_len: int
+    tokens_per_frame: int
+    history_frames: int
+    latent_shape: tuple[int, int, int]
+    offload: Any
+
+
+@dataclass
+class _SimSessionSetup:
+    request: Any
+    prompt: str
+    negative_prompt: Optional[str]
+    seed: int
+    use_guardrails: bool
+    use_duration_template: bool
+    use_resolution_template: bool
+
+
+class _SimSession:
+    """Pipeline-side state of one session: the rollout, the chunk ranges still to
+    run, the embodiment and the streaming decoder's lifetime."""
+
+    def __init__(self, *, rollout, ranges, domain_id, use_guardrails, remaining, device):
+        self.rollout = rollout
+        self.device = device
+        self._ranges = ranges
+        self._pending: Optional[tuple[int, int]] = None
+        self.domain_id = domain_id
+        self.use_guardrails = use_guardrails
+        self.remaining = remaining
+        self.decode_started = False
+        self.closed = False
+
+    def peek_range(self) -> tuple[int, int]:
+        if self._pending is None:
+            self._pending = next(self._ranges)
+        return self._pending
+
+    def take_range(self) -> tuple[int, int]:
+        r = self.peek_range()
+        self._pending = None
+        return r
+
+    def domain_tensor(self, count: int) -> torch.Tensor:
+        return torch.full((count,), self.domain_id, dtype=torch.long, device=self.device)
+
+
+def _rows_tensor(value) -> torch.Tensor:
+    """Action rows as a float ``[rows, width]`` tensor, from a tensor, a list of rows
+    or a NumPy array."""
+    rows = load_action_tensor(value)
+    if rows.ndim != 2:
+        raise ValueError(f"actions must be a [rows, width] array, got shape {tuple(rows.shape)}")
+    return rows
 
 
 @register_pipeline(
@@ -599,6 +666,135 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         )
         return self._kv_cache
 
+    def _chunk_generator(self, seed: int, first_frame: int) -> torch.Generator:
+        """The random stream of one chunk, seeded by the request seed and the chunk's
+        first latent frame: a chunk draws the same noise whether the rollout runs as
+        one request or as a session advanced one chunk at a time."""
+        return make_noise_generator(int(seed) + first_frame, self.device)
+
+    def _rollout_begin(self, request, prepared, *, cond_ids, cond_mask, seed) -> "_SimRollout":
+        """Open the rollout: the prompt's K/V once, then the cache is ready for chunks."""
+        if prepared.video_latents is None:
+            raise RuntimeError("Cosmos3 Sim request reached the rollout without latents.")
+        if request.enable_audio:
+            raise ValueError("Cosmos3 Sim does not generate audio.")
+        sim, tf = self.sim, self.transformer
+        _, C, _, H, W = prepared.video_latents.shape
+        Hp, Wp, _, _ = tf._pad_to_patch_size(H, W)
+        A = sim.action_tokens_per_frame
+        tokens_per_frame = A + Hp * Wp
+        kv_cache = self._kv_cache_manager()
+        history_frames = self._history_frames_for(tokens_per_frame)
+        tf.reset_cache()
+        text_len = int(cond_mask.sum().item())
+        if text_len > sim.text_cache_max_len:
+            raise ValueError(
+                f"prompt of {text_len} tokens exceeds the checkpoint's text cache of "
+                f"{sim.text_cache_max_len} tokens"
+            )
+        offload = self.offloader.context_if_requested
+        kv_cache.open(
+            self._rollout_spec(history_frames, tokens_per_frame),
+            pin_tokens=text_len + sim.sink_frames * tokens_per_frame,
+        )
+        try:
+            tf.write_prompt_kv(kv_cache, cond_ids, cond_mask, offload_context=offload)
+            kv_cache.commit(text_len)
+        except Exception:
+            kv_cache.close()
+            raise
+        return _SimRollout(
+            request=request,
+            prepared=prepared,
+            seed=int(seed),
+            kv_cache=kv_cache,
+            text_len=text_len,
+            tokens_per_frame=tokens_per_frame,
+            history_frames=history_frames,
+            latent_shape=(C, H, W),
+            offload=offload,
+        )
+
+    def _rollout_chunk(
+        self,
+        ro: "_SimRollout",
+        f0: int,
+        f1: int,
+        chunk_actions: torch.Tensor,
+        domain: torch.Tensor,
+        *,
+        commit: bool,
+    ) -> torch.Tensor:
+        """Denoise latent frames ``[f0, f1)`` against the committed history and, with
+        ``commit``, run the clean pass that writes their K/V. Frames the request
+        conditions (the first image) are pinned through the velocity mask. Returns the
+        chunk's clean latents ``[1, C, f1 - f0, H, W]``."""
+        sim, tf, kv_cache = self.sim, self.transformer, ro.kv_cache
+        request, prepared = ro.request, ro.prepared
+        k = f1 - f0
+        C, H, W = ro.latent_shape
+        generator = self._chunk_generator(ro.seed, f0)
+        x = randn_tensor((1, C, k, H, W), generator=generator, device=self.device, dtype=self.dtype)
+        mask = None
+        cond = None
+        if (
+            prepared.velocity_mask is not None
+            and prepared.condition_latents is not None
+            and f0 < prepared.velocity_mask.shape[2]
+        ):
+            n = min(f1, prepared.velocity_mask.shape[2]) - f0
+            mask = torch.ones((1, 1, k, 1, 1), device=self.device, dtype=self.dtype)
+            mask[:, :, :n] = prepared.velocity_mask[:, :, f0 : f0 + n]
+            cond = torch.zeros_like(x)
+            cond[:, :, :n] = prepared.condition_latents[:, :, f0 : f0 + n]
+            x = mask * x + (1.0 - mask) * cond
+        if mask is None or bool((mask > 0).any()):
+            # The scheduler restarts per chunk: same noise levels, this chunk's SDE noise.
+            steps = len(sim.sigmas)
+            self.sampling.set_timesteps(self.scheduler, steps, device=self.device)
+            step_kwargs = self.sampling.scheduler_step_kwargs(generator)
+            for t in self.scheduler.timesteps:
+                t_vec = t.reshape(1).to(self.device)
+                out = tf.forward_causal(
+                    x,
+                    t_vec,
+                    kv_cache=kv_cache,
+                    first_frame=f0,
+                    text_len=ro.text_len,
+                    action_latents=chunk_actions,
+                    action_domain_ids=domain,
+                    fps=request.frame_rate,
+                    action_fps=request.action_fps,
+                    timestep=t_vec / self.scheduler.config.num_train_timesteps,
+                    offload_context=ro.offload,
+                )
+                velocity = out.video if mask is None else out.video * mask
+                x = self.scheduler.step(velocity, t, x, return_dict=False, **step_kwargs)[0]
+                if mask is not None:
+                    x = mask * x + (1.0 - mask) * cond
+        if commit:
+            zero_t = torch.zeros(1, device=self.device)
+            tf.forward_causal(
+                x,
+                zero_t,
+                kv_cache=kv_cache,
+                first_frame=f0,
+                text_len=ro.text_len,
+                action_latents=chunk_actions,
+                action_domain_ids=domain,
+                clean_pass=True,
+                fps=request.frame_rate,
+                action_fps=request.action_fps,
+                timestep=zero_t,
+                offload_context=ro.offload,
+            )
+            kv_cache.commit()
+        return x
+
+    def _rollout_end(self, ro: "_SimRollout") -> None:
+        ro.kv_cache.close()
+        self._release_scheduler_solver_state()
+
     def _denoise_request(
         self,
         request,
@@ -611,96 +807,41 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         generator: torch.Generator,
         timer,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], bool]:
-        """The chunked causal rollout: the prompt's K/V once, then per chunk the fixed
-        denoising schedule with the cache read-only, the clean pass that writes the
-        finished frames' K/V, and a commit. The last latent frame gets no clean pass:
-        nothing reads it."""
+        """The chunked causal rollout of one request: the prompt's K/V once, then per
+        chunk the fixed denoising schedule with the cache read-only, the clean pass
+        that writes the finished frames' K/V, and a commit. The last latent frame gets
+        no clean pass: nothing reads it."""
         del uncond_ids, uncond_mask  # guidance is 1 on a distilled checkpoint
-        if prepared.video_latents is None:
-            raise RuntimeError("Cosmos3 Sim request reached the rollout without latents.")
-        if request.enable_audio:
-            raise ValueError("Cosmos3 Sim does not generate audio.")
-        sim, tf = self.sim, self.transformer
+        sim = self.sim
         latents = prepared.video_latents
-        _, _, num_latent_frames, H, W = latents.shape
-        Hp, Wp, _, _ = tf._pad_to_patch_size(H, W)
+        if latents is None:
+            raise RuntimeError("Cosmos3 Sim request reached the rollout without latents.")
+        num_latent_frames = latents.shape[2]
         A = sim.action_tokens_per_frame
-        tokens_per_frame = A + Hp * Wp
         actions, domains = self._sim_action_rows(request, prepared, num_latent_frames, A, latents)
-        velocity_mask = prepared.velocity_mask
-        offload = self.offloader.context_if_requested
-
-        kv_cache = self._kv_cache_manager()
-        history_frames = self._history_frames_for(tokens_per_frame)
-        self._check_history_fits(num_latent_frames, history_frames)
-        tf.reset_cache()
         timer.mark_denoise_start()
-        text_len = int(cond_mask.sum().item())
-        if text_len > sim.text_cache_max_len:
-            raise ValueError(
-                f"prompt of {text_len} tokens exceeds the checkpoint's text cache of "
-                f"{sim.text_cache_max_len} tokens"
-            )
-        decoder = self._start_chunk_decode(latents)
-        with kv_cache.open(
-            self._rollout_spec(history_frames, tokens_per_frame),
-            pin_tokens=text_len + sim.sink_frames * tokens_per_frame,
-        ):
-            tf.write_prompt_kv(kv_cache, cond_ids, cond_mask, offload_context=offload)
-            kv_cache.commit(text_len)
-            steps = len(sim.sigmas)
-            step_kwargs = self.sampling.scheduler_step_kwargs(generator)
-            zero_t = torch.zeros(1, device=self.device)
+        ro = self._rollout_begin(
+            request, prepared, cond_ids=cond_ids, cond_mask=cond_mask, seed=generator.initial_seed()
+        )
+        try:
+            self._check_history_fits(num_latent_frames, ro.history_frames)
+            decoder = self._start_chunk_decode(latents)
             for f0, f1 in sim.chunk_ranges(num_latent_frames):
-                x = latents[:, :, f0:f1]
-                chunk_actions = actions[:, f0 * A : f1 * A]
-                domain = domains[f0 * A : f1 * A]
-                mask = velocity_mask[:, :, f0:f1] if velocity_mask is not None else None
-                if mask is None or bool((mask > 0).any()):
-                    # The scheduler restarts per chunk: same four noise levels,
-                    # fresh SDE noise from the request's generator.
-                    self.sampling.set_timesteps(self.scheduler, steps, device=self.device)
-                    for t in self.scheduler.timesteps:
-                        t_vec = t.reshape(1).to(self.device)
-                        out = tf.forward_causal(
-                            x,
-                            t_vec,
-                            kv_cache=kv_cache,
-                            first_frame=f0,
-                            text_len=text_len,
-                            action_latents=chunk_actions,
-                            action_domain_ids=domain,
-                            fps=request.frame_rate,
-                            action_fps=request.action_fps,
-                            timestep=t_vec / self.scheduler.config.num_train_timesteps,
-                            offload_context=offload,
-                        )
-                        velocity = out.video if mask is None else out.video * mask
-                        x = self.scheduler.step(velocity, t, x, return_dict=False, **step_kwargs)[0]
-                        if mask is not None and prepared.condition_latents is not None:
-                            x = mask * x + (1.0 - mask) * prepared.condition_latents[:, :, f0:f1]
+                x = self._rollout_chunk(
+                    ro,
+                    f0,
+                    f1,
+                    actions[:, f0 * A : f1 * A],
+                    domains[f0 * A : f1 * A],
+                    commit=f1 < num_latent_frames,
+                )
                 latents[:, :, f0:f1] = x
                 if decoder is not None:
                     decoder.submit(latents[:, :, f0:f1])
-                if f1 < num_latent_frames:
-                    tf.forward_causal(
-                        x,
-                        zero_t,
-                        kv_cache=kv_cache,
-                        first_frame=f0,
-                        text_len=text_len,
-                        action_latents=chunk_actions,
-                        action_domain_ids=domain,
-                        clean_pass=True,
-                        fps=request.frame_rate,
-                        action_fps=request.action_fps,
-                        timestep=zero_t,
-                        offload_context=offload,
-                    )
-                    kv_cache.commit()
+        finally:
+            self._rollout_end(ro)
         if decoder is not None:
             self._decoded_video = decoder.finish()
-        self._release_scheduler_solver_state()
         return latents, None, prepared.action_latents, False
 
     # ------------------------------------------------------------------ chunk VAE decode
@@ -710,18 +851,23 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         the VAE is the native streaming decoder; otherwise the usual decode after the
         rollout applies."""
         self._decoded_video = None
-        vae = self.vae
-        if (
-            self._parallel_vae_enabled
-            or self.rank != 0
-            or not hasattr(vae, "decode_stream_step")
-            or self.offloader.stages()
-        ):
+        if not self._streams_decode():
             return None
         if self._decode_device is not None and self._decode_stream is None:
             self._decode_stream = torch.cuda.Stream(device=self._decode_device)
         num_pixel_frames = (latents.shape[2] - 1) * self.vae_scale_factor_temporal + 1
-        return _ChunkDecoder(self, self._decode_vae or vae, self._decode_stream, num_pixel_frames)
+        return _ChunkDecoder(
+            self, self._decode_vae or self.vae, self._decode_stream, num_pixel_frames
+        )
+
+    def _streams_decode(self) -> bool:
+        """Whether this rank decodes finished chunks itself with the streaming VAE."""
+        return (
+            not self._parallel_vae_enabled
+            and self.rank == 0
+            and hasattr(self.vae, "decode_stream_step")
+            and not self.offloader.stages()
+        )
 
     def _decode_latents(self, latents):
         video = self._decoded_video
@@ -729,6 +875,292 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             return super()._decode_latents(latents)
         self._decoded_video = None
         return video
+
+    # ------------------------------------------------------------------ sessions
+
+    @property
+    def supports_sessions(self) -> bool:
+        return True
+
+    def _session_setup(self, req) -> "_SimSessionSetup":
+        """Resolve a session request the way ``infer`` resolves a generation request:
+        action rows condition the rollout (forward dynamics), the first image is the
+        first frame, and the frame geometry comes from the request or the mode table.
+        Nothing here touches the GPU."""
+        params = req.params
+        extra = params.extra_params or {}
+        specified = params.model_fields_set
+
+        def as_given(name):
+            value = getattr(params, name)
+            return value if name in specified else None
+
+        refs_i = params.image_reference
+        image = refs_i[0].content if refs_i else None
+        latent = sum(self.sim.chunk_partition) + 1
+        num_frames = (latent - 1) * self.vae_scale_factor_temporal + 1
+        request = self._resolve_request(
+            image=image,
+            height=as_given("height"),
+            width=as_given("width"),
+            num_frames=num_frames,
+            num_inference_steps=as_given("num_inference_steps"),
+            guidance_scale=as_given("guidance_scale"),
+            max_sequence_length=params.max_sequence_length,
+            frame_rate=as_given("frame_rate"),
+            use_system_prompt=extra.get("use_system_prompt"),
+            enable_audio=False,
+            output_type="video",
+            video=None,
+            flow_shift=None,
+            action_mode="forward_dynamics",
+            domain_name=extra.get("domain_name"),
+            domain_id=extra.get("domain_id"),
+            raw_action_dim=extra.get("raw_action_dim"),
+            action_chunk_size=num_frames - 1,
+            use_state=None,
+            action_resolution=extra.get("action_resolution"),
+            action_fps=extra.get("action_fps"),
+            transfer_config=None,
+        )
+        if request.raw_action_dim is None:
+            raise ValueError("Cosmos3 Sim session needs the action width: name the embodiment")
+        if not self._streams_decode() and self.rank == 0:
+            raise ValueError(
+                "Cosmos3 Sim sessions decode each chunk with the streaming Wan VAE on rank 0; "
+                "parallel VAE and CPU offload are not supported with sessions"
+            )
+        return _SimSessionSetup(
+            request=request,
+            prompt=req.prompt[0],
+            negative_prompt=params.negative_prompt,
+            seed=int(params.seed),
+            use_guardrails=bool(extra.get("use_guardrails", True)),
+            use_duration_template=bool(extra.get("use_duration_template", False)),
+            use_resolution_template=bool(extra.get("use_resolution_template", False)),
+        )
+
+    def _session_ranges(self):
+        """Chunk ranges of an unbounded rollout, in order."""
+        sim = self.sim
+        f0 = 0
+        i = 0
+        while True:
+            size = sim.chunk_partition[i] if i < len(sim.chunk_partition) else sim.chunk_frames
+            yield f0, f0 + size
+            f0, i = f0 + size, i + 1
+
+    def _session_length(self, request) -> Optional[int]:
+        """Advances a session may run: open-ended with a configured window; with full
+        history, as many chunks as the cache holds frames for."""
+        if self.sim.history_frames is not None:
+            return None
+        if self._pool_tokens is None:
+            self._kv_cache_manager()  # sizes the pool when warmup did not
+        tokens_per_frame = self._tokens_per_frame(request.height, request.width)
+        history = self._history_frames_for(tokens_per_frame)
+        count = 0
+        for f0, f1 in self._session_ranges():
+            if f1 - 1 > history:
+                break
+            if f1 > 1:
+                count += 1
+        return count
+
+    def _action_rows_per_advance(self) -> tuple[int, ...]:
+        """Row counts one advance may take: generated frames of a chunk times the rows
+        per frame. The first chunk generates one frame fewer when it holds the image."""
+        sim = self.sim
+        A = sim.action_tokens_per_frame
+        counts = set()
+        for i, (f0, f1) in zip(range(len(sim.chunk_partition) + 1), self._session_ranges()):
+            generated = f1 - max(f0, 1)
+            if generated > 0:
+                counts.add(generated * A)
+        return tuple(sorted(counts))
+
+    def session_capabilities(self, req) -> SessionCapabilities:
+        setup = self._session_setup(req)
+        request = setup.request
+        sim = self.sim
+        width = int(request.raw_action_dim)
+        allowed = self._action_rows_per_advance()
+
+        def validate_rows(value):
+            rows = _rows_tensor(value)
+            if rows.shape[1] != width:
+                raise ValueError(f"actions: {rows.shape[1]} values per row, {width} expected")
+            if rows.shape[0] not in allowed:
+                raise ValueError(
+                    f"actions: {rows.shape[0]} rows; an advance takes one of {allowed}"
+                )
+
+        max_generated = max(allowed) // sim.action_tokens_per_frame
+        frames_per_advance = max_generated * self.vae_scale_factor_temporal
+        return SessionCapabilities(
+            inputs=(InputSpec("actions", QUEUED, validate=validate_rows),),
+            streams=(
+                StreamSpec(
+                    "video",
+                    "video",
+                    torch.uint8,
+                    (1, frames_per_advance, request.height, request.width, 3),
+                    axis=1,
+                    rate=float(request.frame_rate),
+                ),
+            ),
+            initial_result=True,
+            length=self._session_length(request),
+            lockstep=True,
+        )
+
+    def open_session(self, req, initial_slot):
+        setup = self._session_setup(req)
+        request = setup.request
+        if self._is_text_blocked([setup.prompt], setup.negative_prompt, setup.use_guardrails):
+            raise ValueError("Cosmos3 Sim session: the prompt was blocked by the guardrails")
+        generator = make_noise_generator(setup.seed, self.device)
+        cond_ids, cond_mask, _, _ = self._tokenize_request_prompts(
+            request,
+            [setup.prompt],
+            setup.negative_prompt,
+            use_duration_template=setup.use_duration_template,
+            use_resolution_template=setup.use_resolution_template,
+        )
+        # The prepared latents supply the image's latent and the conditioning mask of
+        # the first chunk; the rollout draws its own noise per chunk, and the rows here
+        # are placeholders the session replaces at every advance.
+        placeholder_rows = torch.zeros(request.action_chunk_size, int(request.raw_action_dim))
+        prepared = self._prepare_request_latents(
+            request,
+            video=None,
+            condition_video_latent_indexes=None,
+            condition_video_keep=None,
+            action=placeholder_rows,
+            generator=generator,
+        )
+        ro = self._rollout_begin(
+            request, prepared, cond_ids=cond_ids, cond_mask=cond_mask, seed=setup.seed
+        )
+        return self._session_start(
+            ro,
+            prepared,
+            initial_slot,
+            domain_id=int(prepared.action_domain_id or 0),
+            use_guardrails=setup.use_guardrails,
+            remaining=self._session_length(request),
+        )
+
+    def _session_start(
+        self,
+        ro: "_SimRollout",
+        prepared,
+        initial_slot,
+        *,
+        domain_id: int,
+        use_guardrails: bool,
+        remaining: Optional[int],
+    ) -> tuple["_SimSession", AdvanceOutcome]:
+        """From an open rollout to a session ready for its first advance: commit the
+        leading chunks that generate nothing (the image alone) and decode the first
+        frame into ``initial_slot``."""
+        session = _SimSession(
+            rollout=ro,
+            ranges=self._session_ranges(),
+            domain_id=domain_id,
+            use_guardrails=use_guardrails,
+            remaining=remaining,
+            device=self.device,
+        )
+        try:
+            A = self.sim.action_tokens_per_frame
+            while True:
+                f0, f1 = session.peek_range()
+                if f1 > 1:
+                    break
+                session.take_range()
+                self._rollout_chunk(
+                    ro,
+                    f0,
+                    f1,
+                    self._null_rows((f1 - f0) * A),
+                    session.domain_tensor((f1 - f0) * A),
+                    commit=True,
+                )
+            outcome = AdvanceOutcome()
+            if initial_slot is not None:
+                self.vae.decode_stream_start()
+                session.decode_started = True
+                image_latent = prepared.condition_latents[:, :, 0:1]
+                outcome = self._session_write_frames(session, image_latent, initial_slot)
+        except Exception:
+            self.close_session(session)
+            raise
+        return session, outcome
+
+    def validate_input(self, state, name, value) -> None:
+        del state, name  # the capability's validator already checked shape and width
+        rows = _rows_tensor(value)
+        if not torch.isfinite(rows).all():
+            raise ValueError("actions must be finite")
+
+    def advance(self, state: "_SimSession", inputs, slot) -> AdvanceOutcome:
+        sim, tf = self.sim, self.transformer
+        A = sim.action_tokens_per_frame
+        f0, f1 = state.take_range()
+        generated = f1 - max(f0, 1)
+        rows = _rows_tensor(inputs["actions"])
+        if rows.shape[0] != generated * A:
+            raise ValueError(
+                f"advance over latent frames [{f0}, {f1}) takes {generated * A} action rows "
+                f"({A} per generated frame), got {rows.shape[0]}"
+            )
+        padded = pad_action_to_dim(rows, int(tf.action_dim)).to(self.device, self.dtype)
+        if f0 == 0:
+            padded = torch.cat([self._null_rows(A)[0], padded], dim=0)
+        chunk_actions = padded.unsqueeze(0)
+        x = self._rollout_chunk(
+            state.rollout, f0, f1, chunk_actions, state.domain_tensor((f1 - f0) * A), commit=True
+        )
+        done = False
+        if state.remaining is not None:
+            state.remaining -= 1
+            done = state.remaining <= 0
+        if slot is None:
+            return AdvanceOutcome(done=done)
+        new_frames = x[:, :, (1 if f0 == 0 else 0) :]
+        outcome = self._session_write_frames(state, new_frames, slot)
+        outcome.done = done
+        return outcome
+
+    def _session_write_frames(self, state: "_SimSession", latents, slot) -> AdvanceOutcome:
+        """Decode latent frames with the streaming VAE straight into the slot."""
+        z = self._scale_latents_for_decode(latents)
+        frames = postprocess_video_tensor(self.vae.decode_stream_step(z))
+        if state.use_guardrails and getattr(self, "safety_checker", None) is not None:
+            frames = check_video_safety(frames, self.safety_checker)
+            if frames is None:
+                raise ValueError("Cosmos3 Sim session: the video was blocked by the guardrails")
+        view = slot.buffer("video", tuple(frames.shape), torch.uint8)
+        view.copy_(frames, non_blocking=True)
+        event = None
+        if frames.is_cuda:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream())
+        return AdvanceOutcome(written={"video": int(frames.shape[1])}, event=event)
+
+    def close_session(self, state: "_SimSession") -> None:
+        if state.decode_started:
+            self.vae.decode_stream_end()
+            state.decode_started = False
+        if not state.closed:
+            state.closed = True
+            self._rollout_end(state.rollout)
+
+    def _null_rows(self, count: int) -> torch.Tensor:
+        return torch.zeros(
+            1, count, self.transformer.action_dim, device=self.device, dtype=self.dtype
+        )
 
     def _sim_action_rows(
         self, request, prepared, num_latent_frames: int, A: int, latents: torch.Tensor
