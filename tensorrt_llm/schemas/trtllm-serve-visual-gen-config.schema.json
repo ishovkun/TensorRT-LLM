@@ -329,6 +329,53 @@
       "title": "CudaGraphConfig",
       "type": "object"
     },
+    "KVCacheConfig": {
+      "additionalProperties": false,
+      "description": "Budget for the K/V cache of autoregressive video models.\n\nThe cache holds the finished frames a chunk attends to. Its size is settled\nonce at startup: the pipeline warms up at the largest shape the checkpoint\nserves, measures the peak memory everything else needs, and gives the cache\nthis fraction of what is left.",
+      "properties": {
+        "attention_sink_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Leading latent frames kept visible for the whole rollout once the window slides past them. Requires kv_cache_inference_size. None: what the checkpoint declares.",
+          "status": "prototype",
+          "title": "Attention Sink Size"
+        },
+        "free_gpu_memory_fraction": {
+          "default": 0.9,
+          "description": "Fraction of the GPU memory left after the warmup peak that the K/V cache may take.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "status": "prototype",
+          "title": "Free Gpu Memory Fraction",
+          "type": "number"
+        },
+        "kv_cache_inference_size": {
+          "anyOf": [
+            {
+              "minimum": 2,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Latent frames each generated frame may attend to, counting the attention sinks and the frame itself: with 64 and 8 sinks, a frame sees the 8 sink frames and the 55 frames before it. None: what the checkpoint declares (Cosmos3 Sim: full history). Fixed for the engine's lifetime.",
+          "status": "prototype",
+          "title": "Kv Cache Inference Size"
+        }
+      },
+      "title": "KVCacheConfig",
+      "type": "object"
+    },
     "ParallelConfig": {
       "additionalProperties": false,
       "description": "Configuration for distributed parallelism across DiT-shaped models.\n\nThe sequence axis can be sharded via Attention2D (a 2D mesh) or Ring\nAttention (a 1D mesh); these two are mutually exclusive. Either can be\ncombined with Ulysses head-sharding to form an outer \u00d7 inner sequence\nparallel mesh. See ``mapping.py`` for the underlying DeviceMesh layout.",
@@ -949,6 +996,20 @@
       "additionalProperties": false,
       "description": "Configuration for the variational autoencoder.",
       "properties": {
+        "decode_device": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "GPU that decodes latents to pixels, e.g. 'cuda:1', when it is not the generator's own. Cosmos3 Sim decodes each finished chunk there while the next chunk denoises, so the decode leaves the rollout's critical path. None: decode on the generator's GPU. Other pipelines ignore it.",
+          "status": "prototype",
+          "title": "Decode Device"
+        },
         "quant_conv_config": {
           "anyOf": [
             {
@@ -1049,6 +1110,10 @@
       "status": "prototype",
       "title": "Enable Layerwise Nvtx Marker",
       "type": "boolean"
+    },
+    "kv_cache_config": {
+      "$ref": "#/$defs/KVCacheConfig",
+      "status": "prototype"
     },
     "model": {
       "default": "",

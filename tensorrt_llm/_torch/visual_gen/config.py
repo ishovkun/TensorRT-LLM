@@ -204,6 +204,8 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
     # VAE Conv-only ModelOpt overrides. None lets the checkpoint determine the mode.
     vae_conv_dynamic_weight_quant: Optional[bool] = None
     vae_conv_dynamic_activation_quant: Optional[bool] = None
+    # GPU the VAE decodes on when it is not the generator's (Cosmos3 Sim only).
+    vae_decode_device: Optional[str] = None
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
@@ -813,6 +815,7 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             vae_conv_quant_config=vae_conv_quant_config,
             vae_conv_dynamic_weight_quant=vae_conv_dynamic_weight_quant,
             vae_conv_dynamic_activation_quant=vae_conv_dynamic_activation_quant,
+            vae_decode_device=args.vae_config.decode_device if args else None,
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,

@@ -324,6 +324,16 @@ class VAEConfig(StrictBaseModel):
             "from transformer linear-layer and attention quantization."
         ),
     )
+    decode_device: Optional[str] = Field(
+        None,
+        status="prototype",
+        description=(
+            "GPU that decodes latents to pixels, e.g. 'cuda:1', when it is not the "
+            "generator's own. Cosmos3 Sim decodes each finished chunk there while the "
+            "next chunk denoises, so the decode leaves the rollout's critical path. "
+            "None: decode on the generator's GPU. Other pipelines ignore it."
+        ),
+    )
 
 
 class ParallelConfig(StrictBaseModel):

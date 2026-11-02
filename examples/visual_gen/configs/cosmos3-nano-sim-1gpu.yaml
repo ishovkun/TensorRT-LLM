@@ -40,3 +40,7 @@ kv_cache_config:
 # The chunk forward replays as CUDA graphs (one per chunk shape and pass).
 cuda_graph_config:
   enable: true
+# Each finished chunk is decoded to pixels before the next one denoises. With a
+# second GPU, name it here and the decode runs there while the rollout continues:
+# vae_config:
+#   decode_device: cuda:1

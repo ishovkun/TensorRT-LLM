@@ -24,7 +24,7 @@ from cosmos3_sim_testing import sim_settings
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_sim import (
     Cosmos3NanoSimBimanualPipeline,
     SimEmbodiment,
-    _OverlappedDecode,
+    _ChunkDecoder,
     split_row_domain_ids,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
@@ -248,9 +248,10 @@ def test_domain_id_may_be_one_per_action_row():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="streams and pinned memory need CUDA")
-def test_streamed_decode_lands_in_one_host_buffer():
-    """Each chunk's frames go to pinned host memory as they are decoded; the result
-    is the frames in order, on the CPU."""
+@pytest.mark.parametrize("side_stream", [False, True], ids=["main_stream", "side_stream"])
+def test_chunk_decode_lands_in_one_host_buffer(side_stream):
+    """Each chunk's frames go to pinned host memory as they are decoded, on the main
+    stream or on a side stream; the result is the frames in order, on the CPU."""
 
     class _FrameVAE:
         """Decodes latent frame ``i`` into pixel frames filled with ``i``: one for the
@@ -274,9 +275,9 @@ def test_streamed_decode_lands_in_one_host_buffer():
             pass
 
     pipe = SimpleNamespace(_scale_latents_for_decode=lambda z: z)
-    stream = torch.cuda.Stream()
+    stream = torch.cuda.Stream() if side_stream else None
     latents = torch.zeros(1, 4, 5, 2, 2, device="cuda")
-    decoder = _OverlappedDecode(pipe, _FrameVAE(), stream, num_pixel_frames=17)
+    decoder = _ChunkDecoder(pipe, _FrameVAE(), stream, num_pixel_frames=17)
     for f0, f1 in [(0, 1), (1, 3), (3, 5)]:
         decoder.submit(latents[:, :, f0:f1])
     video = decoder.finish()
