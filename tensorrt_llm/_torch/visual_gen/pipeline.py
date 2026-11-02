@@ -47,6 +47,8 @@ from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
 from .profiler import VisualGenProfiler
+from .session import AdvanceOutcome, SessionCapabilities
+from .slot_pool import DeliverySlot
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -445,6 +447,59 @@ class BasePipeline(nn.Module):
 
     def infer(self, req: Any):
         raise NotImplementedError
+
+    # ------------------------------------------------------------------ sessions
+    #
+    # A pipeline that can keep its model state alive between calls opts in by
+    # overriding the five methods below and returning True from
+    # ``supports_sessions``. The executor owns delivery slots, advance indices,
+    # stream cursors, ordering and the terminal result; the pipeline owns its
+    # caches, decoder history, random state and device events and never sees
+    # queues, sockets or consumers.
+
+    @property
+    def supports_sessions(self) -> bool:
+        return False
+
+    def session_capabilities(self, req: Any) -> "SessionCapabilities":
+        """Inputs, streams, geometry, length and profile for a session opened with
+        ``req``. These determine admission, the slot pool and what the client may
+        call. Raises ``ValueError`` when the request cannot be served as a session."""
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
+
+    def open_session(
+        self, req: Any, initial_slot: Optional["DeliverySlot"]
+    ) -> Tuple[Any, "AdvanceOutcome"]:
+        """All expensive and allocating work for a session: prompt encode,
+        conditioning, cache open, graph warmup, whole-clip denoise if that is the
+        model. Returns the session state (opaque to the executor) and the initial
+        outcome. ``initial_slot`` is the executor's reserved slot when the
+        capabilities declare an initial result, else ``None``; the outcome's
+        ``written`` names what was put into it and its ``event`` covers those
+        writes on this rank. If opening fails, release partial allocations and
+        raise."""
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
+
+    def validate_input(self, state: Any, name: str, value: Any) -> None:
+        """Schema check on rank 0 before a value is enqueued or broadcast. Raises
+        ``ValueError`` for a bad value. Must not change state. The default accepts
+        anything the input's ``validate`` callable accepted."""
+        del state, name, value
+
+    def advance(self, state: Any, inputs: Dict[str, Any], slot: "DeliverySlot") -> "AdvanceOutcome":
+        """One unit of work. ``inputs`` holds one value per queued input and the
+        current value of every live input. Write each produced stream into
+        ``slot.buffer(name, shape, dtype)`` and return the counts written, a CUDA
+        event recorded after the last write (``None`` when every write has
+        completed on return) and ``done``. Advances never overlap; a non-final
+        outcome must contain at least one stream."""
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
+
+    def close_session(self, state: Any) -> None:
+        """Release session state after work and transfers finish. Prompt-derived
+        data may stay cached inside the pipeline so reopening with the same prompt
+        skips the encode."""
+        raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def _init_transformer(self) -> None:
         raise NotImplementedError

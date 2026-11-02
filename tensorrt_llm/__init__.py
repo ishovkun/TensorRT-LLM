@@ -103,6 +103,7 @@ _LAZY_ATTRS = {
     'VisualGenOutput': ('tensorrt_llm.visual_gen', 'VisualGenOutput'),
     'VisualGenParams': ('tensorrt_llm.visual_gen', 'VisualGenParams'),
     'VisualGenResult': ('tensorrt_llm.visual_gen', 'VisualGenResult'),
+    'VisualGenSession': ('tensorrt_llm.visual_gen', 'VisualGenSession'),
 }
 
 

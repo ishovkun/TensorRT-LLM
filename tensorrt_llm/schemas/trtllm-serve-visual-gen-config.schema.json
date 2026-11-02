@@ -329,6 +329,53 @@
       "title": "CudaGraphConfig",
       "type": "object"
     },
+    "KVCacheConfig": {
+      "additionalProperties": false,
+      "description": "Budget for the K/V cache of autoregressive video models.\n\nThe cache holds the finished frames a chunk attends to. Its size is settled\nonce at startup: the pipeline warms up at the largest shape the checkpoint\nserves, measures the peak memory everything else needs, and gives the cache\nthis fraction of what is left.",
+      "properties": {
+        "attention_sink_size": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Leading latent frames kept visible for the whole rollout once the window slides past them. Requires kv_cache_inference_size. None: what the checkpoint declares.",
+          "status": "prototype",
+          "title": "Attention Sink Size"
+        },
+        "free_gpu_memory_fraction": {
+          "default": 0.9,
+          "description": "Fraction of the GPU memory left after the warmup peak that the K/V cache may take.",
+          "exclusiveMinimum": 0.0,
+          "maximum": 1.0,
+          "status": "prototype",
+          "title": "Free Gpu Memory Fraction",
+          "type": "number"
+        },
+        "kv_cache_inference_size": {
+          "anyOf": [
+            {
+              "minimum": 2,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Latent frames each generated frame may attend to, counting the attention sinks and the frame itself: with 64 and 8 sinks, a frame sees the 8 sink frames and the 55 frames before it. None: what the checkpoint declares (Cosmos3 Sim: full history). Fixed for the engine's lifetime.",
+          "status": "prototype",
+          "title": "Kv Cache Inference Size"
+        }
+      },
+      "title": "KVCacheConfig",
+      "type": "object"
+    },
     "ParallelConfig": {
       "additionalProperties": false,
       "description": "Configuration for distributed parallelism across DiT-shaped models.\n\nThe sequence axis can be sharded via Attention2D (a 2D mesh) or Ring\nAttention (a 1D mesh); these two are mutually exclusive. Either can be\ncombined with Ulysses head-sharding to form an outer \u00d7 inner sequence\nparallel mesh. See ``mapping.py`` for the underlying DeviceMesh layout.",
@@ -740,6 +787,37 @@
       "title": "RuntimeLoRAConfig",
       "type": "object"
     },
+    "SessionConfig": {
+      "additionalProperties": false,
+      "description": "Engine settings for streaming sessions (``VisualGen.open_session``).",
+      "properties": {
+        "delivery_slots": {
+          "default": 2,
+          "description": "Delivery slots per session: results the worker may hold for the client at once, each sized for the pipeline's largest result. 2 lets the worker produce the next result while the client uses the current one; more lets it run further ahead when inputs are already available.",
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Delivery Slots",
+          "type": "integer"
+        },
+        "idle_timeout": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Seconds a session may wait for the client (no submit, no result request, no slot return) while only the client can make progress, before the executor closes it with a terminal error and frees the model instance. None disables the timeout.",
+          "status": "prototype",
+          "title": "Idle Timeout"
+        }
+      },
+      "title": "SessionConfig",
+      "type": "object"
+    },
     "SkipSoftmaxAttentionConfig": {
       "additionalProperties": false,
       "description": "SkipSoftmax sparse attention configuration for visual generation.\n\nThis class is only the Python/YAML user surface. Checkpoint calibration\ndata is passed to ``to_sparse_params()`` when SparseParams are created.",
@@ -1050,6 +1128,10 @@
       "title": "Enable Layerwise Nvtx Marker",
       "type": "boolean"
     },
+    "kv_cache_config": {
+      "$ref": "#/$defs/KVCacheConfig",
+      "status": "prototype"
+    },
     "model": {
       "default": "",
       "description": "Local directory path or HuggingFace Hub model ID (e.g., 'Wan-AI/Wan2.1-T2V-1.3B-Diffusers'). Hub models are downloaded and cached automatically.",
@@ -1107,6 +1189,11 @@
       ],
       "default": null,
       "description": "Startup-preloaded LoRA adapter fused into VisualGen transformer weights.",
+      "status": "prototype"
+    },
+    "session_config": {
+      "$ref": "#/$defs/SessionConfig",
+      "description": "Streaming session settings: delivery slots per session and the idle timeout.",
       "status": "prototype"
     },
     "torch_compile_config": {
