@@ -1588,8 +1588,8 @@ class DiffusionRemoteClient:
     def _discard_unsent_request(request: Optional[Any]) -> None:
         if isinstance(request, SessionOpen):
             request = request.request
-        if not isinstance(request, DiffusionRequest):
-            return
+        if request is None or not hasattr(request, "refs_from_shm"):
+            return  # session commands carry no shared-memory payload
         try:
             # Rebuilding an unsent shared-memory handle releases its producer
             # reference. The restored request is discarded immediately.
