@@ -486,3 +486,119 @@ def test_the_bench_action_slice_fits_the_sim_style_bound():
     assert (
         input_nbytes(actions[0 : 2 * rows_per_advance]) > bound
     )  # the shape validator does the rest
+
+
+# --------------------------------------------------------------------------- delivery slots
+
+
+def _two_stream_caps(n=4):
+    return SessionCapabilities(
+        streams=(
+            StreamSpec(name="video", kind="video", dtype=torch.float32, max_shape=(n,), axis=0),
+            StreamSpec(name="audio", kind="audio", dtype=torch.float32, max_shape=(n,), axis=0),
+        ),
+    )
+
+
+def test_slot_rejects_invalid_extents_before_recording_anything():
+    pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"), local=True)
+    slot = pool.reserve()
+    import numpy as np
+
+    for bad in ((-1,), (0,), (5,), (2, 2), (1.5,), (torch.tensor(1.5),), (True,), ("2",)):
+        with pytest.raises(ValueError):
+            slot.buffer("video", bad, torch.float32)
+    with pytest.raises(ValueError, match="declared"):
+        slot.buffer("video", (2,), torch.float16)
+    assert slot.written() == {}  # a refused request left nothing written
+    view = slot.buffer("video", (3,), torch.float32)
+    assert view.shape == (3,) and slot.written() == {"video": ((3,), torch.float32)}
+    slot.reset()
+    for ok in ((np.int64(2),), (torch.tensor(2),)):  # integer-like scalars index fine
+        assert slot.buffer("video", ok, torch.float32).shape == (2,)
+    pool.close()
+
+
+def test_media_result_validates_everything_before_moving_any_cursor():
+    state = SessionState(1, _two_stream_caps())
+    state.initialized = True
+    with pytest.raises(ValueError, match="audio"):
+        state.media_result(0, 0, {"video": ((2,), torch.float32), "audio": ((5,), torch.float32)})
+    assert state.cursors == {"video": 0, "audio": 0} and state.next_sequence == 0
+    for bad in ((-1,), (0,), (1, 1), (torch.tensor(1.5),), (True,), (1.5,)):
+        with pytest.raises(ValueError):
+            state.media_result(0, 0, {"video": (bad, torch.float32)})
+    assert state.cursors == {"video": 0, "audio": 0} and state.next_sequence == 0
+    first = state.media_result(
+        0, 0, {"video": ((1,), torch.float32), "audio": ((4,), torch.float32)}
+    )
+    assert first.position == {"video": (0, 1), "audio": (0, 4)} and first.sequence == 0
+    last = state.media_result(1, 1, {"video": ((4,), torch.float32)})
+    assert last.position == {"video": (1, 4)} and state.cursors == {"video": 5, "audio": 4}
+
+
+def test_partial_pool_construction_undoes_every_registration(monkeypatch):
+    import tensorrt_llm._torch.visual_gen.slot_pool as pool_module
+
+    registered, unregistered = [], []
+
+    def fake_lock(storage, bucket):
+        registered.append(storage.data_ptr())
+        bucket.append(storage)
+
+    def fake_unlock(storage):
+        unregistered.append(storage.data_ptr())
+
+    monkeypatch.setattr(pool_module, "_page_lock", fake_lock)
+    monkeypatch.setattr(pool_module, "_page_unlock", fake_unlock)
+    original_allocate = pool_module.SlotPool._allocate
+    calls = {"n": 0}
+
+    def failing_allocate(self, spec):
+        calls["n"] += 1
+        if calls["n"] == 3:  # second slot, first stream: mid-way through the pool
+            raise MemoryError("probe: out of memory")
+        return original_allocate(self, spec)
+
+    monkeypatch.setattr(pool_module.SlotPool, "_allocate", failing_allocate)
+    with pytest.raises(MemoryError, match="probe"):
+        SlotPool(_two_stream_caps(), num_slots=2, device=torch.device("cpu"))
+    assert len(registered) == 2 and sorted(unregistered) == sorted(registered)  # each undone once
+    # and a failure inside one slot's streams behaves the same
+    registered.clear()
+    unregistered.clear()
+    calls["n"] = 0
+
+    def failing_second_stream(self, spec):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise MemoryError("probe: out of memory")
+        return original_allocate(self, spec)
+
+    monkeypatch.setattr(pool_module.SlotPool, "_allocate", failing_second_stream)
+    with pytest.raises(MemoryError, match="probe"):
+        SlotPool(_two_stream_caps(), num_slots=2, device=torch.device("cpu"))
+    assert registered and sorted(unregistered) == sorted(registered)
+
+
+def test_registered_pointer_is_the_exported_storage_pointer(monkeypatch):
+    """The handle is exported before the page-lock, so the address the client
+    maps is the address that was registered (sharing moves the storage)."""
+    import tensorrt_llm._torch.visual_gen.slot_pool as pool_module
+
+    registered = []
+    monkeypatch.setattr(
+        pool_module,
+        "_page_lock",
+        lambda storage, bucket: (registered.append(storage.data_ptr()), bucket.append(storage)),
+    )
+    monkeypatch.setattr(pool_module, "_page_unlock", lambda storage: None)
+    pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"))
+    exported = [buf.storage.data_ptr() for slot in pool._slots for buf in slot._buffers.values()]
+    assert sorted(registered) == sorted(exported)
+    client = ClientSlotMap(pool.export_handles())
+    view = client.view(0, "video", (4,), torch.float32)
+    assert view.data_ptr() == pool._slots[0]._buffers["video"].storage.data_ptr()
+    client.close()
+    pool.close()
+    pool.close()  # repeated close is harmless

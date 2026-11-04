@@ -381,24 +381,24 @@ class SessionState:
         written: Dict[str, Tuple[Tuple[int, ...], torch.dtype]],
     ) -> SessionResultMessage:
         """Build the message for what the slot recorded as written (stream name to
-        shape and dtype), checking each stream against its declaration; assigns each
-        stream's start from its cursor and moves the cursor by the shape's extent
-        along the stream axis."""
+        shape and dtype). Every stream is checked against its declaration before
+        anything moves: a rejected result publishes nothing and leaves every
+        cursor where it was. Each stream's start is its cursor, which then moves
+        by the extent along the stream axis."""
+        from .slot_pool import check_extent
+
         caps = self.capabilities
         if not written:
             raise ValueError("a media result must carry at least one stream")
-        streams: Dict[str, Tuple[Tuple[int, ...], str]] = {}
-        position: Dict[str, Tuple[int, int]] = {}
+        checked: Dict[str, Tuple[Tuple[int, ...], str, int]] = {}
         for name, (shape, dtype) in written.items():
             spec = caps.stream(name)
-            if dtype != spec.dtype:
-                raise ValueError(f"stream {name!r}: wrote {dtype}, declared {spec.dtype}")
-            if len(shape) != len(spec.max_shape) or any(
-                int(a) > int(b) for a, b in zip(shape, spec.max_shape)
-            ):
-                raise ValueError(f"stream {name!r}: shape {tuple(shape)} exceeds {spec.max_shape}")
-            count = int(shape[spec.axis])
-            streams[name] = (tuple(int(d) for d in shape), str(dtype))
+            extents = check_extent(spec, shape, dtype)
+            checked[name] = (extents, str(dtype), extents[spec.axis])
+        streams: Dict[str, Tuple[Tuple[int, ...], str]] = {}
+        position: Dict[str, Tuple[int, int]] = {}
+        for name, (extents, dtype_name, count) in checked.items():
+            streams[name] = (extents, dtype_name)
             start = self.cursors[name]
             position[name] = (start, count)
             self.cursors[name] = start + count
