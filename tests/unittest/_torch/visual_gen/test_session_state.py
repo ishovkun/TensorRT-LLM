@@ -18,24 +18,31 @@ assembly and the slot pool. No pipeline, no processes."""
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.session import (
-    CURRENT,
-    QUEUED,
+from tensorrt_llm._torch.visual_gen.pipeline import (
     AdvanceOutcome,
     InputSpec,
     SessionCapabilities,
+    StreamSpec,
+)
+from tensorrt_llm._torch.visual_gen.session import (
     SessionEnded,
     SessionQueueFull,
     SessionState,
-    StreamSpec,
+    input_nbytes,
 )
 from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, SlotPool
 
 pytestmark = pytest.mark.cpu_only
 
+ONE_INT = input_nbytes(1)  # the object size of one small int
+EIGHT_FLOATS = input_nbytes([1.0] * 8)
+TWO_FLOATS = input_nbytes((0.0, 0.0))
+
 
 def _video_stream(frames=8, h=4, w=6):
-    return StreamSpec("video", "video", torch.uint8, (1, frames, h, w, 3), axis=1, rate=24.0)
+    return StreamSpec(
+        name="video", kind="video", dtype=torch.uint8, max_shape=(1, frames, h, w, 3), rate=24.0
+    )
 
 
 def _positive(value):
@@ -45,7 +52,7 @@ def _positive(value):
 
 def lockstep_caps(initial=True, length=None):
     return SessionCapabilities(
-        inputs=(InputSpec("controls", QUEUED, validate=_positive, queue_depth=2),),
+        inputs=(InputSpec(name="controls", max_bytes=ONE_INT, validator=_positive, queue_depth=2),),
         streams=(_video_stream(),),
         initial_result=initial,
         length=length,
@@ -56,12 +63,14 @@ def lockstep_caps(initial=True, length=None):
 def steered_caps():
     return SessionCapabilities(
         inputs=(
-            InputSpec("controls", QUEUED, queue_depth=3),
-            InputSpec("camera", CURRENT, default=(0.0, 0.0)),
+            InputSpec(name="controls", max_bytes=EIGHT_FLOATS, queue_depth=3),
+            InputSpec(name="camera", max_bytes=TWO_FLOATS, policy="live", default=(0.0, 0.0)),
         ),
         streams=(
             _video_stream(),
-            StreamSpec("audio", "audio", torch.float32, (1, 2, 1024), axis=2),
+            StreamSpec(
+                name="audio", kind="audio", dtype=torch.float32, max_shape=(1, 2, 1024), axis=2
+            ),
         ),
     )
 
@@ -71,17 +80,26 @@ def steered_caps():
 
 def test_capabilities_reject_bad_declarations():
     with pytest.raises(ValueError):
-        InputSpec("x", "sometimes")
+        InputSpec(name="x", max_bytes=8, policy="sometimes")
     with pytest.raises(ValueError):
-        StreamSpec("v", "video", torch.uint8, (1, 2), placement="pinned")
+        InputSpec(name="x", max_bytes=8, queue_depth=0)
     with pytest.raises(ValueError):
-        StreamSpec("v", "video", torch.uint8, (0, 1))
+        InputSpec(name="x")  # the byte bound is declared, never defaulted
     with pytest.raises(ValueError):
-        StreamSpec("v", "video", torch.uint8, (1, 2), axis=5)
+        InputSpec(name="x", max_bytes=0)
+    with pytest.raises(ValueError):
+        StreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(1, 2), placement="pinned")
+    with pytest.raises(ValueError):
+        StreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(0, 1))
+    with pytest.raises(ValueError):
+        StreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(1, 2), axis=5)
     with pytest.raises(ValueError):
         SessionCapabilities(inputs=(), streams=())
     with pytest.raises(ValueError):
-        SessionCapabilities(inputs=(InputSpec("a"), InputSpec("a")), streams=(_video_stream(),))
+        SessionCapabilities(
+            inputs=(InputSpec(name="a", max_bytes=8), InputSpec(name="a", max_bytes=8)),
+            streams=(_video_stream(),),
+        )
     with pytest.raises(ValueError):
         SessionCapabilities(inputs=(), streams=(_video_stream(),), lockstep=True)
 
@@ -248,3 +266,182 @@ def test_client_map_sees_the_worker_write_without_a_copy():
 def test_outcome_defaults():
     outcome = AdvanceOutcome()
     assert outcome.event is None and not outcome.done
+
+
+# --------------------------------------------------------------------------- input byte bound
+
+
+def test_input_nbytes_counts_what_a_value_retains_or_expands_to():
+    import sys
+
+    import numpy as np
+
+    assert input_nbytes(7) == sys.getsizeof(7) and input_nbytes(b"abc") == sys.getsizeof(b"abc")
+    assert input_nbytes([1.0, 2.0]) == sys.getsizeof([1.0, 2.0]) + 2 * sys.getsizeof(1.0)
+    assert input_nbytes({"a": 1}) == sys.getsizeof({"a": 1}) + sys.getsizeof("a") + sys.getsizeof(1)
+    big = torch.zeros(262144, dtype=torch.float32)  # 1 MiB of storage
+    assert input_nbytes(big) == 1 << 20
+    assert input_nbytes(big[:1]) == 1 << 20  # a view keeps the whole storage alive
+    assert input_nbytes(big[:1].numpy()) >= 1 << 20  # NumPy view whose base is the tensor
+    arr = np.zeros(262144, dtype=np.float32)
+    assert input_nbytes(arr[:1]) == 1 << 20  # NumPy view of a NumPy owner
+    with pytest.raises(ValueError, match="memoryview"):
+        input_nbytes(memoryview(bytearray(16)))  # not picklable: not a wire form
+    assert input_nbytes([b""] * 100000) > 3_000_000  # a hundred thousand references
+    # Small storage, huge logical extent: counted at what it expands to.
+    assert input_nbytes(np.broadcast_to(np.array([1.0]), (1_000_000,))) >= 8_000_000
+    assert input_nbytes(torch.zeros(1).expand(1_000_000)) >= 4_000_000
+    assert input_nbytes(torch.zeros(1).expand(1_000_000).numpy()) >= 4_000_000
+    # Shared rows are ordinary input, counted once per appearance; self-containment is not.
+    row = [1.0, 2.0]
+    assert input_nbytes([row, row]) == sys.getsizeof([row, row]) + 2 * input_nbytes(row)
+    with pytest.raises(ValueError, match="contains itself"):
+        cyc: list = []
+        cyc.append(cyc)
+        input_nbytes(cyc)
+    with pytest.raises(ValueError, match="object references"):
+        input_nbytes(np.array([b"x" * 16], dtype=object))
+    structured = np.empty(1, dtype=[("payload", object)])
+    structured["payload"][0] = b"x" * 1024
+    with pytest.raises(ValueError, match="object references"):
+        input_nbytes(structured)
+    with pytest.raises(ValueError, match="not a supported input form"):
+        input_nbytes(object())
+    # Decorated forms carry arbitrary Python state into serialization: refused.
+    decorated_array = np.zeros(1, dtype=np.dtype("uint8", metadata={"payload": b"x" * 4096}))
+    with pytest.raises(ValueError, match="dtype metadata"):
+        input_nbytes(decorated_array)
+    decorated_tensor = torch.zeros(1, dtype=torch.uint8)
+    decorated_tensor.payload = b"x" * 4096
+    with pytest.raises(ValueError, match="attributes"):
+        input_nbytes(decorated_tensor)
+    with pytest.raises(ValueError, match="autograd"):
+        input_nbytes(torch.zeros(1, requires_grad=True))
+
+    class MyList(list):
+        pass
+
+    with pytest.raises(ValueError, match="MyList"):
+        input_nbytes(MyList([1]))
+    with pytest.raises(ValueError, match="not a supported input form"):
+        input_nbytes(np.zeros(1).view(np.recarray))
+    # Plain views of decorated owners retain the decoration: refused down the chain.
+    decorated_base = torch.zeros(1)
+    decorated_base.payload = b"x" * 4096
+    with pytest.raises(ValueError, match="attributes"):
+        input_nbytes(decorated_base[:])
+    with pytest.raises(ValueError, match="attributes"):
+        input_nbytes(decorated_base[:][:1])
+    decorated_owner = np.zeros(1, dtype=np.dtype("uint8", metadata={"payload": b"x" * 4096}))
+    with pytest.raises(ValueError, match="dtype metadata"):
+        input_nbytes(decorated_owner.view(np.uint8))
+    with pytest.raises(ValueError, match="dtype metadata"):
+        input_nbytes(decorated_owner.view(np.uint8)[:1])
+    # ``Tensor.numpy()`` roots the array at a fresh plain tensor over the same
+    # storage, so the decorated Python object is not retained: measured, accepted.
+    assert 4 <= input_nbytes(decorated_base[:].numpy()) <= 8
+    # Plain views of plain owners keep working.
+    plain = torch.zeros(4)
+    assert input_nbytes(plain[1:3]) == 16 and input_nbytes(plain[1:3].numpy()[:1]) >= 16
+    assert input_nbytes(np.zeros(4)[1:3]) == 32
+    # Plain forms stay usable.
+    assert input_nbytes(np.zeros(2, dtype=np.float32)) == 8
+    assert input_nbytes(torch.zeros(2, dtype=torch.float32)) == 8
+    with pytest.raises(ValueError, match="fields"):
+        input_nbytes(np.zeros(2, dtype=[("a", np.float32), ("b", np.float32)]))
+
+
+def test_input_nbytes_walk_is_bounded_by_the_limit_not_the_value():
+    import sys
+    import tracemalloc
+
+    huge = [None] * 1_000_000
+    tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
+    size = input_nbytes(huge, limit=64)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert size == sys.getsizeof(huge)  # the list object alone is past the bound: not expanded
+    assert peak - before < 64 * 1024  # the walk allocated no reference array for the items
+    nested = [[0] * 1000 for _ in range(10_000)]
+    tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
+    size = input_nbytes(nested, limit=1024)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert 1024 < size < sys.getsizeof(nested) + 3 * 10_000 and peak - before < 64 * 1024
+
+
+def test_oversize_input_is_rejected_as_capacity_before_anything_changes():
+    state = SessionState(1, steered_caps())
+    state.initialized = True
+    with pytest.raises(SessionQueueFull, match="declared bound"):
+        state.admit("controls", [1.0] * 9)
+    assert state.admitted["controls"] == 0 and not state.queues["controls"]
+    assert state.admit("controls", [1.0] * 8) == 0  # exactly the bound is accepted
+    with pytest.raises(SessionQueueFull, match="declared bound"):
+        state.admit("camera", (1.0, 2.0, 3.0))
+    assert state.live["camera"] == (0.0, 0.0)  # the live value is unchanged
+    assert state.admit("camera", (1.0, 2.0)) == 0
+    for sneaky in (
+        torch.zeros(1024)[:1],
+        torch.zeros(1024)[:1].numpy(),
+    ):
+        with pytest.raises(SessionQueueFull):
+            state.admit("controls", sneaky)
+
+
+def test_live_default_must_fit_the_bound():
+    with pytest.raises(ValueError, match="default holds"):
+        InputSpec(name="live", policy="live", max_bytes=16, default=bytes(1 << 20))
+    spec = InputSpec(name="live", policy="live", max_bytes=TWO_FLOATS, default=(0.0, 0.0))
+    assert spec.default == (0.0, 0.0)
+
+
+def test_queue_full_and_size_rejections_leave_the_next_index_unchanged():
+    state = SessionState(1, lockstep_caps(initial=False))
+    state.initialized = True
+    assert state.admit("controls", 1) == 0
+    assert state.admit("controls", 2) == 1
+    with pytest.raises(SessionQueueFull):
+        state.admit("controls", 3)
+    with pytest.raises(SessionQueueFull):
+        state.admit("controls", [1, 2])
+    assert state.admitted["controls"] == 2 and list(state.queues["controls"]) == [1, 2]
+    state.take_inputs()
+    assert state.admit("controls", 3) == 2  # the next index is the one after the admitted two
+
+
+def test_supported_input_forms_survive_the_wire_serialization():
+    """Every accepted form goes through what the request socket does to it
+    (pickle) and comes back equal."""
+    import pickle
+
+    import numpy as np
+
+    from tensorrt_llm._torch.visual_gen.session import SessionSubmit
+
+    forms = [
+        1,
+        2.5,
+        True,
+        "text",
+        b"bytes",
+        bytearray(b"ba"),
+        [1.0, 2.0, [3.0]],
+        (1, 2),
+        {"k": [1, 2]},
+        torch.arange(6, dtype=torch.float32).reshape(2, 3)[:, 1:],
+        np.arange(6, dtype=np.float32).reshape(2, 3)[:, 1:],
+    ]
+    for value in forms:
+        assert input_nbytes(value) >= 0  # accepted
+        back = pickle.loads(pickle.dumps(SessionSubmit(1, 0, "x", value))).value
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(back, value)
+        elif isinstance(value, np.ndarray):
+            assert np.array_equal(back, value)
+        else:
+            assert back == value
+    with pytest.raises(TypeError):
+        pickle.dumps(memoryview(b"abc"))  # which is why it is not a supported form

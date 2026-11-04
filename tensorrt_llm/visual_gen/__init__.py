@@ -66,7 +66,7 @@ if TYPE_CHECKING:
         SessionLeaseExpired,
         SessionQueueFull,
         SessionResult,
-        SessionResults,
+        SessionResultsIterator,
         VisualGenSession,
     )
     from .visual_gen import ExtraParamSchema, VisualGen, VisualGenResult
@@ -95,7 +95,7 @@ _LAZY_ATTRS = {
     "VAEConfig": "tensorrt_llm.visual_gen.args",
     "SessionConfig": "tensorrt_llm.visual_gen.args",
     "VisualGenSession": "tensorrt_llm.visual_gen.session",
-    "SessionResults": "tensorrt_llm.visual_gen.session",
+    "SessionResultsIterator": "tensorrt_llm.visual_gen.session",
     "SessionResult": "tensorrt_llm.visual_gen.session",
     "SessionError": "tensorrt_llm.visual_gen.session",
     "SessionQueueFull": "tensorrt_llm.visual_gen.session",
@@ -161,7 +161,7 @@ __all__ = [
     "ExtraParamSchema",
     # Streaming sessions
     "VisualGenSession",
-    "SessionResults",
+    "SessionResultsIterator",
     "SessionResult",
     "SessionError",
     "SessionQueueFull",

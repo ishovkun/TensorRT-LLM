@@ -35,7 +35,7 @@ from test_cosmos3_sim_transformer import (  # noqa: F401  (the ``model`` fixture
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import _PreparedLatents
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer
-from tensorrt_llm._torch.visual_gen.session import SessionCapabilities, StreamSpec
+from tensorrt_llm._torch.visual_gen.pipeline import SessionCapabilities, StreamSpec
 from tensorrt_llm._torch.visual_gen.slot_pool import SlotPool
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the rollout needs CUDA")
@@ -136,7 +136,10 @@ def _session_video(model, prepared, seed, num_latent_frames):  # noqa: F811
         inputs=(),
         streams=(
             StreamSpec(
-                "video", "video", torch.uint8, (1, 4 * pipe.sim.chunk_frames, H * UP, W * UP, 3)
+                name="video",
+                kind="video",
+                dtype=torch.uint8,
+                max_shape=(1, 4 * pipe.sim.chunk_frames, H * UP, W * UP, 3),
             ),
         ),
         initial_result=True,

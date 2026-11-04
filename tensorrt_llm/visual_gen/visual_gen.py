@@ -506,10 +506,13 @@ class VisualGen:
         prompt: str,
         params: Optional[VisualGenParams] = None,
     ) -> VisualGenSession:
-        """Asynchronous form of :meth:`open_session`, same contract."""
+        """Asynchronous form of :meth:`open_session`, same contract.
+
+        Cancelling the awaiting task relinquishes the session: an open that
+        completes anyway is closed on the worker and its capacity released.
+        """
         request = self._session_request(prompt, params)
-        channel = self.executor.open_session(request)
-        await asyncio.wrap_future(channel.opened)
+        channel = await self.executor.open_session_async(request)
         return VisualGenSession(request.request_id, self.executor, channel)
 
     def __enter__(self):

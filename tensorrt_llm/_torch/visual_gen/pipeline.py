@@ -3,8 +3,10 @@
 
 import contextlib
 import itertools
+import math
 import os
 import time
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -13,6 +15,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Set,
     Tuple,
@@ -22,7 +25,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from pydantic import Field
+from pydantic import ConfigDict, Field, model_validator
 
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.nccl_window_graph import release_nccl_window_graph_owner
@@ -47,8 +50,6 @@ from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
 from .profiler import VisualGenProfiler
-from .session import AdvanceOutcome, SessionCapabilities
-from .slot_pool import DeliverySlot
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -105,10 +106,190 @@ class RefSlotSpec(StrictBaseModel):
     roles: List[RoleSpec] = Field(description="Accepted roles + counts for this modality.")
 
 
+# ------------------------------------------------------------------ session declarations
+# What a pipeline declares for one session: the inputs it takes while running, the
+# streams it writes and how the session ends. Pickled to the client in its
+# ``public()`` form, so the callables never leave the worker.
+
+
+class InputSpec(StrictBaseModel):
+    """One named input the pipeline accepts during a session.
+
+    A ``queued`` input supplies one value per advance and the worker waits for it;
+    a ``live`` input is a state value the worker reads at each advance and never
+    waits for. ``max_bytes`` bounds one value, measured as the bytes it retains
+    (see ``input_nbytes``: a tensor's backing storage, a container with its
+    items at their object sizes); a larger value is refused as
+    ``SessionQueueFull``, by the client before it is sent and by the worker
+    before it is admitted. Memory held per input is therefore at most
+    ``queue_depth`` values for a queued input, and the current value plus the
+    snapshot of the advance in flight for a live one. ``validator`` runs on rank
+    0 before admission, after the size check, and raises ``ValueError`` for a
+    bad value.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str
+    max_bytes: int = Field(gt=0)
+    policy: Literal["queued", "live"] = "queued"
+    validator: Optional[Callable[[Any], None]] = None
+    default: Any = None
+    queue_depth: int = Field(default=8, ge=1)
+
+    @model_validator(mode="after")
+    def _check_default(self) -> "InputSpec":
+        if self.default is not None:
+            from .session import input_nbytes
+
+            size = input_nbytes(self.default, self.max_bytes)
+            if size > self.max_bytes:
+                raise ValueError(
+                    f"input {self.name!r}: the default holds at least {size} bytes, "
+                    f"the declared bound is {self.max_bytes}"
+                )
+        return self
+
+
+class StreamSpec(StrictBaseModel):
+    """One named output stream the pipeline produces.
+
+    ``max_shape`` is the largest tensor one result may carry for this stream; the
+    slot pool sizes its buffers from it. ``axis`` is the dimension counted by a
+    result's ``position`` (frames, samples or predictions). ``placement`` is where
+    the slot buffer lives: shared page-locked host memory or device memory.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    name: str
+    kind: str
+    dtype: torch.dtype
+    max_shape: Tuple[int, ...]
+    axis: int = 1
+    rate: Optional[float] = None
+    placement: Literal["host", "device"] = "host"
+
+    @model_validator(mode="after")
+    def _check_geometry(self) -> "StreamSpec":
+        if not self.max_shape or any(d <= 0 for d in self.max_shape):
+            raise ValueError(f"stream {self.name!r}: max_shape must be non-empty and positive")
+        if not 0 <= self.axis < len(self.max_shape):
+            raise ValueError(f"stream {self.name!r}: axis {self.axis} outside max_shape")
+        return self
+
+    @property
+    def max_bytes(self) -> int:
+        return math.prod(self.max_shape) * self.dtype.itemsize
+
+
+class SessionCapabilities(StrictBaseModel):
+    """What a pipeline declares for one session request.
+
+    ``length`` is the number of advances of a finite session, ``None`` when the
+    session is open-ended. ``lockstep`` marks an interactive session: exactly one
+    queued input and one media result per advance, which enables ``advance(value)``
+    on the client.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    inputs: Tuple[InputSpec, ...] = ()
+    streams: Tuple[StreamSpec, ...]
+    initial_result: bool = False
+    length: Optional[int] = None
+    lockstep: bool = False
+
+    @model_validator(mode="after")
+    def _check_declarations(self) -> "SessionCapabilities":
+        names = [s.name for s in self.inputs]
+        if len(set(names)) != len(names):
+            raise ValueError(f"duplicate input names: {names}")
+        stream_names = [s.name for s in self.streams]
+        if len(set(stream_names)) != len(stream_names):
+            raise ValueError(f"duplicate stream names: {stream_names}")
+        if not self.streams:
+            raise ValueError("a session must declare at least one stream")
+        if self.lockstep and len(self.queued_inputs) != 1:
+            raise ValueError("a lockstep session has exactly one queued input")
+        return self
+
+    @property
+    def queued_inputs(self) -> Tuple[InputSpec, ...]:
+        return tuple(s for s in self.inputs if s.policy == "queued")
+
+    @property
+    def live_inputs(self) -> Tuple[InputSpec, ...]:
+        return tuple(s for s in self.inputs if s.policy == "live")
+
+    @property
+    def max_result_bytes(self) -> int:
+        return sum(s.max_bytes for s in self.streams)
+
+    def input(self, name: str) -> InputSpec:
+        for spec in self.inputs:
+            if spec.name == name:
+                return spec
+        raise ValueError(f"unknown input {name!r}; declared: {[s.name for s in self.inputs]}")
+
+    def stream(self, name: str) -> StreamSpec:
+        for spec in self.streams:
+            if spec.name == name:
+                return spec
+        raise ValueError(f"unknown stream {name!r}; declared: {[s.name for s in self.streams]}")
+
+    def public(self) -> Dict[str, Any]:
+        """The picklable, callable-free form sent to the client."""
+        return {
+            "inputs": [
+                {
+                    "name": s.name,
+                    "policy": s.policy,
+                    "default": s.default,
+                    "queue_depth": s.queue_depth,
+                    "max_bytes": s.max_bytes,
+                }
+                for s in self.inputs
+            ],
+            "streams": [
+                {
+                    "name": s.name,
+                    "kind": s.kind,
+                    "dtype": str(s.dtype),
+                    "max_shape": tuple(s.max_shape),
+                    "axis": s.axis,
+                    "rate": s.rate,
+                    "placement": s.placement,
+                }
+                for s in self.streams
+            ],
+            "initial_result": self.initial_result,
+            "length": self.length,
+            "lockstep": self.lockstep,
+        }
+
+
+@dataclass
+class AdvanceOutcome:
+    """What ``advance`` and ``open_session`` hand back to the executor.
+
+    ``event`` is a CUDA event recorded after every write into the slot, or ``None``
+    when all writes have completed on return. ``done`` ends the session after this
+    result. What was written is recorded by the slot itself.
+    """
+
+    event: Optional[torch.cuda.Event] = None
+    done: bool = False
+
+
+# ------------------------------------------------------------------ end session declarations
+
+
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionPipelineConfig
     from .sleep import SleepRestoreMode
+    from .slot_pool import DeliverySlot
 
 
 class BasePipeline(nn.Module):
@@ -455,13 +636,14 @@ class BasePipeline(nn.Module):
     # ``supports_sessions``. The executor owns delivery slots, advance indices,
     # stream cursors, ordering and the terminal result; the pipeline owns its
     # caches, decoder history, random state and device events and never sees
-    # queues, sockets or consumers.
+    # queues, sockets or consumers. ``open_session``, ``advance`` and
+    # ``close_session`` run under ``torch.inference_mode()``, like ``infer``.
 
     @property
     def supports_sessions(self) -> bool:
         return False
 
-    def session_capabilities(self, req: Any) -> "SessionCapabilities":
+    def session_capabilities(self, req: Any) -> SessionCapabilities:
         """Inputs, streams, geometry, length and profile for a session opened with
         ``req``. These determine admission, the slot pool and what the client may
         call. Raises ``ValueError`` when the request cannot be served as a session."""
@@ -469,7 +651,7 @@ class BasePipeline(nn.Module):
 
     def open_session(
         self, req: Any, initial_slot: Optional["DeliverySlot"]
-    ) -> Tuple[Any, "AdvanceOutcome"]:
+    ) -> Tuple[Any, AdvanceOutcome]:
         """All expensive and allocating work for a session: prompt encode,
         conditioning, cache open, graph warmup, whole-clip denoise if that is the
         model. Returns the session state (opaque to the executor) and the initial
@@ -483,10 +665,10 @@ class BasePipeline(nn.Module):
     def validate_input(self, state: Any, name: str, value: Any) -> None:
         """Schema check on rank 0 before a value is enqueued or broadcast. Raises
         ``ValueError`` for a bad value. Must not change state. The default accepts
-        anything the input's ``validate`` callable accepted."""
+        anything the input's ``validator`` accepted."""
         del state, name, value
 
-    def advance(self, state: Any, inputs: Dict[str, Any], slot: "DeliverySlot") -> "AdvanceOutcome":
+    def advance(self, state: Any, inputs: Dict[str, Any], slot: "DeliverySlot") -> AdvanceOutcome:
         """One unit of work. ``inputs`` holds one value per queued input and the
         current value of every live input. Write each produced stream into
         ``slot.buffer(name, shape, dtype)``; the slot records what was written.

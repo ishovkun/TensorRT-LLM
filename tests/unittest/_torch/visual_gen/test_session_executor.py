@@ -18,38 +18,55 @@ over fake sockets, a ``DiffusionRemoteClient`` fed by them, the public
 no worker processes, no model."""
 
 import asyncio
+import json
+import os
 import queue
+import socket
+import subprocess
+import sys
 import threading
 import time
+from concurrent.futures import Future
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionExecutor,
     DiffusionRemoteClient,
     DiffusionRequest,
+    FatalRankError,
+    SessionChannel,
 )
-from tensorrt_llm._torch.visual_gen.session import (
-    CURRENT,
-    QUEUED,
+from tensorrt_llm._torch.visual_gen.pipeline import (
     AdvanceOutcome,
     InputSpec,
     SessionCapabilities,
+    StreamSpec,
+)
+from tensorrt_llm._torch.visual_gen.session import (
+    SessionAdmitted,
+    SessionClosed,
     SessionEnded,
     SessionError,
     SessionLeaseExpired,
     SessionOpen,
+    SessionOpened,
     SessionQueueFull,
-    StreamSpec,
+    SessionResultMessage,
+    SessionSubmit,
+    input_nbytes,
 )
 from tensorrt_llm.visual_gen.session import VisualGenSession
 
 pytestmark = pytest.mark.cpu_only
 
 FRAMES, H, W = 4, 2, 3
+ONE_INT = input_nbytes(1)  # the declared bound of the harness inputs: one small int
 
 
 class CountingPipeline:
@@ -64,6 +81,8 @@ class CountingPipeline:
 
     def __init__(self, *, queued=True, initial=True, length=None, fail_at=None, open_fails=False):
         self.queued = queued
+        # When set, every advance waits on it before writing (tests gate the worker).
+        self.advance_gate: Optional[threading.Event] = None
         self.initial = initial
         self.length = length
         self.fail_at = fail_at
@@ -81,11 +100,19 @@ class CountingPipeline:
     def session_capabilities(self, req):
         inputs = []
         if self.queued:
-            inputs.append(InputSpec("controls", QUEUED, validate=_non_negative, queue_depth=2))
-        inputs.append(InputSpec("camera", CURRENT, default=0))
+            inputs.append(
+                InputSpec(
+                    name="controls", max_bytes=ONE_INT, validator=_non_negative, queue_depth=2
+                )
+            )
+        inputs.append(InputSpec(name="camera", max_bytes=ONE_INT, policy="live", default=0))
         return SessionCapabilities(
             inputs=tuple(inputs),
-            streams=(StreamSpec("video", "video", torch.uint8, (1, FRAMES, H, W, 3), axis=1),),
+            streams=(
+                StreamSpec(
+                    name="video", kind="video", dtype=torch.uint8, max_shape=(1, FRAMES, H, W, 3)
+                ),
+            ),
             initial_result=self.initial,
             length=self.length,
             lockstep=self.queued,
@@ -104,6 +131,8 @@ class CountingPipeline:
         pass
 
     def advance(self, state, inputs, slot):
+        if self.advance_gate is not None:
+            self.advance_gate.wait()
         index = state.count
         state.count += 1
         if self.fail_at is not None and index == self.fail_at:
@@ -134,6 +163,9 @@ class FakeRequestSocket:
     def __init__(self):
         self.q: "queue.Queue[Any]" = queue.Queue()
 
+    def put_nowait(self, item):
+        self.q.put(item)
+
     def get(self, timeout: Optional[float] = None):
         try:
             return self.q.get(timeout=timeout)
@@ -149,13 +181,13 @@ class FakeRequestSocket:
                 return items
 
 
-def _make_executor(pipeline, session_config=None):
+def _make_executor(pipeline, session_config=None, *, rank=0, world_size=1, in_client_process=True):
     ex = DiffusionExecutor.__new__(DiffusionExecutor)
     ex.pipeline = pipeline
-    ex.rank = 0
-    ex.world_size = 1
-    ex.device_id = 0
-    ex.in_client_process = True  # same process as the client: local handles
+    ex.rank = rank
+    ex.world_size = world_size
+    ex.device_id = rank
+    ex.in_client_process = in_client_process  # True: same process as the client, local handles
     ex.response_queue = queue.Queue()
     ex.requests_ipc = FakeRequestSocket()
     ex.session_config = session_config
@@ -184,6 +216,15 @@ class Harness:
         self.client = _make_client()
         self._stop = threading.Event()
         self.worker_error: Optional[BaseException] = None
+        # Reply gates: while a kind is held, its messages queue up here in order
+        # and are routed when released; other kinds keep flowing. Lets a test
+        # observe "accepted but not yet delivered" deterministically.
+        self._held_kinds: set = set()
+        self._held_replies: list = []
+        self._hold_lock = threading.Lock()
+        # Cleared by a test to keep the client's commands in pending_requests.
+        self.send_gate = threading.Event()
+        self.send_gate.set()
         self.threads = [
             threading.Thread(target=self._forward_commands, daemon=True),
             threading.Thread(target=self._forward_replies, daemon=True),
@@ -198,6 +239,9 @@ class Harness:
                 item = self.client.pending_requests.get(timeout=0.02)
             except queue.Empty:
                 continue
+            while not self.send_gate.wait(timeout=0.02):  # a test holds commands unsent
+                if self._stop.is_set():
+                    return
             self.executor.requests_ipc.q.put(item)
 
     def _forward_replies(self):
@@ -206,7 +250,26 @@ class Harness:
                 item = self.executor.response_queue.get(timeout=0.02)
             except queue.Empty:
                 continue
+            with self._hold_lock:
+                if self._held_kinds and isinstance(item, tuple(self._held_kinds)):
+                    self._held_replies.append(item)  # released later, in order
+                    continue
             self.client._route_session_reply(item)
+
+    def hold(self, *kinds):
+        with self._hold_lock:
+            self._held_kinds.update(kinds)
+
+    def release(self):
+        with self._hold_lock:
+            self._held_kinds.clear()
+            held, self._held_replies = self._held_replies, []
+        for item in held:
+            self.client._route_session_reply(item)
+
+    def held(self, kind) -> bool:
+        with self._hold_lock:
+            return any(isinstance(m, kind) for m in self._held_replies)
 
     def _worker(self):
         try:
@@ -234,11 +297,22 @@ class Harness:
         return VisualGenSession(req.request_id, self.client, channel)
 
     def stop(self):
+        gate = self.pipeline.advance_gate
+        if gate is not None:
+            gate.set()  # never leave the worker parked inside an advance
+        self.send_gate.set()
+        self.release()
         self._stop.set()
+        # A worker still inside a session (a test that failed the channel without
+        # closing the session) waits on its request socket and never sees the
+        # stop flag; the shutdown sentinel is what ends its session loop.
+        self.executor.requests_ipc.put_nowait(None)
         for t in self.threads:
             t.join(timeout=5.0)
         if self.worker_error is not None:
             raise self.worker_error
+        alive = [t.name for t in self.threads if t.is_alive()]
+        assert not alive, f"harness threads still running: {alive}"
 
     def __enter__(self) -> "Harness":
         return self
@@ -448,19 +522,52 @@ def test_idle_timeout_ends_an_abandoned_session(harness):
         s.close()
 
 
-def test_consumer_role_is_exclusive(harness):
-    with harness(CountingPipeline()) as h:
+def test_client_send_loop_forwards_session_commands():
+    """Session commands travel through the same send loop as requests; the loop
+    must not assume every outgoing object is a ``DiffusionRequest``."""
+    client = _make_client()
+    client._request_to_send = None
+    client.requests_ipc = FakeRequestSocket()
+    req = DiffusionRequest(request_id=7, prompt=["p"], params=SimpleNamespace())
+    client.pending_requests.put(SessionOpen(req))
+    client.pending_requests.put(SessionSubmit(7, 0, "controls", 1))
+    client._process_requests()
+    client._process_requests()
+    sent = client.requests_ipc.drain()
+    assert [type(m) for m in sent] == [SessionOpen, SessionSubmit]
+    assert client._request_to_send is None
+
+
+def test_one_result_request_and_one_submit_at_a_time(harness):
+    with harness(CountingPipeline(initial=False)) as h:
         with h.open() as s:
             results = s.results()
-            with pytest.raises(SessionError):
-                s.results()
-            with pytest.raises(SessionError):
-                s.advance(1)  # iterator open
-            next(results)  # initial
+            errors = []
+
+            def wait_for_result():
+                try:
+                    next(results)
+                except SessionError as exc:
+                    errors.append(exc)
+
+            # Nothing is submitted, so the first request blocks inside the channel;
+            # a second request from another thread must be refused, not queued.
+            t = threading.Thread(target=wait_for_result)
+            t.start()
+            time.sleep(0.1)
+            with pytest.raises(SessionError, match="already in progress"):
+                next(results)
+            with pytest.raises(SessionError, match="already in progress"):
+                s.advance(1)
+            s.submit("controls", 1)
+            t.join(timeout=10)
+            assert not errors
+            # advance() and the iterator share the one held result.
+            r = s.advance(2)
+            assert int(r.video[0, 0, 0, 0, 1]) == 2
             results.close()
-            s.advance(1)
-            with pytest.raises(SessionError):
-                s.results()  # advance() holds the role now
+            with pytest.raises(SessionLeaseExpired):
+                r.outputs
 
 
 def test_advance_refuses_while_the_initial_result_is_unread(harness):
@@ -517,3 +624,2075 @@ def test_async_forms(harness):
 
         asyncio.run(run())
         assert pipe.closed == 1
+
+
+# --------------------------------------------------------------------------- worker failure
+
+
+def test_worker_failure_raises_to_the_client_instead_of_a_terminal_result(harness):
+    """A dead worker group is not a session outcome: the parked result request,
+    the submit awaiting admission and every later call raise the failure; unread
+    results are dropped and the held view expires."""
+    with harness(CountingPipeline(initial=True)) as h:
+        s = h.open()
+        results = s.results()
+        time.sleep(0.1)
+        held = next(results)  # the initial result, a view over the worker's slot
+        assert held.video is not None
+        s.submit("controls", 1)  # produces a result nobody asks for
+        time.sleep(0.2)
+        channel = h.client._sessions[s.request_id]
+        assert channel.media_pending()
+        caught = []
+
+        def wait_for_result():
+            try:
+                next(results)
+            except BaseException as exc:  # noqa: BLE001  (the test inspects the type)
+                caught.append(exc)
+
+        channel.fail("DiffusionClient: local worker processes exited: pid=1, exitcode=1")
+        with pytest.raises(SessionLeaseExpired, match="exited"):
+            held.outputs  # the held view expired with its producer
+        assert not channel.media_pending()  # the unread result was dropped, not served
+        t = threading.Thread(target=wait_for_result)
+        t.start()
+        t.join(timeout=10)
+        assert len(caught) == 1 and isinstance(caught[0], RuntimeError)
+        assert not isinstance(caught[0], SessionError)
+        assert "exited" in str(caught[0])
+        with pytest.raises(RuntimeError, match="exited"):
+            s.submit("controls", 2)
+        with pytest.raises(RuntimeError, match="exited"):
+            s.advance(2)
+        s.close()  # the close future carries the failure; close() swallows it
+        assert s.closed
+
+
+def test_worker_failure_wakes_a_parked_request(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        s = h.open()
+        results = s.results()
+        caught = []
+
+        def wait_for_result():
+            try:
+                next(results)
+            except BaseException as exc:  # noqa: BLE001
+                caught.append(exc)
+
+        t = threading.Thread(target=wait_for_result)
+        t.start()
+        time.sleep(0.1)  # nothing submitted: the request is parked in the channel
+        h.client._sessions[s.request_id].fail("worker died")
+        t.join(timeout=10)
+        assert len(caught) == 1 and isinstance(caught[0], RuntimeError)
+        s.close()
+
+
+def test_channel_fail_before_any_request():
+    channel = SessionChannel(7)
+    channel.fail("gone")
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.expect_admission("controls")
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.request_next_result()
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.opened.result()
+
+
+def test_channel_tolerates_cancelled_futures():
+    """asyncio cancellation reaches the concurrent future; fail() and the reply
+    routing must not raise on it, and a delivery to a cancelled request stays
+    the next result."""
+    channel = SessionChannel(7)
+    seq, admission = channel.expect_admission("controls")
+    admission.cancel()
+    request = channel.request_next_result()
+    request.cancel()
+    message = SessionResultMessage(7, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
+    channel.deliver(message)
+    assert channel.request_next_result().result(timeout=1) is message
+    channel.resolve_admission(seq, 0, None)  # late reply to a cancelled submit: dropped
+    channel.fail("gone")  # cancelled admission future: no InvalidStateError
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.request_next_result()
+
+
+def test_liveness_check_sees_a_dead_in_process_worker_thread():
+    """External launch runs rank 0 as a thread in the client's process; its end
+    must be reported like a dead worker process so the abort path runs."""
+    client = _make_client()
+    client._monitor_worker_liveness = True
+    client._shutdown_started = False
+    client.worker_processes = []
+    t = threading.Thread(target=lambda: None)
+    t.start()
+    t.join()
+    client._ext_worker_thread = t
+    failure = client._check_worker_liveness()
+    assert failure is not None and "external-launch worker thread exited" in failure
+
+
+# --------------------------------------------------------------------------- two ranks, one throws
+#
+# Two ranks on the gloo backend with a short collective timeout. The pipeline's open
+# and advance each enter an all-reduce; a failing rank raises either before it (a
+# pipeline-call failure, phases ``open`` / ``advance``) or after it, from the
+# completion event in ``_finish_advance`` (an asynchronous device error, phases
+# ``open_event`` / ``advance_event``). Either way the other rank is inside a
+# collective the failing rank will never join. Required: the failing rank enters no
+# further collective (no status all-reduce after a pipeline failure, no CLOSE
+# broadcast ever) and ends its worker at once; as a thread in the client's process
+# it raises FatalRankError, as a dedicated process it exits 1. The surviving rank
+# hits the collective timeout, which is the same rank-local exception, and takes
+# the same path.
+
+COLLECTIVE_TIMEOUT_S = 3.0
+
+
+class _FailingEvent:
+    """Stands in for the CUDA event of an advance whose device work failed."""
+
+    def __init__(self, events, phase):
+        self.events = events
+        self.phase = phase
+
+    def synchronize(self):
+        self.events.append(f"raise:{self.phase}")
+        raise RuntimeError(f"device error surfaced at the {self.phase} event")
+
+
+class CollectivePipeline(CountingPipeline):
+    def __init__(self, rank, fail_rank, fail_phase, events):
+        super().__init__(initial=False)
+        self.rank = rank
+        self.fail_rank = fail_rank
+        self.fail_phase = fail_phase
+        self.events = events
+
+    def _collective(self, phase):
+        if self.rank == self.fail_rank and self.fail_phase == phase:
+            self.events.append(f"raise:{phase}")
+            raise RuntimeError(f"rank {self.rank} failed in {phase}")
+        self.events.append(f"enter:{phase}")
+        dist.all_reduce(torch.zeros(1))
+        self.events.append(f"leave:{phase}")
+
+    def _outcome(self, phase, outcome):
+        if self.rank == self.fail_rank and self.fail_phase == f"{phase}_event":
+            outcome.event = _FailingEvent(self.events, f"{phase}_event")
+        return outcome
+
+    def open_session(self, req, initial_slot):
+        self._collective("open")
+        return SimpleNamespace(count=0), self._outcome("open", AdvanceOutcome())
+
+    def advance(self, state, inputs, slot):
+        self._collective("advance")
+        return self._outcome("advance", super().advance(state, inputs, slot))
+
+
+class _EventLog(list):
+    """Appends go to a file too, so the parent can read a dead child's events."""
+
+    def __init__(self, path=None):
+        super().__init__()
+        self.path = path
+
+    def append(self, item):
+        entry = (time.time(), item)
+        super().append(entry)
+        if self.path:
+            with open(self.path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+                f.flush()
+
+
+def _instrument(ex, events):
+    """Record every status all-reduce and tag broadcast the rank performs."""
+    finish, tag = ex._finish_advance, ex._broadcast_session_tag
+
+    def _finish(outcome, failed):
+        events.append("status")
+        return finish(outcome, failed)
+
+    def _tag(payload):
+        events.append("tag:" + (payload[0] if payload else "recv"))
+        return tag(payload)
+
+    ex._finish_advance = _finish
+    ex._broadcast_session_tag = _tag
+
+
+def _session_request():
+    return DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+
+
+IMPORT_WAIT_S = 600.0  # a cold import of the package from network storage takes minutes
+
+
+def _wait_for(path, timeout_s=IMPORT_WAIT_S):
+    deadline = time.monotonic() + timeout_s
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{path} never appeared")
+        time.sleep(0.02)
+
+
+def _run_rank(rank, port, fail_rank, fail_phase, events, in_client_process, holder, timeout_s):
+    """One rank's whole life for the test: join the group, run the session. The
+    executor is handed out through ``holder`` before the run so its published
+    messages can be inspected after it raised. Callers line the ranks up before
+    this (see ``_RankProcess.ready``) so the short collective timeout never
+    covers a peer that is still importing."""
+    # Join with a generous timeout (the peer may still be setting up), confirm
+    # both are in with a barrier, then arm the short timeout the test is about.
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=IMPORT_WAIT_S),
+    )
+    dist.barrier()
+    torch.distributed.distributed_c10d._set_pg_timeout(
+        timedelta(seconds=timeout_s), dist.group.WORLD
+    )
+    pipe = CollectivePipeline(rank, fail_rank, fail_phase, events)
+    ex = _make_executor(pipe, rank=rank, world_size=2, in_client_process=in_client_process)
+    _instrument(ex, events)
+    holder["executor"] = ex
+    req = _session_request()
+    if rank == 0:
+        ex.requests_ipc.put_nowait(SessionSubmit(1, 0, "controls", 1))
+    ex._run_session(req)
+
+
+def _child_main(argv):
+    """Entry of a rank process: ``python -c`` loads this file by path. Reports
+    that its imports are done, then waits for the parent's go before joining the
+    process group."""
+    rank, port, fail_rank, fail_phase, events_path, timeout_s = argv
+    with open(events_path + ".ready", "w"):
+        pass
+    _wait_for(events_path + ".go")
+    events = _EventLog(events_path)
+    _run_rank(int(rank), int(port), int(fail_rank), fail_phase, events, False, {}, float(timeout_s))
+    events.append("returned")  # only a coordinated path gets here
+
+
+_CHILD_CODE = """
+import importlib.util, os, sys
+boot = os.environ.get("SESSION_TEST_BOOTSTRAP")
+if boot:
+    exec(compile(open(boot).read(), boot, "exec"))
+spec = importlib.util.spec_from_file_location("session_rank_child", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mod._child_main(sys.argv[2:])
+"""
+
+
+class _RankProcess:
+    """A rank in its own python process, with the ``multiprocessing.Process``
+    surface the coordinator's liveness check and abort path use."""
+
+    def __init__(self, rank, port, fail_rank, fail_phase, tmp_path, timeout_s):
+        self.events_path = tmp_path / f"rank{rank}.events"
+        self.stderr_path = tmp_path / f"rank{rank}.stderr"
+        with open(self.stderr_path, "w") as stderr:
+            self._proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _CHILD_CODE,
+                    __file__,
+                    str(rank),
+                    str(port),
+                    str(fail_rank),
+                    fail_phase,
+                    str(self.events_path),
+                    str(timeout_s),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=stderr,
+            )
+        self.exited_at = None
+        self._watch = threading.Thread(target=self._wait, daemon=True)
+        self._watch.start()
+
+    def _wait(self):
+        self._proc.wait()
+        self.exited_at = time.time()
+
+    def ready(self):
+        """Block until the process has imported everything; raises if it died."""
+        deadline = time.monotonic() + IMPORT_WAIT_S
+        while not os.path.exists(f"{self.events_path}.ready"):
+            assert self.is_alive(), self.stderr()
+            assert time.monotonic() < deadline, "rank process never got through its imports"
+            time.sleep(0.05)
+
+    def go(self):
+        with open(f"{self.events_path}.go", "w"):
+            pass
+
+    @property
+    def pid(self):
+        return self._proc.pid
+
+    @property
+    def exitcode(self):
+        return self._proc.poll()
+
+    def is_alive(self):
+        return self._proc.poll() is None
+
+    def join(self, timeout=None):
+        self._watch.join(timeout)
+
+    def terminate(self):
+        self._proc.terminate()
+
+    def kill(self):
+        self._proc.kill()
+
+    def events(self):
+        if not os.path.exists(self.events_path):
+            return []
+        return [tuple(json.loads(line)) for line in open(self.events_path) if line.strip()]
+
+    def stderr(self):
+        return self.stderr_path.read_text()[-2000:]
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _names(events):
+    return [name for _, name in events]
+
+
+def _after(events, marker):
+    names = _names(events)
+    return names[names.index(marker) + 1 :] if marker in names else names
+
+
+def _published(ex):
+    out = []
+    while not ex.response_queue.empty():
+        out.append(ex.response_queue.get_nowait())
+    return out
+
+
+@pytest.mark.parametrize("fail_phase", ["open", "advance", "open_event", "advance_event"])
+@pytest.mark.parametrize("fail_rank", [0, 1])
+def test_rank_local_exception_is_fatal_not_a_hung_collective(tmp_path, fail_rank, fail_phase):
+    """Rank 0 as a thread in this process (the external-launch shape), rank 1 as a
+    dedicated process."""
+    port = _free_port()
+    child = _RankProcess(1, port, fail_rank, fail_phase, tmp_path, COLLECTIVE_TIMEOUT_S)
+    child.ready()
+    rank0_events = _EventLog()
+    outcome = {}
+
+    def rank0():
+        child.go()
+        try:
+            _run_rank(
+                0, port, fail_rank, fail_phase, rank0_events, True, outcome, COLLECTIVE_TIMEOUT_S
+            )
+        except BaseException as exc:  # noqa: BLE001
+            outcome["error"] = exc
+        outcome["ended"] = time.time()
+
+    t = threading.Thread(target=rank0, daemon=True)
+    t.start()
+    try:
+        t.join(timeout=120)
+        assert not t.is_alive(), "rank 0 hung"
+        child.join(timeout=60)
+        assert not child.is_alive(), "rank 1 hung"
+    finally:
+        if child.is_alive():
+            child.kill()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+    rank1_events = child.events()
+
+    # The in-process rank 0 raised and the caller (this test) is alive; the
+    # dedicated rank-1 process exited with status 1.
+    assert isinstance(outcome.get("error"), FatalRankError), outcome
+    assert child.exitcode == 1, child.stderr()
+
+    # The failing rank entered no further collective after raising ...
+    failing = rank0_events if fail_rank == 0 else rank1_events
+    assert f"raise:{fail_phase}" in _names(failing)
+    assert _after(failing, f"raise:{fail_phase}") == []
+    # ... and left well inside the collective timeout, so it waited in none.
+    raise_ts = next(ts for ts, n in failing if n == f"raise:{fail_phase}")
+    left_ts = outcome["ended"] if fail_rank == 0 else child.exited_at
+    assert left_ts - raise_ts < COLLECTIVE_TIMEOUT_S * 0.75
+
+    # The surviving rank was inside a collective (the pipeline's, or the status
+    # barrier after an event failure), got the timeout there and took the same
+    # fatal path: nothing after it, in particular no CLOSE.
+    surviving = rank1_events if fail_rank == 0 else rank0_events
+    base = fail_phase.removesuffix("_event")
+    last = "status" if fail_phase.endswith("_event") else f"enter:{base}"
+    assert _names(surviving)[-1] == last, _names(surviving)
+    assert "tag:close" not in _names(surviving)
+
+    # Nothing coordinated was published by rank 0: no SessionClosed, no terminal.
+    published = _published(outcome["executor"])
+    assert not any(isinstance(m, SessionClosed) for m in published)
+    assert not any(isinstance(m, SessionResultMessage) and m.done for m in published)
+    if fail_phase.startswith("advance"):
+        assert any(isinstance(m, SessionOpened) for m in published)
+
+
+def test_coordinator_contains_the_group_when_a_rank_dies(tmp_path):
+    """Both ranks as dedicated processes under a client whose liveness check runs
+    the way the background thread runs it. Rank 1 dies in its advance; the
+    coordinator notices, fails the public session (the parked waiter raises) and
+    kills rank 0, which is inside the pipeline collective, long before that
+    collective's timeout. Only liveness is wired to the workers here; the
+    session channel is the client's own, so the public failure comes from the
+    abort path and nothing else."""
+    port = _free_port()
+    timeout_s = 20.0
+    rank0 = _RankProcess(0, port, 1, "advance", tmp_path, timeout_s)
+    rank1 = _RankProcess(1, port, 1, "advance", tmp_path, timeout_s)
+    rank0.ready()
+    rank1.ready()
+    rank0.go()
+    rank1.go()
+
+    client = _make_client()
+    client._monitor_worker_liveness = True
+    client._shutdown_started = False
+    client._ext_worker_thread = None
+    client._request_to_send = None
+    client.shutdown_event = threading.Event()
+    client.response_event = threading.Event()
+    client.worker_processes = [rank0, rank1]
+    channel = SessionChannel(1)
+    client._sessions[1] = channel
+    channel.capabilities = CountingPipeline().session_capabilities(None).public()
+    channel.opened.set_result(channel)
+    session = VisualGenSession(1, client, channel)
+    results = session.results()
+    waiter = {}
+
+    def wait_for_result():
+        try:
+            next(results)
+        except BaseException as exc:  # noqa: BLE001
+            waiter["error"] = exc
+        waiter["ended"] = time.time()
+
+    def poll_liveness():
+        while not client.shutdown_event.is_set():
+            failure = client._check_worker_liveness()
+            if failure is not None:
+                client._abort_worker_group(failure)
+                return
+            time.sleep(0.01)
+
+    threading.Thread(target=wait_for_result, daemon=True).start()
+    poller = threading.Thread(target=poll_liveness, daemon=True)
+    poller.start()
+    try:
+        poller.join(timeout=120)
+        assert not poller.is_alive(), "the coordinator never saw a dead worker"
+        rank0.join(timeout=60)
+        assert not rank0.is_alive(), "the surviving rank was not killed"
+    finally:
+        for proc in (rank0, rank1):
+            if proc.is_alive():
+                proc.kill()
+
+    assert rank1.exitcode == 1, rank1.stderr()
+    # The survivor ends one of two ways, both inside the bound: killed by the
+    # coordinator (negative exit), or, where the transport reports the dead peer
+    # at once (Linux gloo), by its own fatal exit from the collective (exit 1).
+    # Never a normal return.
+    assert rank0.exitcode != 0, rank0.stderr()
+    raise_ts = next(ts for ts, n in rank1.events() if n == "raise:advance")
+    assert rank0.exited_at - raise_ts < timeout_s * 0.5  # contained before any collective timeout
+    assert _names(rank0.events())[-1] == "enter:advance"  # ended inside the collective
+    assert "exited" in client._worker_failure
+    assert isinstance(waiter.get("error"), RuntimeError) and "exited" in str(waiter["error"])
+    assert waiter["ended"] - raise_ts < timeout_s * 0.5
+    with pytest.raises(RuntimeError, match="exited"):
+        session.submit("controls", 2)
+
+
+# --------------------------------------------------------------------------- close and idle timeout
+
+
+def _wait_until(predicate, timeout=10.0, what="condition"):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.01)
+
+
+def test_close_settles_a_parked_reader(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        s = h.open()
+        results = s.results()
+        caught = []
+
+        def read():
+            try:
+                next(results)
+            except BaseException as exc:  # noqa: BLE001
+                caught.append(exc)
+
+        t = threading.Thread(target=read)
+        t.start()
+        time.sleep(0.1)  # nothing submitted: parked
+        s.close()
+        t.join(timeout=10)
+        assert not t.is_alive()
+        assert len(caught) == 1 and isinstance(caught[0], SessionEnded)
+        assert s.closed
+
+
+def test_close_async_settles_a_parked_reader(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            results = s.results()
+            reader = asyncio.ensure_future(results.__anext__())
+            await asyncio.sleep(0.1)
+            assert not reader.done()
+            await s.close_async()
+            with pytest.raises(SessionEnded):
+                await asyncio.wait_for(reader, 10)
+            assert s.closed
+
+        asyncio.run(run())
+
+
+def test_idle_timeout_expires_held_and_unread_media_and_keeps_its_terminal_once(harness):
+    pipe = CountingPipeline(initial=True)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
+        s = h.open()
+        results = s.results()
+        held = next(results)  # initial result, a view over slot storage
+        assert held.video is not None
+        s.submit("controls", 1)  # one media result nobody reads
+        channel = h.client._sessions[s.request_id]
+        _wait_until(channel.media_pending, what="the unread result")
+        _wait_until(channel.closed.done, what="the idle close")
+        assert s.closed
+        with pytest.raises(SessionLeaseExpired, match="closed"):
+            held.outputs
+        assert not channel.media_pending()  # dropped with its mapping
+        terminal = next(results)  # the timeout terminal survives the close
+        assert terminal.done and "idle timeout" in terminal.error
+        with pytest.raises(StopIteration):
+            next(results)
+        with pytest.raises(SessionEnded):
+            s.submit("controls", 2)  # prompt, no round trip to a closed session
+        with pytest.raises(SessionEnded):
+            s.advance(2)
+        s.close()  # idempotent after the worker's own close
+        _wait_until(lambda: pipe.closed == 1, what="pipeline close")
+
+
+def test_idle_timeout_keeps_an_existing_terminal_and_adds_none(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
+        s = h.open()
+        s.submit("controls", 1)  # the one advance: media, then the normal terminal
+        channel = h.client._sessions[s.request_id]
+        _wait_until(channel.closed.done, timeout=10, what="the idle close")
+        results = s.results()
+        terminal = next(results)  # media dropped, the normal terminal kept
+        assert terminal.done and terminal.error is None
+        with pytest.raises(StopIteration):
+            next(results)
+
+
+def test_first_result_request_restarts_the_idle_clock(harness):
+    """A request that returns no slot still counts as activity: the first request
+    of a session, or one after the iterator was closed."""
+    idle = 0.6
+    with harness(
+        CountingPipeline(initial=True), SimpleNamespace(delivery_slots=2, idle_timeout=idle)
+    ) as h:
+        s = h.open()
+        opened = time.monotonic()
+        channel = h.client._sessions[s.request_id]
+        time.sleep(idle * 0.6)
+        first = next(s.results())  # first request: no slot to return, so a ping
+        requested = time.monotonic()
+        assert first.advance_index is None
+        time.sleep(idle * 0.6)  # past the original deadline, inside the restarted one
+        assert not channel.closed.done(), "the request did not restart the clock"
+        _wait_until(channel.closed.done, timeout=idle * 3, what="the idle close")
+        assert time.monotonic() - requested >= idle * 0.9
+        assert time.monotonic() - opened >= idle * 1.5
+
+
+def test_replies_racing_with_close_are_harmless():
+    client = _make_client()
+    channel = client.open_session(
+        DiffusionRequest(request_id=3, prompt=["p"], params=SimpleNamespace())
+    )
+    channel.capabilities = {}
+    channel.opened.set_result(channel)
+    seq, admission = channel.expect_admission("controls")
+    parked = channel.request_next_result()
+    client._route_session_reply(SessionClosed(3))
+    assert channel.closed.done() and channel.closed.result() is None
+    with pytest.raises(SessionEnded):
+        admission.result(timeout=1)
+    with pytest.raises(SessionEnded):
+        parked.result(timeout=1)
+    # In flight behind the close: a late admission, media, a second close.
+    client._route_session_reply(SessionAdmitted(3, seq, advance_index=0))
+    client._route_session_reply(
+        SessionResultMessage(3, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
+    )
+    client._route_session_reply(SessionClosed(3))
+    assert not channel.media_pending()
+    with pytest.raises(SessionEnded):
+        channel.request_next_result()
+    with pytest.raises(SessionEnded):
+        channel.expect_admission("controls")
+    # A failure after the close changes nothing.
+    channel.fail("worker died")
+    assert channel.lease_lost is not None and "closed" in channel.lease_lost
+
+
+# --------------------------------------------------------------------------- close racing a handed-out result
+#
+# The response thread may complete a reader's future and the close may land before
+# the reader resumes (an await, a preempted thread). The driving below is done by
+# hand on the channel, so every ordering is deterministic and nothing sleeps.
+
+
+def _timeout_terminal(session_id, sequence):
+    return SessionResultMessage(
+        session_id,
+        sequence,
+        None,
+        None,
+        {},
+        {},
+        done=True,
+        error="session idle timeout (0s) expired",
+    )
+
+
+def test_media_handed_out_before_a_timeout_close_yields_the_terminal(harness):
+    with harness(CountingPipeline(initial=True)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        fut = s._begin_receive()  # the initial media completes it at once
+        media = fut.result(timeout=5)
+        assert media.slot_id is not None
+        # Before the reader resumes: the worker times out and closes.
+        channel.deliver(_timeout_terminal(s.request_id, 7))
+        h.client._route_session_reply(SessionClosed(s.request_id))
+        assert channel.closed.done()
+        result = s._end_receive(media)  # resumes: the media is gone, the terminal is next
+        assert result.done and "idle timeout" in result.error
+        assert result.outputs == {} and result.copy().outputs == {}  # no storage to expire
+        assert not channel.media_pending()
+        with pytest.raises(StopIteration):
+            next(s.results())
+
+
+def test_media_handed_out_before_an_explicit_close_ends_the_read(harness):
+    with harness(CountingPipeline(initial=True)) as h:
+        s = h.open()
+        fut = s._begin_receive()
+        media = fut.result(timeout=5)
+        h.client._route_session_reply(SessionClosed(s.request_id))  # no terminal: explicit close
+        with pytest.raises(SessionEnded):
+            s._end_receive(media)
+        assert not s._receiving.locked()  # the busy flag was released on the way out
+        with pytest.raises(SessionEnded):
+            s._begin_receive()
+
+
+def test_media_handed_out_before_a_close_is_dropped_async(harness):
+    """The async reader resumes after the close; same outcome, same ordering,
+    driven from the loop's own thread."""
+    with harness(CountingPipeline(initial=True)) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            fut = s._begin_receive()
+            media = await asyncio.wrap_future(fut)  # completed by the initial result
+            channel.deliver(_timeout_terminal(1, 7))
+            h.client._route_session_reply(SessionClosed(1))
+            result = s._end_receive(media)
+            assert result.done and "idle timeout" in result.error and result.outputs == {}
+            with pytest.raises(StopAsyncIteration):
+                await s.results().__anext__()
+
+        asyncio.run(run())
+
+
+def test_abandon_after_close_does_not_resurrect_media(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        fut = channel.request_next_result()  # parked: nothing published yet
+        s.submit("controls", 1)
+        assert fut.result(timeout=5).slot_id is not None  # the advance completed the request
+        channel.deliver(_timeout_terminal(s.request_id, 9))
+        h.client._route_session_reply(SessionClosed(s.request_id))
+        channel.abandon(fut)  # the reader gave up on it after the close
+        assert not channel.media_pending()
+        terminal = channel.request_next_result().result(timeout=1)
+        assert terminal.done
+        with pytest.raises(SessionEnded):
+            channel.request_next_result()
+        s.close()
+
+
+def test_abandon_before_close_requeues_media_and_a_terminal_survives_abandon_after_close(harness):
+    with harness(CountingPipeline(initial=True)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        fut = channel.request_next_result()
+        media = fut.result(timeout=5)  # the initial result
+        channel.abandon(fut)  # before any close: still the next result
+        assert channel.media_pending()
+        again = channel.request_next_result().result(timeout=1)
+        assert again.sequence == media.sequence
+        # A terminal handed out and abandoned across the close stays deliverable.
+        fut = channel.request_next_result()
+        channel.deliver(_timeout_terminal(s.request_id, 9))
+        terminal = fut.result(timeout=1)
+        h.client._route_session_reply(SessionClosed(s.request_id))
+        channel.abandon(fut)
+        assert channel.request_next_result().result(timeout=1) is terminal
+        with pytest.raises(SessionEnded):
+            channel.request_next_result()
+        s.close()
+
+
+def test_terminals_keep_empty_outputs_after_the_close(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
+        s = h.open()
+        s.submit("controls", 1)  # media, then the normal terminal
+        channel = h.client._sessions[s.request_id]
+        _wait_until(channel.closed.done, what="the idle close")
+        terminal = next(s.results())
+        assert terminal.done and terminal.error is None
+        assert terminal.outputs == {} and terminal.video is None
+        assert terminal.copy().outputs == {}
+        with pytest.raises(StopIteration):
+            next(s.results())
+
+
+# --------------------------------------------------------------------------- explicit close discards terminals
+
+
+def _wait_for_terminal(channel):
+    """The worker publishes media then the normal terminal; wait for the latter."""
+    _wait_until(lambda: any(m.done for m in channel._unread_messages), what="the queued terminal")
+
+
+def test_explicit_close_discards_a_queued_terminal_behind_handed_out_media(harness):
+    with harness(CountingPipeline(initial=False, length=1)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        s.submit("controls", 1)
+        fut = s._begin_receive()
+        media = fut.result(timeout=5)
+        _wait_for_terminal(channel)
+        s.close()  # the client cancels: nothing undelivered survives
+        with pytest.raises(SessionEnded):
+            s._end_receive(media)
+        assert not channel._unread_messages
+        with pytest.raises(SessionError):  # closed by the client: calls refuse outright
+            next(s.results())
+
+
+def test_explicit_close_discards_a_handed_out_terminal(harness):
+    with harness(CountingPipeline(initial=False, length=1)) as h:
+        s = h.open()
+        s.submit("controls", 1)
+        with s.results() as results:
+            media = next(results)
+            assert not media.done
+        fut = s._begin_receive()
+        terminal = fut.result(timeout=5)
+        assert terminal.done and terminal.error is None
+        s.close()
+        with pytest.raises(SessionEnded):
+            s._end_receive(terminal)
+
+
+def test_explicit_close_async_discards_a_handed_out_terminal(harness):
+    with harness(CountingPipeline(initial=False, length=1)) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            await s.submit_async("controls", 1)
+            fut = s._begin_receive()
+            media = await asyncio.wrap_future(fut)
+            s._end_receive(media)
+            fut = s._begin_receive()
+            terminal = await asyncio.wrap_future(fut)
+            assert terminal.done
+            await s.close_async()
+            with pytest.raises(SessionEnded):
+                s._end_receive(terminal)
+
+        asyncio.run(run())
+
+
+def test_terminal_abandoned_across_an_explicit_close_is_gone(harness):
+    with harness(CountingPipeline(initial=False, length=1)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        s.submit("controls", 1)
+        fut = channel.request_next_result()
+        assert fut.result(timeout=5).slot_id is not None
+        channel.abandon(fut)  # media back at the front, before any close
+        fut = channel.request_next_result()
+        fut.result(timeout=5)  # the media again
+        channel.abandon(fut)
+        _wait_for_terminal(channel)
+        s.close()
+        assert not channel._unread_messages  # the queued terminal went with the close
+        fut2 = Future()
+        fut2.set_result(_timeout_terminal(s.request_id, 9))
+        channel.abandon(fut2)  # a terminal handed out earlier, abandoned now: not restored
+        assert not channel._unread_messages
+        with pytest.raises(SessionEnded):
+            channel.request_next_result()
+
+
+def test_worker_initiated_close_still_keeps_its_terminal(harness):
+    """The timeout path is unchanged by the cancellation rule."""
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
+        s = h.open()
+        s.submit("controls", 1)
+        channel = h.client._sessions[s.request_id]
+        _wait_until(channel.closed.done, what="the idle close")
+        assert not channel.cancelled
+        terminal = next(s.results())
+        assert terminal.done and terminal.error is None
+
+
+def test_explicit_close_after_a_timeout_close_discards_the_retained_terminal(harness):
+    with harness(
+        CountingPipeline(initial=True), SimpleNamespace(delivery_slots=2, idle_timeout=0.15)
+    ) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        fut = s._begin_receive()
+        media = fut.result(timeout=5)  # the initial result, handed out
+        channel.closed.result(timeout=5)  # the timeout won; its terminal is retained
+        assert any(m.done for m in channel._unread_messages)
+        s.close()  # explicit cancellation after the worker close: discard everything
+        assert not channel._unread_messages
+        with pytest.raises(SessionEnded):
+            s._end_receive(media)
+
+
+def test_timeout_close_without_explicit_close_still_returns_its_terminal(harness):
+    with harness(
+        CountingPipeline(initial=True), SimpleNamespace(delivery_slots=2, idle_timeout=0.15)
+    ) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        fut = s._begin_receive()
+        media = fut.result(timeout=5)
+        channel.closed.result(timeout=5)
+        terminal = s._end_receive(media)  # media dropped, the retained terminal built
+        assert terminal.done and "idle timeout" in terminal.error and terminal.outputs == {}
+        with pytest.raises(StopIteration):
+            next(s.results())
+
+
+# --------------------------------------------------------------------------- advance(): input to result
+#
+# advance(value) must return the media of the value it admitted. The hazards are
+# results that are owed but not yet in the client's hands: the declared initial
+# result still in transit behind SessionOpened, an earlier queued value still
+# computing or its media still in transit. Gating the worker (advance_gate) and
+# the reply forwarding (Harness.hold) makes each ordering deterministic.
+
+
+def test_advance_refuses_while_the_initial_result_is_in_transit(harness):
+    with harness(CountingPipeline(initial=True)) as h:
+        h.hold(SessionResultMessage)  # SessionOpened passes, the initial media does not
+        s = h.open()
+        _wait_until(lambda: h.held(SessionResultMessage), what="the held initial result")
+        assert not h.client._sessions[s.request_id].media_pending()  # nothing arrived yet
+        with pytest.raises(SessionError, match="initial result is unread"):
+            s.advance(1)
+        assert h.pipeline.advances == []  # nothing was submitted
+        h.release()
+        first = next(s.results())
+        assert first.advance_index is None
+        r = s.advance(1)
+        assert r.advance_index == 0 and _pixels(r) == (0, 1, 0)
+
+
+def test_advance_refuses_while_an_earlier_input_is_still_computing(harness):
+    pipe = CountingPipeline(initial=False)
+    pipe.advance_gate = threading.Event()
+    with harness(pipe) as h:
+        s = h.open()
+        assert s.submit("controls", 1) == 0
+        _wait_until(lambda: h.executor.pipeline is pipe and pipe.advance_gate is not None)
+        with pytest.raises(SessionError, match="advance 0.*unread"):
+            s.advance(2)  # advance 0 is computing: nothing in the deque, still refused
+        pipe.advance_gate.set()
+        with s.results() as results:
+            r0 = next(results)
+            assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)
+        r1 = s.advance(2)
+        assert r1.advance_index == 1 and _pixels(r1) == (1, 2, 0)
+        assert [a["controls"] for a in pipe.advances] == [1, 2]
+
+
+def test_advance_refuses_while_an_earlier_result_is_in_transit(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        s = h.open()
+        h.hold(SessionResultMessage)
+        s.submit("controls", 1)
+        _wait_until(lambda: h.held(SessionResultMessage), what="the held media")
+        with pytest.raises(SessionError, match="advance 0.*unread"):
+            s.advance(2)
+        h.release()
+        assert next(s.results()).advance_index == 0
+        assert s.advance(2).advance_index == 1
+
+
+def test_iterator_request_is_refused_while_advance_awaits_admission(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        s = h.open()
+        results = s.results()
+        h.hold(SessionAdmitted)  # advance() will park in its submit
+        outcome = {}
+
+        def run_advance():
+            try:
+                outcome["result"] = s.advance(1)
+            except BaseException as exc:  # noqa: BLE001
+                outcome["error"] = exc
+
+        t = threading.Thread(target=run_advance)
+        t.start()
+        _wait_until(lambda: h.held(SessionAdmitted), what="the held admission")
+        with pytest.raises(SessionError, match="already in progress"):
+            next(results)  # the reservation covers the admission wait
+        with pytest.raises(SessionError, match="already in progress"):
+            s.advance(2)
+        h.release()
+        t.join(timeout=10)
+        assert "error" not in outcome, outcome
+        assert outcome["result"].advance_index == 0 and _pixels(outcome["result"]) == (0, 1, 0)
+        assert not s._receiving.locked()
+        assert s.advance(2).advance_index == 1
+
+
+def test_iterator_request_is_refused_while_advance_async_awaits_admission(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            results = s.results()
+            h.hold(SessionAdmitted)
+            task = asyncio.ensure_future(s.advance_async(1))
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: _wait_until(lambda: h.held(SessionAdmitted), what="admission")
+            )
+            with pytest.raises(SessionError, match="already in progress"):
+                await results.__anext__()
+            h.release()
+            r = await asyncio.wait_for(task, 10)
+            assert r.advance_index == 0
+            assert (await s.advance_async(2)).advance_index == 1
+            await s.close_async()
+
+        asyncio.run(run())
+
+
+def test_advance_returns_its_admitted_index_in_sequence(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open() as s:
+            for value in (5, 6, 7):
+                r = s.advance(value)
+                assert r.advance_index == value - 5 and _pixels(r) == (value - 5, value, 0)
+
+
+def test_advance_after_the_session_ended_returns_the_terminal_once_without_submitting(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe) as h:
+        with h.open() as s:
+            r = s.advance(1)
+            assert r.advance_index == 0
+            channel = h.client._sessions[s.request_id]
+            _wait_until(lambda: any(m.done for m in channel._unread_messages), what="the terminal")
+            sent = []
+            original = h.client.session_submit
+            h.client.session_submit = lambda *a, **k: (sent.append(a), original(*a, **k))[1]
+            terminal = s.advance(2)  # the terminal is already here: nothing is submitted
+            assert terminal.done and terminal.error is None
+            assert sent == [] and [a["controls"] for a in pipe.advances] == [1]
+            with pytest.raises(SessionEnded):
+                s.advance(3)
+
+
+def test_advance_whose_input_fails_returns_the_error_terminal(harness):
+    pipe = CountingPipeline(initial=False, fail_at=1)
+    with harness(pipe) as h:
+        with h.open() as s:
+            assert s.advance(1).advance_index == 0
+            terminal = s.advance(2)  # admitted as 1, the advance raised: terminal instead
+            assert terminal.done and "kernel exploded" in terminal.error
+            with pytest.raises(SessionEnded):
+                s.advance(3)
+
+
+def test_rejected_input_leaves_advance_and_results_usable(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open() as s:
+            with pytest.raises(ValueError):
+                s.advance(-1)  # the validator rejects it
+            assert not s._receiving.locked() and not s._submitting.locked()
+            assert s.advance(1).advance_index == 0  # holds one of the two slots
+            h.hold(SessionResultMessage)  # results stay in transit: no slot comes back
+            for value in (2, 3, 4):  # 2 takes the last free slot, 3 and 4 fill the queue
+                s.submit("controls", value)
+            with pytest.raises(SessionQueueFull):
+                s.submit("controls", 5)
+            assert not s._submitting.locked()
+            with pytest.raises(SessionError, match="unread"):
+                s.advance(6)  # three results owed
+            h.release()
+            with s.results() as results:
+                assert [next(results).advance_index for _ in range(3)] == [1, 2, 3]
+            assert s.advance(6).advance_index == 4
+
+
+@pytest.mark.parametrize("slots", [1, 2])
+def test_advance_releases_its_lease_before_waiting(harness, slots):
+    """With one slot the worker cannot produce the next result until the held one
+    is returned; advance() returns it at entry, before admission."""
+    with harness(
+        CountingPipeline(initial=False), SimpleNamespace(delivery_slots=slots, idle_timeout=None)
+    ) as h:
+        with h.open() as s:
+            previous = None
+            for value in (1, 2, 3):
+                r = s.advance(value)
+                assert r.advance_index == value - 1
+                if previous is not None:
+                    with pytest.raises(SessionLeaseExpired):
+                        previous.outputs
+                previous = r
+
+
+# --------------------------------------------------------------------------- advance(): what is owed
+#
+# The owed-media bookkeeping lives in the channel and is kept by the background
+# thread, so a cancelled submit does not lose an admission, and a terminal that
+# has arrived supersedes admissions that ended without media.
+
+
+def test_advance_async_does_not_submit_when_the_terminal_is_known(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            assert (await s.advance_async(1)).advance_index == 0
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: _wait_until(channel.terminal_next, what="terminal")
+            )
+            sent = []
+            original = h.client.session_submit
+            h.client.session_submit = lambda *a, **k: (sent.append(a), original(*a, **k))[1]
+            terminal = await s.advance_async(2)
+            assert terminal.done and sent == []
+            with pytest.raises(SessionEnded):
+                await s.advance_async(3)
+            await s.close_async()
+
+        asyncio.run(run())
+
+
+def test_advance_takes_the_terminal_when_the_earlier_input_died_without_media(harness):
+    pipe = CountingPipeline(initial=False, fail_at=0)
+    with harness(pipe) as h:
+        with h.open() as s:
+            assert s.submit("controls", 1) == 0  # admitted, then the advance raises
+            channel = h.client._sessions[s.request_id]
+            _wait_until(channel.terminal_next, what="the error terminal")
+            assert channel.owed_media() is not None  # index 0 is still recorded ...
+            terminal = s.advance(2)  # ... but the terminal supersedes it; nothing submitted
+            assert terminal.done and "kernel exploded" in terminal.error
+            assert [a["controls"] for a in pipe.advances] == []
+            with pytest.raises(SessionEnded):
+                s.advance(3)
+
+
+def test_advance_takes_a_retained_timeout_terminal_after_the_worker_closed(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.15)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        _wait_until(channel.closed.done, what="the idle close")
+        terminal = s.advance(1)  # closed by the worker, terminal retained: delivered, not refused
+        assert terminal.done and "idle timeout" in terminal.error
+        with pytest.raises(SessionEnded):
+            s.advance(2)
+
+
+def test_advance_still_refuses_while_real_media_precedes_the_terminal(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe) as h:
+        with h.open() as s:
+            s.submit("controls", 1)  # media 0, then the normal terminal
+            channel = h.client._sessions[s.request_id]
+            _wait_until(lambda: any(m.done for m in channel._unread_messages), what="terminal")
+            assert channel.media_pending()
+            with pytest.raises(SessionError, match="advance 0.*unread"):
+                s.advance(2)
+            with s.results() as results:
+                assert next(results).advance_index == 0
+            assert s.advance(2).done
+
+
+def test_cancelled_submit_keeps_its_admission_and_its_media(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            h.hold(SessionAdmitted, SessionResultMessage)  # released later in wire order
+            task = asyncio.ensure_future(s.submit_async("controls", 1))
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: _wait_until(lambda: h.held(SessionAdmitted), what="admission")
+            )
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not s._submitting.locked()
+            h.release()
+            await loop.run_in_executor(
+                None, lambda: _wait_until(channel.media_pending, what="media")
+            )
+            assert channel.owed_media() is not None  # index 0 is owed although nobody awaited it
+            with pytest.raises(SessionError, match="advance 0.*unread"):
+                await s.advance_async(2)  # refused: nothing admitted, result 0 not consumed
+            assert [a["controls"] for a in pipe.advances] == [1]
+            results = s.results()
+            r0 = await results.__anext__()  # the old media is still obtainable
+            assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)
+            assert channel.owed_media() is None
+            assert (await s.advance_async(2)).advance_index == 1
+            await s.close_async()
+
+        asyncio.run(run())
+
+
+def test_cancelled_advance_async_keeps_its_admission(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            h.hold(SessionAdmitted, SessionResultMessage)
+            task = asyncio.ensure_future(s.advance_async(1))
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: _wait_until(lambda: h.held(SessionAdmitted), what="admission")
+            )
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not s._receiving.locked() and not s._submitting.locked()
+            h.release()
+            await loop.run_in_executor(
+                None, lambda: _wait_until(channel.media_pending, what="media")
+            )
+            with pytest.raises(SessionError, match="advance 0.*unread"):
+                await s.advance_async(2)
+            r0 = await s.results().__anext__()
+            assert r0.advance_index == 0
+            await s.close_async()  # closing after a cancellation works
+            assert s.closed
+
+        asyncio.run(run())
+
+
+def _drive_cancelled_submit_then_advance(h, start_call):
+    """The reviewer's interleaving: a submit is cancelled while its admission is
+    held; then, right after advance's owed check passes, the held replies arrive
+    (admission of index 0, media 0) before advance reserves its own admission."""
+
+    async def run():
+        req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+        channel = h.client.open_session(req)
+        await asyncio.wrap_future(channel.opened)
+        s = VisualGenSession(1, h.client, channel)
+        loop = asyncio.get_running_loop()
+        h.hold(SessionAdmitted, SessionResultMessage)
+        task = asyncio.ensure_future(start_call(s))
+        await loop.run_in_executor(
+            None, lambda: _wait_until(lambda: h.held(SessionAdmitted), what="admission")
+        )
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not s._receiving.locked() and not s._submitting.locked()
+        seen = {}
+        original = channel.owed_media
+
+        def owed_then_replies_arrive():
+            seen["owed"] = original()
+            h.release()  # the background thread resolves the old admission now
+            _wait_until(channel.media_pending, what="media 0")
+            return seen["owed"]
+
+        channel.owed_media = owed_then_replies_arrive
+        with pytest.raises(SessionError, match="unread|awaiting admission"):
+            await s.advance_async(2)
+        channel.owed_media = original
+        assert seen["owed"] is not None  # the unanswered submit already counted as owed
+        assert [a["controls"] for a in h.pipeline.advances] == [1]  # no second input admitted
+        r0 = await s.results().__anext__()
+        assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)  # media 0 still obtainable
+        assert (await s.advance_async(2)).advance_index == 1
+        await s.close_async()
+
+    asyncio.run(run())
+
+
+def test_advance_cannot_slip_between_the_owed_check_and_a_late_admission(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        _drive_cancelled_submit_then_advance(h, lambda s: s.submit_async("controls", 1))
+
+
+def test_advance_cannot_slip_after_a_cancelled_advance_async(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        _drive_cancelled_submit_then_advance(h, lambda s: s.advance_async(1))
+
+
+def test_advance_reservation_refuses_when_results_become_owed_meanwhile():
+    """The atomic half: even if the pre-check passed, the reservation refuses once
+    something is owed at that moment."""
+    channel = SessionChannel(5)
+    channel.declare({"inputs": [{"name": "controls", "policy": "queued"}], "initial_result": False})
+    seq, fut = channel.expect_admission("controls")
+    channel.resolve_admission(seq, 0, None)  # index 0 is owed from now on
+    assert fut.result(timeout=1) == 0
+    with pytest.raises(SessionError, match="advance 0.*unread"):
+        channel.expect_admission("controls", nothing_owed=True)
+    seq2, fut2 = channel.expect_admission("controls")  # an ordinary submit still queues
+    assert fut2 is not None and seq2 == seq + 1
+
+
+# --------------------------------------------------------------------------- advance(): the session ends mid-call
+
+
+def _idle_closes_before_the_submit(s, channel):
+    """Wrap _begin_submit so the worker's idle close (terminal, SessionClosed) has
+    landed by the time advance tries to reserve its admission."""
+    original = s._begin_submit
+
+    def wait_then_begin(*args, **kwargs):
+        _wait_until(channel.closed.done, what="the idle close")
+        return original(*args, **kwargs)
+
+    s._begin_submit = wait_then_begin
+    return lambda: setattr(s, "_begin_submit", original)
+
+
+def test_advance_returns_the_terminal_when_the_idle_close_lands_before_its_submit(harness):
+    with harness(
+        CountingPipeline(initial=False), SimpleNamespace(delivery_slots=2, idle_timeout=0.15)
+    ) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        restore = _idle_closes_before_the_submit(s, channel)
+        terminal = s.advance(1)
+        restore()
+        assert terminal.done and "idle timeout" in terminal.error
+        assert not s._receiving.locked() and not s._submitting.locked()
+        with pytest.raises(SessionEnded):
+            s.advance(2)
+
+
+def test_advance_async_returns_the_terminal_when_the_idle_close_lands_before_its_submit(harness):
+    with harness(
+        CountingPipeline(initial=False), SimpleNamespace(delivery_slots=2, idle_timeout=0.15)
+    ) as h:
+
+        async def run():
+            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
+            channel = h.client.open_session(req)
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            restore = _idle_closes_before_the_submit(s, channel)
+            terminal = await s.advance_async(1)
+            restore()
+            assert terminal.done and "idle timeout" in terminal.error
+            assert not s._receiving.locked() and not s._submitting.locked()
+            with pytest.raises(SessionEnded):
+                await s.advance_async(2)
+
+        asyncio.run(run())
+
+
+def test_advance_ends_when_an_explicit_close_lands_before_its_submit(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        original = s._begin_submit
+
+        def close_then_begin(*args, **kwargs):
+            h.client.session_close(channel).result(timeout=10)  # the client's own close
+            return original(*args, **kwargs)
+
+        s._begin_submit = close_then_begin
+        with pytest.raises(SessionEnded):
+            s.advance(1)  # cancelled close: nothing retained, the call ends
+        s._begin_submit = original
+        assert not s._receiving.locked() and not s._submitting.locked()
+        s.close()
+
+
+def test_advance_raises_the_worker_failure_when_it_lands_before_its_submit(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        original = s._begin_submit
+
+        def fail_then_begin(*args, **kwargs):
+            channel.fail("DiffusionClient: local worker processes exited")
+            return original(*args, **kwargs)
+
+        s._begin_submit = fail_then_begin
+        with pytest.raises(RuntimeError, match="exited"):
+            s.advance(1)
+        s._begin_submit = original
+        assert not s._receiving.locked() and not s._submitting.locked()
+        s.close()
+
+
+# --------------------------------------------------------------------------- one session per model instance
+
+
+def _request(request_id):
+    return DiffusionRequest(request_id=request_id, prompt=["p"], params=SimpleNamespace())
+
+
+def test_second_open_is_refused_at_once_and_the_first_session_stays_usable(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open() as s:
+            t0 = time.monotonic()
+            with pytest.raises(MemoryError, match="session 1 is open"):
+                h.client.open_session(_request(2))
+            assert time.monotonic() - t0 < 1.0
+            assert list(h.client._sessions) == [1]
+            assert h.executor._deferred == []
+            assert s.advance(1).advance_index == 0
+
+
+def test_second_open_async_is_refused_at_once(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+
+        async def run():
+            channel = h.client.open_session(_request(1))
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            with pytest.raises(MemoryError):
+                h.client.open_session(_request(2))
+            assert (await s.advance_async(1)).advance_index == 0
+            await s.close_async()
+
+        asyncio.run(run())
+
+
+def test_second_open_is_refused_while_the_worker_is_inside_an_advance(harness):
+    pipe = CountingPipeline(initial=False)
+    pipe.advance_gate = threading.Event()
+    with harness(pipe) as h:
+        s = h.open()
+        s.submit("controls", 1)  # the worker is now parked inside advance 0
+        t0 = time.monotonic()
+        with pytest.raises(MemoryError):
+            h.client.open_session(_request(2))
+        assert time.monotonic() - t0 < 1.0  # no round trip to the busy worker
+        pipe.advance_gate.set()
+        assert next(s.results()).advance_index == 0
+        s.close()
+
+
+def test_competing_opens_admit_exactly_one(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        outcomes = []
+        barrier = threading.Barrier(4)
+
+        def attempt(i):
+            barrier.wait()
+            try:
+                outcomes.append(h.client.open_session(_request(i)))
+            except MemoryError as exc:
+                outcomes.append(exc)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(1, 5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        channels = [o for o in outcomes if isinstance(o, SessionChannel)]
+        assert len(channels) == 1 and len(outcomes) == 4
+        channel = channels[0]
+        channel.opened.result(timeout=10)
+        VisualGenSession(channel.session_id, h.client, channel).close()
+
+
+def test_open_succeeds_again_after_close_idle_close_and_open_failure(harness):
+    pipe = CountingPipeline(initial=False, open_fails=True)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
+        channel = h.client.open_session(_request(1))
+        with pytest.raises(ValueError):  # the pipeline refuses the open
+            channel.opened.result(timeout=10)
+        assert h.client._sessions == {}  # the reservation went with the failure
+        pipe.open_fails = False
+        s = h.open()  # explicit close releases it
+        s.close()
+        assert h.client._sessions == {}
+        s = h.open()  # idle close releases it too
+        channel = h.client._sessions[s.request_id]
+        _wait_until(channel.closed.done, what="the idle close")
+        assert h.client._sessions == {}
+        s = h.open()
+        assert s.advance(1).advance_index == 0
+        s.close()
+
+
+def test_rejected_open_releases_the_request_payload(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open():
+            released = []
+            original = h.client._discard_unsent_request
+            h.client._discard_unsent_request = lambda req: (released.append(req), original(req))[1]
+            req = _request(2)
+            with pytest.raises(MemoryError):
+                h.client.open_session(req)
+            h.client._discard_unsent_request = original
+            assert released == [req]
+
+
+def test_worker_refuses_an_open_already_in_flight_and_still_defers_a_generate(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open() as s:
+            replies = []
+            original = h.client._route_session_reply
+            h.client._route_session_reply = lambda r: (replies.append(r), original(r))[1]
+            # Straight onto the worker's socket: an open that slipped past the client.
+            h.executor.requests_ipc.put_nowait(SessionOpen(_request(7)))
+            generate = _request(8)
+            h.executor.requests_ipc.put_nowait(generate)
+            s.submit("controls", 1)  # makes the worker service its socket
+            _wait_until(
+                lambda: any(isinstance(r, SessionOpened) and r.session_id == 7 for r in replies),
+                what="the capacity reply",
+            )
+            refused = next(r for r in replies if isinstance(r, SessionOpened) and r.session_id == 7)
+            assert refused.error_type == "capacity" and "is open" in refused.error
+            assert h.executor._deferred == [generate]  # a generate still waits its turn
+            assert not any(isinstance(m, SessionOpen) for m in h.executor._deferred)
+            h.client._route_session_reply = original
+            assert next(s.results()).advance_index == 0
+            assert h.pipeline.opened == 1
+
+
+# --------------------------------------------------------------------------- open racing a worker failure
+
+
+def _request_with_payload(request_id):
+    """A request carrying one image reference, moved to shared memory the way
+    VisualGen._session_request does before open_session."""
+    ref = SimpleNamespace(content=b"\x07" * 4096)
+    req = DiffusionRequest(
+        request_id=request_id, prompt=["p"], params=SimpleNamespace(image_reference=[ref])
+    )
+    req.refs_to_shm()
+    assert req.ref_handles and ref.content == b""  # the bytes live in shared memory now
+    return req, ref
+
+
+def _aborting_client():
+    client = _make_client()
+    client._shutdown_started = False
+    client._request_to_send = None
+    client.shutdown_event = threading.Event()
+    client.response_event = threading.Event()
+    client.worker_processes = []
+    return client
+
+
+def test_open_after_a_worker_failure_refuses_and_releases_its_payload():
+    client = _aborting_client()
+    client._abort_worker_group("review probe: worker exited")
+    req, ref = _request_with_payload(3)
+    with pytest.raises(RuntimeError, match="worker exited"):
+        client.open_session(req)
+    assert client._sessions == {} and client.pending_requests.empty()
+    assert req.ref_handles is None and ref.content == b"\x07" * 4096  # handle consumed
+
+
+def test_abort_between_the_failure_check_and_the_reservation_fails_the_opener(monkeypatch):
+    """The abort lands after open_session built its channel and before it took
+    the lock: the open must then see the failure, not register behind it."""
+    import tensorrt_llm._torch.visual_gen.executor as executor_module
+
+    client = _aborting_client()
+    real = executor_module.SessionChannel
+
+    def abort_then_build(session_id):
+        client._abort_worker_group("review probe: worker exited")
+        return real(session_id)
+
+    monkeypatch.setattr(executor_module, "SessionChannel", abort_then_build)
+    req, ref = _request_with_payload(3)
+    with pytest.raises(RuntimeError, match="worker exited"):
+        client.open_session(req)
+    assert client._sessions == {} and client.pending_requests.empty()
+    assert req.ref_handles is None and ref.content == b"\x07" * 4096
+
+
+def test_abort_after_the_reservation_fails_the_opener_and_drains_its_message():
+    client = _aborting_client()
+    req, ref = _request_with_payload(3)
+    channel = client.open_session(req)
+    assert list(client._sessions) == [3] and client.pending_requests.qsize() == 1
+    client._abort_worker_group("review probe: worker exited")
+    with pytest.raises(RuntimeError, match="worker exited"):
+        channel.opened.result(timeout=1)  # the opener raises promptly
+    assert client._sessions == {}  # no reservation remains ...
+    assert client.pending_requests.empty()  # ... and the unsent open is gone
+    assert req.ref_handles is None and ref.content == b"\x07" * 4096  # payload released
+    with pytest.raises(RuntimeError, match="worker exited"):
+        client.open_session(_request(4))
+
+
+def test_rejected_second_open_consumes_its_real_payload(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open():
+            req, ref = _request_with_payload(2)
+            with pytest.raises(MemoryError):
+                h.client.open_session(req)
+            assert req.ref_handles is None and ref.content == b"\x07" * 4096
+
+
+# --------------------------------------------------------------------------- cancelled opening
+#
+# open_session_async on the client is the code VisualGen.open_session_async runs
+# after building the request; the tests drive it directly.
+
+
+def _run_async(coro_fn):
+    asyncio.run(coro_fn())
+
+
+def test_cancelled_open_relinquishes_the_session_when_the_open_succeeds_later(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            h.hold(SessionOpened)  # the open is in progress; its reply is held
+            task = asyncio.ensure_future(h.client.open_session_async(_request(1)))
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: _wait_until(lambda: h.held(SessionOpened)))
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            channel = h.client._sessions[1]
+            assert channel.abandoned and not channel.opened.cancelled()
+            assert list(h.client._sessions) == [1]  # still reserved: the worker holds it
+            h.release()  # the late success: no InvalidStateError, closed at once
+            await loop.run_in_executor(
+                None, lambda: _wait_until(lambda: not h.client._sessions, what="release")
+            )
+            assert channel.closed.done() and channel.lease_lost is not None
+            await loop.run_in_executor(None, lambda: _wait_until(lambda: pipe.closed == 1))
+            assert pipe.opened == 1
+            s = VisualGenSession(2, h.client, await h.client.open_session_async(_request(2)))
+            assert (await s.advance_async(1)).advance_index == 0
+            await s.close_async()
+
+        _run_async(run)
+
+
+def test_cancelled_open_whose_open_fails_later_releases_the_reservation(harness):
+    pipe = CountingPipeline(initial=False, open_fails=True)
+    with harness(pipe) as h:
+
+        async def run():
+            h.hold(SessionOpened)
+            task = asyncio.ensure_future(h.client.open_session_async(_request(1)))
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: _wait_until(lambda: h.held(SessionOpened)))
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            h.release()  # the late failure: no InvalidStateError
+            await loop.run_in_executor(
+                None, lambda: _wait_until(lambda: not h.client._sessions, what="release")
+            )
+            pipe.open_fails = False
+            channel = await h.client.open_session_async(_request(2))
+            VisualGenSession(2, h.client, channel).close()
+
+        _run_async(run)
+
+
+def test_cancellation_after_the_open_completed_but_before_the_handle_is_returned(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            channels = []
+            original = h.client.open_session
+            h.client.open_session = lambda req: (channels.append(original(req)), channels[-1])[1]
+            task = asyncio.ensure_future(h.client.open_session_async(_request(1)))
+            loop = asyncio.get_running_loop()
+            # Let the task start and send its open; block the loop thread until the
+            # worker's success is in, so the task cannot have resumed yet.
+            await asyncio.sleep(0)
+            channels[0].opened.result(timeout=10)
+            task.cancel()  # arrives before the task sees its completed future
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await loop.run_in_executor(
+                None, lambda: _wait_until(lambda: not h.client._sessions, what="release")
+            )
+            await loop.run_in_executor(None, lambda: _wait_until(lambda: pipe.closed == 1))
+            h.client.open_session = original
+            channel = await h.client.open_session_async(_request(2))
+            VisualGenSession(2, h.client, channel).close()
+
+        _run_async(run)
+
+
+def test_cancelled_open_still_unsent_does_not_leave_an_ownerless_session(harness):
+    """The open is cancelled while its command is still in the client's queue
+    (the sender is gated, as when it is busy behind an earlier request); when the
+    worker eventually opens it, the session is closed and the reservation freed."""
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            h.send_gate.clear()
+            task = asyncio.ensure_future(h.client.open_session_async(_request(1)))
+            await asyncio.sleep(0)
+            assert pipe.opened == 0  # the open is still on the client's side of the gate
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            loop = asyncio.get_running_loop()
+            h.send_gate.set()
+            await loop.run_in_executor(
+                None, lambda: _wait_until(lambda: not h.client._sessions, what="release")
+            )
+            await loop.run_in_executor(None, lambda: _wait_until(lambda: pipe.closed == 1))
+            assert pipe.opened == 1 and pipe.closed == 1
+
+        _run_async(run)
+
+
+def test_open_reply_routing_tolerates_a_cancelled_lifecycle_future():
+    client = _make_client()
+    channel = client.open_session(_request(9))
+    channel.opened.cancel()  # a caller that bypassed the shield
+    client._route_session_reply(
+        SessionOpened(9, capabilities={"inputs": [], "streams": []}, slots=[])
+    )
+    assert list(client._sessions) == [9]  # success recorded, nothing raised
+    client._route_session_reply(SessionClosed(9))
+    assert client._sessions == {}
+    channel = client.open_session(_request(10))
+    channel.opened.cancel()
+    client._route_session_reply(SessionOpened(10, error="bad prompt", error_type="client"))
+    assert client._sessions == {}
+
+
+# --------------------------------------------------------------------------- result request cancelled during delivery
+
+
+def test_delivery_to_a_cancelled_request_requeues_under_the_lock(harness):
+    """The reader's future is cancelled while a delivery is about to complete it:
+    the message goes back to the front under the same lock, so the next request
+    takes it at once and nothing waits beside it."""
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            channel = h.client.open_session(_request(1))
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            results = s.results()
+            first = asyncio.ensure_future(results.__anext__())
+            await asyncio.sleep(0)
+            old = channel._next_result
+            assert old is not None
+            old.cancel()  # what the cancelled awaiter does to the parked future
+            await s.submit_async("controls", 1)  # delivery finds a cancelled future
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: _wait_until(channel.media_pending))
+            assert channel._next_result is None  # the invariant held: no waiter beside it
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first  # its handler abandons the cancelled future: nothing duplicated
+            assert not s._receiving.locked()
+            r0 = await results.__anext__()  # the replacement gets media 0 without another submit
+            assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)
+            await s.submit_async("controls", 2)
+            r1 = await results.__anext__()
+            assert r1.advance_index == 1 and _pixels(r1) == (1, 2, 0)
+            await s.close_async()
+
+        asyncio.run(run())
+
+
+def test_requeue_hands_the_message_to_a_parked_replacement():
+    """Channel-level: a done-but-unconsumed future is abandoned while a new
+    request is already parked; the message goes to that request, not beside it."""
+    channel = SessionChannel(4)
+    channel.declare({"inputs": [], "streams": [], "initial_result": False})
+    fut = channel.request_next_result()
+    media = SessionResultMessage(4, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
+    channel.deliver(media)
+    assert fut.result(timeout=1) is media
+    replacement = channel.request_next_result()  # parks: nothing unread
+    channel.abandon(fut)  # the owner never read it
+    assert replacement.result(timeout=1) is media
+    assert not channel.media_pending() and channel._next_result is None
+    terminal = SessionResultMessage(4, 1, None, None, {}, {}, done=True)
+    channel.deliver(terminal)
+    assert channel.request_next_result().result(timeout=1) is terminal
+
+
+def test_cancelled_delivery_still_respects_close_and_failure():
+    channel = SessionChannel(4)
+    channel.declare({"inputs": [], "streams": [], "initial_result": False})
+    media = SessionResultMessage(4, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
+    # Worker-initiated close with a cancelled parked request: the terminal is kept.
+    fut = channel.request_next_result()
+    fut.cancel()
+    channel.deliver(SessionResultMessage(4, 1, None, None, {}, {}, done=True, error="idle"))
+    channel.close("session 4 is closed")
+    assert channel.request_next_result().result(timeout=1).done
+    # Failure with a cancelled parked request: nothing is delivered afterwards.
+    channel = SessionChannel(5)
+    fut = channel.request_next_result()
+    fut.cancel()
+    channel.fail("worker died")
+    channel.deliver(media)
+    with pytest.raises(RuntimeError, match="worker died"):
+        channel.request_next_result()
+
+
+# --------------------------------------------------------------------------- input byte bound, end to end
+
+
+def test_oversize_inputs_are_refused_before_they_are_sent(harness):
+    pipe = CountingPipeline(initial=False)
+    validated = []
+    pipe.validate_input = lambda state, name, value: validated.append(name)
+    with harness(pipe) as h:
+        with h.open() as s:
+            assert s.capabilities["inputs"][0]["max_bytes"] == ONE_INT
+            h.send_gate.clear()  # anything queued would stay visible in pending_requests
+            import numpy as np
+
+            oversize = (
+                [1, 2],
+                torch.zeros(262144)[:1],
+                torch.zeros(262144)[:1].numpy(),
+                b"x" * 64,
+                {"a": 1.0},
+                [b""] * 100000,
+                np.broadcast_to(np.array([1.0]), (1_000_000,)),  # 8 bytes retained, 8 MB expanded
+                torch.zeros(1).expand(1_000_000),
+            )
+            for value in oversize:
+                with pytest.raises(SessionQueueFull, match="declared bound"):
+                    s.submit("controls", value)
+                with pytest.raises(SessionQueueFull, match="declared bound"):
+                    s.submit("camera", value)
+            with pytest.raises(ValueError, match="object references"):
+                s.submit("controls", np.array([b"x" * 16], dtype=object))
+            structured = np.empty(1, dtype=[("payload", object)])
+            structured["payload"][0] = b"x" * (1 << 20)
+            with pytest.raises(ValueError, match="object references"):
+                s.submit("controls", structured)
+            decorated_array = np.zeros(1, dtype=np.dtype("uint8", metadata={"p": b"x" * (1 << 20)}))
+            with pytest.raises(ValueError, match="dtype metadata"):
+                s.submit("controls", decorated_array)
+            decorated_tensor = torch.zeros(1, dtype=torch.uint8)
+            decorated_tensor.payload = b"x" * (1 << 20)
+            with pytest.raises(ValueError, match="attributes"):
+                s.submit("controls", decorated_tensor)
+            with pytest.raises(ValueError, match="attributes"):
+                s.submit("controls", decorated_tensor[:])  # a plain view of a decorated base
+            with pytest.raises(ValueError, match="dtype metadata"):
+                s.submit("controls", decorated_array.view(np.uint8))  # plain view, decorated owner
+            with pytest.raises(ValueError, match="unknown input"):
+                s.submit("unknown", bytes(1 << 20))  # no spec: refused, not queued
+            assert h.client.pending_requests.empty()  # nothing staged, nothing grew
+            assert not s._submitting.locked()
+            h.send_gate.set()
+            assert s.submit("controls", 1) == 0  # exactly the bound (one small int)
+            assert s.submit("camera", 2) == 1
+            assert next(s.results()).advance_index == 0
+            assert h.pipeline.advances == [{"controls": 1, "camera": 0}]
+            assert validated == ["controls", "camera"]  # the pipeline saw only admitted values
+
+
+def test_worker_rejects_an_oversize_input_before_its_pipeline_sees_it(harness):
+    """The worker checks name and size again, before pipeline.validate_input: a
+    submit put straight on its socket with an oversize value is refused as
+    capacity, the validator never runs on it, and the queue index does not move."""
+    pipe = CountingPipeline(initial=False)
+    validated = []
+    pipe.validate_input = lambda state, name, value: validated.append(value)
+    with harness(pipe) as h:
+        with h.open() as s:
+            replies = []
+            original = h.client._route_session_reply
+            h.client._route_session_reply = lambda r: (replies.append(r), original(r))[1]
+            import numpy as np
+
+            decorated_array = np.zeros(1, dtype=np.dtype("uint8", metadata={"p": b"x" * 4096}))
+            decorated_tensor = torch.zeros(1, dtype=torch.uint8)
+            decorated_tensor.payload = b"x" * 4096
+            put = h.executor.requests_ipc.put_nowait
+            put(SessionSubmit(s.request_id, 99, "controls", [1, 2]))
+            put(SessionSubmit(s.request_id, 98, "nope", 1))
+            put(SessionSubmit(s.request_id, 97, "controls", decorated_array))
+            put(SessionSubmit(s.request_id, 96, "controls", decorated_tensor))
+            put(SessionSubmit(s.request_id, 95, "controls", decorated_tensor[:]))
+            put(SessionSubmit(s.request_id, 94, "controls", decorated_array.view(np.uint8)))
+            s.submit("camera", 1)  # makes the worker service its socket
+            seqs = {94, 95, 96, 97, 98, 99}
+            _wait_until(
+                lambda: sum(isinstance(r, SessionAdmitted) and r.seq in seqs for r in replies) == 6,
+                what="the worker's answers",
+            )
+            by_seq = {r.seq: r for r in replies if isinstance(r, SessionAdmitted)}
+            assert by_seq[99].error_kind == "queue_full" and "declared bound" in by_seq[99].error
+            assert by_seq[98].error_kind == "invalid" and "unknown input" in by_seq[98].error
+            assert by_seq[97].error_kind == "invalid" and "dtype metadata" in by_seq[97].error
+            assert by_seq[96].error_kind == "invalid" and "attributes" in by_seq[96].error
+            assert by_seq[95].error_kind == "invalid" and "attributes" in by_seq[95].error
+            assert by_seq[94].error_kind == "invalid" and "dtype metadata" in by_seq[94].error
+            assert len(validated) == 1  # only the admitted camera value reached the validator
+            h.client._route_session_reply = original
+            assert s.submit("controls", 1) == 0  # the next index is still 0
+
+
+def test_repeated_rejected_submits_do_not_grow_staging(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open() as s:
+            channel = h.client._sessions[s.request_id]
+            for _ in range(50):
+                with pytest.raises(SessionQueueFull):
+                    s.submit("controls", [1, 2])
+            assert h.client.pending_requests.empty() and channel._awaiting_admission is None
+            assert s.submit("controls", 1) == 0
+
+
+# --------------------------------------------------------------------------- a command that cannot be sent
+
+
+class _FailingSocket:
+    """``requests_ipc`` whose send raises what the caller chose."""
+
+    def __init__(self, exc):
+        self.exc = exc
+        self.sent = []
+
+    def put_nowait(self, obj):
+        if self.exc is not None:
+            raise self.exc
+        self.sent.append(obj)
+
+
+def _sending_client(exc):
+    client = _aborting_client()
+    client.requests_ipc = _FailingSocket(exc)
+    return client
+
+
+def _declared(client, session_id):
+    channel = client.open_session(_request(session_id))
+    channel.declare(
+        {"inputs": [{"name": "x", "policy": "queued", "max_bytes": 1024}], "initial_result": False}
+    )
+    channel._complete(channel.opened, channel)
+    return channel
+
+
+def test_unserializable_submit_fails_that_call_only():
+    client = _sending_client(None)
+    channel = _declared(client, 1)
+    client._process_requests()  # the open goes out
+    client.requests_ipc.exc = TypeError("cannot pickle 'probe' object")
+    fut = client.session_submit(channel, "x", [1.0])
+    client._process_requests()
+    with pytest.raises(ValueError, match="cannot be serialized"):
+        fut.result(timeout=1)
+    assert channel._awaiting_admission is None and client._worker_failure is None
+    assert client.pending_requests.empty() and client._request_to_send is None
+    client.requests_ipc.exc = None
+    fut = client.session_submit(channel, "x", [1.0])  # the next submit goes out
+    client._process_requests()
+    sent = client.requests_ipc.sent[-1]
+    assert isinstance(sent, SessionSubmit)
+    channel.resolve_admission(sent.seq, 0, None)
+    assert fut.result(timeout=1) == 0  # no index was consumed by the failed one
+
+
+def test_unserializable_open_fails_the_opener_and_releases_everything():
+    client = _sending_client(TypeError("cannot pickle 'probe' object"))
+    req, ref = _request_with_payload(2)
+    channel = client.open_session(req)
+    client._process_requests()
+    with pytest.raises(ValueError, match="cannot be serialized"):
+        channel.opened.result(timeout=1)
+    assert client._sessions == {} and client._worker_failure is None
+    assert req.ref_handles is None and ref.content == b"\x07" * 4096  # references released
+    client.requests_ipc.exc = None
+    client.open_session(_request(3))  # capacity is free again
+    client._process_requests()
+    assert isinstance(client.requests_ipc.sent[-1], SessionOpen)
+
+
+@pytest.mark.parametrize("command", ["submit", "close", "slot_return", "activity", "open"])
+def test_transport_failure_on_a_session_command_aborts_the_group(command):
+    client = _sending_client(None)
+    channel = _declared(client, 1)
+    client._process_requests()
+    client.requests_ipc.exc = OSError("probe: send failed")
+    waiters = []
+    if command == "submit":
+        waiters.append(client.session_submit(channel, "x", [1.0]))
+    elif command == "close":
+        waiters.append(client.session_close(channel))
+    elif command == "slot_return":
+        client.session_return_slot(channel, 0)
+        waiters.append(channel.request_next_result())
+    elif command == "activity":
+        client.session_activity(channel)
+        waiters.append(channel.request_next_result())
+    else:
+        client.requests_ipc.exc = None
+        with client._sessions_lock:
+            client._sessions.clear()  # make room: a fresh open whose send then fails
+        channel = client.open_session(_request(5))
+        client.requests_ipc.exc = OSError("probe: send failed")
+        waiters.append(channel.opened)
+    client._process_requests()
+    assert client._worker_failure is not None and "send failed" in client._worker_failure
+    for fut in waiters:
+        with pytest.raises(RuntimeError, match="send failed"):
+            fut.result(timeout=1)
+    assert client._sessions == {}
+    with pytest.raises(RuntimeError, match="send failed"):
+        client.open_session(_request(9))  # sticky: every later call raises
+
+
+def test_zmq_again_still_retries_without_failing_the_call():
+    import zmq
+
+    client = _sending_client(None)
+    client._monitor_worker_liveness = False
+    channel = _declared(client, 1)
+    client._process_requests()
+    client.requests_ipc.exc = zmq.Again()
+    fut = client.session_submit(channel, "x", [1.0])
+    client._process_requests()  # not writable: kept at the head, nothing failed
+    assert not fut.done() and client._request_to_send is not None
+    client.requests_ipc.exc = None
+    client._process_requests()
+    assert isinstance(client.requests_ipc.sent[-1], SessionSubmit)
+
+
+def test_transport_failure_on_an_open_releases_its_references_exactly_once():
+    client = _sending_client(OSError("probe: send failed"))
+    req, ref = _request_with_payload(2)
+    channel = client.open_session(req)
+    client._process_requests()
+    with pytest.raises(RuntimeError, match="send failed"):
+        channel.opened.result(timeout=1)
+    assert client._sessions == {} and client._request_to_send is None
+    assert req.ref_handles is None and ref.content == b"\x07" * 4096  # consumed by the abort
+    req.refs_from_shm()  # a second release is a no-op: nothing left to consume
+    assert ref.content == b"\x07" * 4096
+
+
+def test_transport_failure_releases_the_failing_open_and_the_queued_payload_once():
+    """The open in the send slot fails; a generate with its own payload is still
+    queued behind it. Both are released by the abort, neither twice."""
+    client = _sending_client(None)
+    req, ref = _request_with_payload(2)
+    channel = client.open_session(req)
+    queued, queued_ref = _request_with_payload(3)
+    client.pending_requests.put(queued)  # an ordinary request behind the open
+    client.requests_ipc.exc = OSError("probe: send failed")
+    client._process_requests()
+    with pytest.raises(RuntimeError, match="send failed"):
+        channel.opened.result(timeout=1)
+    assert client.pending_requests.empty()
+    assert req.ref_handles is None and ref.content == b"\x07" * 4096
+    assert queued.ref_handles is None and queued_ref.content == b"\x07" * 4096
+    for r, content in ((req, ref), (queued, queued_ref)):
+        r.refs_from_shm()  # idempotent: handles are gone, content stays
+        assert content.content == b"\x07" * 4096

@@ -12,50 +12,168 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Session state shared by the executor's worker loop and its client channel.
+"""Session state owned by the executor's worker loop.
 
 A session is one generation whose model state stays alive on the worker while it
-produces results one advance at a time. This module holds what the executor owns:
-the pipeline's declared capabilities, the input queues and live values, the advance
-condition, the stream cursors and the messages that travel between the coordinator
-and rank 0. The pipeline owns its caches and never sees any of it.
+produces results one advance at a time. This module holds the input queues and
+live values, the advance condition, the stream cursors and the messages that
+travel between the coordinator and rank 0. The pipeline declares what it accepts
+and produces through ``SessionCapabilities`` in ``pipeline.py`` and never sees
+any of this.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
+import sys
 from collections import deque
 from dataclasses import dataclass
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple
 
 import torch
+
+from .pipeline import SessionCapabilities
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
 
-
-class InputPolicy(str, Enum):
-    """How an input reaches an advance: ``QUEUED`` consumes one value per advance
-    and waits when none is there; ``CURRENT`` reads the newest value and never waits."""
-
-    QUEUED = "queued"
-    CURRENT = "current"
+# --------------------------------------------------------------------------- input size
 
 
-class Placement(str, Enum):
-    """Where a stream is written: shared page-locked host memory or device memory."""
+def input_nbytes(value: Any, limit: float = math.inf) -> int:
+    """The bytes a submitted value costs: the measure ``InputSpec.max_bytes``
+    bounds. Counts what a value retains and what it expands to, whichever is
+    larger: a tensor or NumPy array the larger of its backing storage (a narrow
+    view keeps all of it alive; an array is followed down its ``base`` chain to
+    the owner) and its logical size (a broadcast or expanded layout materializes
+    to it in transport and validation); a memoryview its exporter; bytes,
+    numbers, strings and containers their CPython object size, containers plus
+    every item, a repeated reference counted each time it appears. Stops as soon
+    as the total passes ``limit`` and never expands a container before its own
+    size has been counted and checked, so the walk's memory and time are bounded
+    by the limit, not by the value. Supported forms only, and only plain ones,
+    since serialization carries whatever Python state a value drags along: the
+    exact built-in types (no subclasses), ``torch.Tensor`` itself without
+    autograd state or instance attributes, ``numpy.ndarray`` itself with a plain
+    dtype (no fields, no metadata, no object references); every form the wire
+    (pickle) carries as is. A decorated form, a container that contains itself,
+    a memoryview (not picklable) or any other type raises ``ValueError`` (the
+    bound could not be established)."""
+    import numpy as np
 
-    HOST = "host"
-    DEVICE = "device"
+    total = 0
+    frames: List[Tuple[Optional[int], Any]] = [(None, iter((value,)))]  # (container id, items)
+    on_path: set = set()
+    while frames:
+        if total > limit:
+            return total
+        container_id, items = frames[-1]
+        try:
+            v = next(items)
+        except StopIteration:
+            frames.pop()
+            if container_id is not None:
+                on_path.discard(container_id)
+            continue
+        kind = type(v)
+        if kind is torch.Tensor:
+            _check_plain_tensor_chain(v)
+            total += max(v.untyped_storage().nbytes(), v.numel() * v.element_size())
+        elif kind is np.ndarray:
+            owner = _check_plain_array_chain(v)
+            if isinstance(owner, np.ndarray):
+                total += max(owner.nbytes, v.nbytes)
+            else:
+                total += v.nbytes  # the logical size; the owner is measured next
+                frames.append((None, iter((owner,))))
+        elif kind in (list, tuple, dict):
+            if id(v) in on_path:
+                raise ValueError("a container that contains itself is not a supported input form")
+            total += sys.getsizeof(v)
+            if total > limit:
+                return total  # not expanded: its slots alone are past the bound
+            on_path.add(id(v))
+            if isinstance(v, dict):
+                frames.append((id(v), itertools.chain(v.keys(), v.values())))
+            else:
+                frames.append((id(v), iter(v)))
+        elif v is None or kind in (bytes, bytearray, str, bool, int, float):
+            total += sys.getsizeof(v)
+        else:
+            raise ValueError(f"{kind.__name__} is not a supported input form")
+    return total
 
 
-QUEUED = InputPolicy.QUEUED
-CURRENT = InputPolicy.CURRENT
-HOST = Placement.HOST
-DEVICE = Placement.DEVICE
+_OWNER_CHAIN_LIMIT = 64  # views of views; anything deeper is not a plain input
 
-DEFAULT_QUEUE_DEPTH = 8
+
+def _check_plain_tensor_chain(t: Any) -> None:
+    """``t`` and every tensor it is a view of must be a plain ``torch.Tensor``:
+    the exact type, no autograd state, no instance attributes. A view keeps its
+    base alive, so whatever the base carries is retained and serialized."""
+    for _ in range(_OWNER_CHAIN_LIMIT):
+        if type(t) is not torch.Tensor:
+            raise ValueError(f"{type(t).__name__} is not a supported input form")
+        if t.requires_grad or t.__dict__:
+            raise ValueError(
+                "a tensor with autograd state or attributes is not a supported input form"
+            )
+        base = t._base
+        if base is None:
+            return
+        t = base
+    raise ValueError("a view chain this deep is not a supported input form")
+
+
+def _check_plain_array_chain(a: Any) -> Any:
+    """``a`` and every array it is a view of must be a plain ``numpy.ndarray``
+    with a plain dtype; returns the owner at the end of the chain (an array, or
+    a non-array exporter such as a tensor, whose own chain is checked)."""
+    import numpy as np
+
+    owner: Any = a
+    for _ in range(_OWNER_CHAIN_LIMIT):
+        if not isinstance(owner, np.ndarray):
+            if isinstance(owner, torch.Tensor):
+                _check_plain_tensor_chain(owner)
+            return owner
+        if type(owner) is not np.ndarray:
+            raise ValueError(f"{type(owner).__name__} is not a supported input form")
+        if not _plain_dtype(owner.dtype):
+            raise ValueError(
+                "a NumPy array with object references, fields or dtype metadata is not a "
+                "supported input form"
+            )
+        if owner.base is None:
+            return owner
+        owner = owner.base
+    raise ValueError("a view chain this deep is not a supported input form")
+
+
+def _plain_dtype(dtype: Any) -> bool:
+    """A NumPy dtype that carries nothing but numbers: no object references, no
+    fields (checked down the nesting) and no metadata."""
+    if dtype.hasobject or dtype.metadata is not None:
+        return False
+    if dtype.fields is not None:
+        return False
+    if dtype.subdtype is not None:
+        return _plain_dtype(dtype.subdtype[0])
+    return True
+
+
+def check_input_size(spec: Any, value: Any) -> None:
+    """Raise ``SessionQueueFull`` when ``value`` exceeds the input's declared
+    bound (admission capacity), ``ValueError`` when its form is unsupported.
+    ``spec`` is an ``InputSpec`` or its public dict."""
+    limit = spec["max_bytes"] if isinstance(spec, dict) else spec.max_bytes
+    name = spec["name"] if isinstance(spec, dict) else spec.name
+    size = input_nbytes(value, limit)
+    if size > limit:
+        raise SessionQueueFull(
+            f"input {name!r}: value holds at least {size} bytes, the declared bound is {limit}"
+        )
 
 
 class SessionError(RuntimeError):
@@ -72,153 +190,6 @@ class SessionEnded(SessionError):
 
 class SessionLeaseExpired(SessionError):
     """A result's storage was returned to the worker; the view is no longer valid."""
-
-
-# --------------------------------------------------------------------------- capabilities
-
-
-@dataclass(frozen=True)
-class InputSpec:
-    """One named input the pipeline accepts during a session.
-
-    ``validate`` runs on rank 0 before admission and raises ``ValueError`` for a
-    bad value. ``queue_depth`` bounds a queued input.
-    """
-
-    name: str
-    policy: InputPolicy = InputPolicy.QUEUED
-    validate: Optional[Callable[[Any], None]] = None
-    default: Any = None
-    queue_depth: int = DEFAULT_QUEUE_DEPTH
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "policy", InputPolicy(self.policy))
-        if self.queue_depth < 1:
-            raise ValueError(f"input {self.name!r}: queue_depth must be at least 1")
-
-
-@dataclass(frozen=True)
-class StreamSpec:
-    """One named output stream the pipeline produces.
-
-    ``max_shape`` is the largest tensor one result may carry for this stream; the
-    slot pool sizes its buffers from it. ``axis`` is the dimension counted by
-    ``position`` (frames, samples or predictions).
-    """
-
-    name: str
-    kind: str
-    dtype: torch.dtype
-    max_shape: Tuple[int, ...]
-    axis: int = 1
-    rate: Optional[float] = None
-    placement: Placement = Placement.HOST
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "placement", Placement(self.placement))
-        if not self.max_shape or any(int(d) <= 0 for d in self.max_shape):
-            raise ValueError(f"stream {self.name!r}: max_shape must be non-empty and positive")
-        if not 0 <= self.axis < len(self.max_shape):
-            raise ValueError(f"stream {self.name!r}: axis {self.axis} outside max_shape")
-
-    @property
-    def max_bytes(self) -> int:
-        return math.prod(int(d) for d in self.max_shape) * self.dtype.itemsize
-
-
-@dataclass(frozen=True)
-class SessionCapabilities:
-    """What a pipeline declares for one session request.
-
-    ``length`` is the number of advances for a finite session or ``None`` when the
-    session is open-ended. ``lockstep`` is true when exactly one queued input exists
-    and every advance yields one media result, which enables ``advance(value)`` on
-    the client.
-    """
-
-    inputs: Tuple[InputSpec, ...]
-    streams: Tuple[StreamSpec, ...]
-    initial_result: bool = False
-    length: Optional[int] = None
-    lockstep: bool = False
-
-    def __post_init__(self) -> None:
-        names = [s.name for s in self.inputs]
-        if len(set(names)) != len(names):
-            raise ValueError(f"duplicate input names: {names}")
-        stream_names = [s.name for s in self.streams]
-        if len(set(stream_names)) != len(stream_names):
-            raise ValueError(f"duplicate stream names: {stream_names}")
-        if not self.streams:
-            raise ValueError("a session must declare at least one stream")
-        if self.lockstep and len(self.queued_inputs) != 1:
-            raise ValueError("a lockstep session has exactly one queued input")
-
-    @property
-    def queued_inputs(self) -> Tuple[InputSpec, ...]:
-        return tuple(s for s in self.inputs if s.policy == QUEUED)
-
-    @property
-    def live_inputs(self) -> Tuple[InputSpec, ...]:
-        return tuple(s for s in self.inputs if s.policy == CURRENT)
-
-    @property
-    def max_result_bytes(self) -> int:
-        return sum(s.max_bytes for s in self.streams)
-
-    def input(self, name: str) -> InputSpec:
-        for spec in self.inputs:
-            if spec.name == name:
-                return spec
-        raise ValueError(f"unknown input {name!r}; declared: {[s.name for s in self.inputs]}")
-
-    def stream(self, name: str) -> StreamSpec:
-        for spec in self.streams:
-            if spec.name == name:
-                return spec
-        raise ValueError(f"unknown stream {name!r}; declared: {[s.name for s in self.streams]}")
-
-    def public(self) -> Dict[str, Any]:
-        """The picklable, callable-free form sent to the client."""
-        return {
-            "inputs": [
-                {
-                    "name": s.name,
-                    "policy": s.policy.value,
-                    "default": s.default,
-                    "queue_depth": s.queue_depth,
-                }
-                for s in self.inputs
-            ],
-            "streams": [
-                {
-                    "name": s.name,
-                    "kind": s.kind,
-                    "dtype": str(s.dtype),
-                    "max_shape": tuple(s.max_shape),
-                    "axis": s.axis,
-                    "rate": s.rate,
-                    "placement": s.placement.value,
-                }
-                for s in self.streams
-            ],
-            "initial_result": self.initial_result,
-            "length": self.length,
-            "lockstep": self.lockstep,
-        }
-
-
-@dataclass
-class AdvanceOutcome:
-    """What ``pipeline.advance`` (and ``open_session``) hands back to the executor.
-
-    ``event`` is a CUDA event recorded after every write into the slot, or ``None``
-    when all writes have completed on return. ``done`` ends the session after this
-    result. What was written is recorded by the slot itself.
-    """
-
-    event: Optional[torch.cuda.Event] = None
-    done: bool = False
 
 
 # --------------------------------------------------------------------------- wire messages
@@ -245,6 +216,14 @@ class SessionSlotReturn:
 
 @dataclass
 class SessionClose:
+    session_id: int
+
+
+@dataclass
+class SessionActivity:
+    """The client asked for a result without returning a slot. Carries nothing;
+    receiving it is what restarts the worker's idle clock."""
+
     session_id: int
 
 
@@ -320,16 +299,18 @@ class SessionState:
     def admit(self, name: str, value: Any) -> int:
         """Validate and admit one value. Returns the advance index: for a queued input
         the advance that will consume the value; for a live input the next advance to
-        be dispatched. Raises ``ValueError``, ``SessionQueueFull`` or ``SessionEnded``."""
+        be dispatched. Raises ``ValueError`` (size, then the validator),
+        ``SessionQueueFull`` or ``SessionEnded``; a rejection changes nothing."""
         if self.terminal is not None or self.closing:
             raise SessionEnded(
                 f"session {self.session_id}: "
                 + ("closing" if self.closing else "a terminal result exists")
             )
         spec = self.capabilities.input(name)
-        if spec.validate is not None:
-            spec.validate(value)
-        if spec.policy is InputPolicy.CURRENT:
+        check_input_size(spec, value)
+        if spec.validator is not None:
+            spec.validator(value)
+        if spec.policy == "live":
             self.live[name] = value
             return self.next_advance
         length = self.capabilities.length

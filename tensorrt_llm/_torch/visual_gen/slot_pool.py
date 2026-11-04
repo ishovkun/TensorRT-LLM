@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-from tensorrt_llm._torch.visual_gen.session import Placement, SessionCapabilities, StreamSpec
+from tensorrt_llm._torch.visual_gen.pipeline import SessionCapabilities, StreamSpec
 from tensorrt_llm.logger import logger
 
 
@@ -39,6 +39,7 @@ from tensorrt_llm.logger import logger
 class _StreamBuffer:
     spec: StreamSpec
     storage: torch.Tensor  # flat uint8 of spec.max_bytes
+    handle: Dict[str, Any]  # what the client maps it from; made once, at allocation
     shape: Optional[Tuple[int, ...]] = None
     dtype: Optional[torch.dtype] = None
     nbytes: int = 0
@@ -127,14 +128,16 @@ class SlotPool:
         self._free.reverse()  # reserve() pops from the end: slot 0 first
 
     def _allocate(self, spec: StreamSpec) -> _StreamBuffer:
-        if spec.placement is Placement.DEVICE:
+        if spec.placement == "device":
             storage = torch.empty(spec.max_bytes, dtype=torch.uint8, device=self.device)
+            handle = SharedTensorContainer.from_tensor(storage, local=self.local).dump_to_dict()
         else:
             storage = torch.empty(spec.max_bytes, dtype=torch.uint8)
-            if not self.local:
-                storage.share_memory_()
+            # Sharing moves the bytes into shared memory and changes the storage
+            # address, so the handle is made before the address is page-locked.
+            handle = SharedTensorContainer.from_tensor(storage, local=self.local).dump_to_dict()
             _page_lock(storage, self._registered)
-        return _StreamBuffer(spec=spec, storage=storage)
+        return _StreamBuffer(spec=spec, storage=storage, handle=handle)
 
     @property
     def free_count(self) -> int:
@@ -167,16 +170,10 @@ class SlotPool:
     def export_handles(self) -> List[Dict[str, Dict[str, Any]]]:
         """One handle dict per slot per stream, for ``SessionOpened``. Each handle is
         consumed exactly once by the client's mapping."""
-        handles: List[Dict[str, Dict[str, Any]]] = []
-        for slot in self._slots:
-            per_stream = {}
-            for name in slot.stream_names:
-                storage = slot._buffers[name].storage
-                per_stream[name] = SharedTensorContainer.from_tensor(
-                    storage, local=self.local
-                ).dump_to_dict()
-            handles.append(per_stream)
-        return handles
+        return [
+            {name: slot._buffers[name].handle for name in slot.stream_names}
+            for slot in self._slots
+        ]
 
     def close(self) -> None:
         for storage in self._registered:
@@ -206,10 +203,16 @@ def _page_lock(storage: torch.Tensor, registered: List[torch.Tensor]) -> None:
 
 
 def _page_unlock(storage: torch.Tensor) -> None:
+    """Undo ``_page_lock`` before the storage is freed: a freed range that is
+    still registered poisons the next allocation that lands on the same
+    addresses (``cudaErrorHostMemoryAlreadyRegistered`` at its registration)."""
     try:
-        torch.cuda.cudart().cudaHostUnregister(storage.data_ptr())
+        rc = torch.cuda.cudart().cudaHostUnregister(storage.data_ptr())
     except Exception as exc:
         logger.warning(f"slot pool: cudaHostUnregister failed: {exc}")
+        return
+    if int(rc) != 0:
+        logger.warning(f"slot pool: cudaHostUnregister failed with {int(rc)}")
 
 
 class ClientSlotMap:
