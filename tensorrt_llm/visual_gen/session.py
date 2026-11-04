@@ -123,13 +123,26 @@ class SessionResult:
     def copy(self) -> "SessionResult":
         """Return this result with its media in memory the caller owns.
 
-        Does not expire the view it was copied from.
+        The copies are complete on return, so the slot may be reused as soon as
+        the next result is requested. Does not expire the view it was copied from.
         """
+        outputs = self.outputs
+        copies: Dict[str, torch.Tensor] = {}
+        try:
+            for name, tensor in outputs.items():
+                copies[name] = tensor.clone()
+        finally:
+            # A device clone reads the slot asynchronously on the caller's current
+            # stream; the worker reuses the slot with no view of that stream, so
+            # every issued read must finish before the slot can be returned, on
+            # success and on a failure partway through the streams alike.
+            for device in {t.device for t in copies.values() if t.is_cuda}:
+                torch.cuda.current_stream(device).synchronize()
         return SessionResult(
             self.request_id,
             self.sequence,
             self.advance_index,
-            {name: tensor.clone() for name, tensor in self.outputs.items()},
+            copies,
             self.position,
             self.done,
             self.error,
