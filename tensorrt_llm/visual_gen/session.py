@@ -37,8 +37,8 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.executor import _EOF as _END
 from tensorrt_llm._torch.visual_gen.session import (
+    ResultKind,
     SessionEnded,
     SessionError,
     SessionLeaseExpired,
@@ -407,7 +407,7 @@ class VisualGenSession:
     def _take_result(self, expected_index: Optional[int] = None) -> Optional[SessionResult]:
         while True:
             taken = self._channel.take(self._build_result, expected_index)
-            if taken is _END:
+            if taken is ResultKind.ENDED:
                 return None
             if taken is not None:
                 self._held = taken
@@ -419,7 +419,7 @@ class VisualGenSession:
     ) -> Optional[SessionResult]:
         while True:
             taken = self._channel.take(self._build_result, expected_index)
-            if taken is _END:
+            if taken is ResultKind.ENDED:
                 return None
             if taken is not None:
                 self._held = taken
@@ -507,7 +507,7 @@ class VisualGenSession:
             message.advance_index,
             outputs,
             message.position,
-            message.done,
+            message.kind is ResultKind.TERMINAL,
             message.error,
             owned=False,
             channel=self._channel,

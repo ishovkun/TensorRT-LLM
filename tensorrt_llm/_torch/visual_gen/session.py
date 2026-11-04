@@ -29,6 +29,7 @@ import math
 import sys
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Tuple
 
 import torch
@@ -260,20 +261,39 @@ class SessionAdmitted:
     error_kind: Optional[str] = None  # "invalid" | "queue_full" | "ended"
 
 
+class ResultKind(Enum):
+    """What an entry of a session's result stream is. The worker publishes
+    ``MEDIA`` and ``TERMINAL``; ``ENDED`` and ``CLOSED`` exist only on the client,
+    as the entry left at the head of its queue once the stream is over."""
+
+    MEDIA = "media"  # a delivery slot holds the streams
+    TERMINAL = "terminal"  # the session is over; ``error`` says why, ``None`` for normal completion
+    ENDED = "ended"  # the terminal was taken: nothing more to read
+    CLOSED = "closed"  # the client closed: the stream is discarded
+
+
 @dataclass
 class SessionResultMessage:
-    """One result. ``streams`` maps a stream name to the ``(shape, dtype)`` written
-    in ``slots[slot_id][name]``; ``position`` maps it to ``(start, count)``. The
-    terminal result has ``slot_id=None`` and no streams."""
+    """One entry of the result stream. For ``MEDIA``, ``streams`` maps a stream
+    name to the ``(shape, dtype)`` written in ``slots[slot_id][name]`` and
+    ``position`` maps it to ``(start, count)``. ``TERMINAL`` has ``slot_id=None``
+    and no streams. The client-local kinds carry no sequence."""
 
     session_id: int
-    sequence: int
+    sequence: Optional[int]
     advance_index: Optional[int]
     slot_id: Optional[int]
     streams: Dict[str, Tuple[Tuple[int, ...], str]]
     position: Dict[str, Tuple[int, int]]
-    done: bool = False
+    kind: ResultKind = ResultKind.MEDIA
     error: Optional[str] = None
+
+    @classmethod
+    def end(cls, session_id: int, kind: ResultKind) -> "SessionResultMessage":
+        """The client-local entry that ends a stream: ``ENDED`` or ``CLOSED``."""
+        if kind not in (ResultKind.ENDED, ResultKind.CLOSED):
+            raise ValueError(f"{kind} is published by the worker, not an end of stream")
+        return cls(session_id, None, None, None, {}, {}, kind=kind)
 
 
 @dataclass
@@ -423,7 +443,7 @@ class SessionState:
             slot_id=None,
             streams={},
             position={},
-            done=True,
+            kind=ResultKind.TERMINAL,
             error=error,
         )
         self.next_sequence += 1

@@ -25,6 +25,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     StreamSpec,
 )
 from tensorrt_llm._torch.visual_gen.session import (
+    ResultKind,
     SessionEnded,
     SessionQueueFull,
     SessionState,
@@ -216,7 +217,8 @@ def test_media_result_validates_and_advances_cursors():
     with pytest.raises(ValueError):
         state.media_result(2, 0, {})
     terminal = state.terminal_result()
-    assert terminal.done and terminal.error is None and terminal.sequence == 2
+    assert terminal.kind is ResultKind.TERMINAL and terminal.error is None
+    assert terminal.sequence == 2
     assert state.terminal_result() is terminal  # exactly one
 
 

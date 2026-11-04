@@ -50,6 +50,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     StreamSpec,
 )
 from tensorrt_llm._torch.visual_gen.session import (
+    ResultKind,
     SessionActivity,
     SessionAdmitted,
     SessionClose,
@@ -1074,7 +1075,9 @@ def test_rank_local_exception_is_fatal_not_a_hung_collective(tmp_path, fail_rank
     # Nothing coordinated was published by rank 0: no SessionClosed, no terminal.
     published = _published(outcome["executor"])
     assert not any(isinstance(m, SessionClosed) for m in published)
-    assert not any(isinstance(m, SessionResultMessage) and m.done for m in published)
+    assert not any(
+        isinstance(m, SessionResultMessage) and m.kind is ResultKind.TERMINAL for m in published
+    )
     if fail_phase.startswith("advance"):
         assert any(isinstance(m, SessionOpened) for m in published)
 
@@ -1168,7 +1171,7 @@ def _closed(channel) -> bool:
 
 def _terminal_next(channel) -> bool:
     head = channel._results[0] if channel._results else None
-    return isinstance(head, SessionResultMessage) and head.done
+    return head is not None and head.kind is ResultKind.TERMINAL
 
 
 def _wait_until(predicate, timeout=10.0, what="condition"):
@@ -1297,7 +1300,7 @@ def _timeout_terminal(session_id, sequence):
         None,
         {},
         {},
-        done=True,
+        kind=ResultKind.TERMINAL,
         error="session idle timeout (0s) expired",
     )
 
@@ -1323,7 +1326,8 @@ def test_terminals_keep_empty_outputs_after_the_close(harness):
 def _wait_for_terminal(channel):
     """The worker publishes media then the normal terminal; wait for the latter."""
     _wait_until(
-        lambda: any(getattr(m, "done", False) for m in channel._results), what="the queued terminal"
+        lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results),
+        what="the queued terminal",
     )
 
 
@@ -1346,7 +1350,7 @@ def test_explicit_close_after_a_timeout_close_discards_the_retained_terminal(har
         s = h.open()
         channel = h.client._sessions[s.request_id]
         _wait_until(lambda: _closed(channel), what="the idle close")
-        assert any(getattr(m, "done", False) for m in channel._results)  # terminal retained
+        assert any(m.kind is ResultKind.TERMINAL for m in channel._results)  # terminal retained
         s.close()  # explicit cancellation after the worker close: discard everything
         with pytest.raises(SessionEnded):
             next(s.results())
@@ -1494,7 +1498,10 @@ def test_advance_after_the_session_ended_returns_the_terminal_once_without_submi
             r = s.advance(1)
             assert r.advance_index == 0
             channel = h.client._sessions[s.request_id]
-            _wait_until(lambda: any(m.done for m in channel._results), what="the terminal")
+            _wait_until(
+                lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results),
+                what="the terminal",
+            )
             sent = []
             original = h.client.pending_requests.put
             h.client.pending_requests.put = lambda m: (sent.append(m), original(m))[1]
@@ -1597,7 +1604,7 @@ def test_advance_takes_the_terminal_when_the_earlier_input_died_without_media(ha
             assert s.submit("controls", 1) == 0  # admitted, then the advance raises
             channel = h.client._sessions[s.request_id]
             _wait_until(lambda: _terminal_next(channel), what="the error terminal")
-            assert channel.owed() > 0  # index 0 is still recorded ...
+            assert channel.lockstep_due() > 0  # index 0 is still recorded ...
             terminal = s.advance(2)  # ... but the terminal supersedes it; nothing submitted
             assert terminal.done and "kernel exploded" in terminal.error
             assert [a["controls"] for a in pipe.advances] == []
@@ -1623,7 +1630,10 @@ def test_advance_still_refuses_while_real_media_precedes_the_terminal(harness):
         with h.open() as s:
             s.submit("controls", 1)  # media 0, then the normal terminal
             channel = h.client._sessions[s.request_id]
-            _wait_until(lambda: any(m.done for m in channel._results), what="terminal")
+            _wait_until(
+                lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results),
+                what="terminal",
+            )
             assert channel.unread_media()
             with pytest.raises(SessionError, match="unread"):
                 s.advance(2)
@@ -1656,14 +1666,14 @@ def test_cancelled_submit_keeps_its_admission_and_its_media(harness):
             await loop.run_in_executor(
                 None, lambda: _wait_until(channel.unread_media, what="media")
             )
-            assert channel.owed() > 0 and channel._submit is None  # owed; record retired
+            assert channel.lockstep_due() > 0 and channel._submit is None  # owed; record retired
             with pytest.raises(SessionError, match="unread"):
                 await s.advance_async(2)  # refused: nothing admitted, result 0 not consumed
             assert [a["controls"] for a in pipe.advances] == [1]
             results = s.results()
             r0 = await results.__anext__()  # the old media is still obtainable
             assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)
-            assert channel.owed() == 0
+            assert channel.lockstep_due() == 0
             assert (await s.advance_async(2)).advance_index == 1
             await s.close_async()
 
@@ -2727,11 +2737,11 @@ def test_explicit_close_discards_a_queued_terminal(harness):
         s = h.open()
         channel = h.client._sessions[s.request_id]
         s.submit("controls", 1)  # media 0, then the normal terminal, both unread
-        _wait_until(lambda: any(getattr(m, "done", False) for m in channel._results))
+        _wait_until(lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results))
         s.close()
         with pytest.raises(SessionEnded):
             next(s.results())
-        assert channel.owed() == 0
+        assert channel.lockstep_due() == 0
 
 
 def test_channel_members_are_the_eight_and_the_session_the_three(harness):
@@ -2747,7 +2757,7 @@ def test_channel_members_are_the_eight_and_the_session_the_three(harness):
                 "_submit",
                 "_reader",
                 "_results",
-                "_owed",
+                "_lockstep_due",
             }
             assert set(vars(s)) == {"_client", "_channel", "_held"}
 
@@ -2826,18 +2836,18 @@ def test_cancelled_admission_never_retains_the_submit_record():
     channel.release_submit(fut)  # the caller left: marks it cancelled, keeps it
     assert channel._submit is not None and fut.cancelled()
     channel.admitted(0, None)
-    assert channel._submit is None and channel.owed() == 1
+    assert channel._submit is None and channel.lockstep_due() == 1
     # reply first, then the caller's release: the record retires on release
     fut = channel.reserve_submit("controls")
     channel.admitted(1, None)
     assert channel._submit is not None and fut.result(timeout=1) == 1
     channel.release_submit(fut)
-    assert channel._submit is None and channel.owed() == 2
+    assert channel._submit is None and channel.lockstep_due() == 2
     # and a new submit is possible after both
     fut = channel.reserve_submit("controls")
     channel.admitted(2, None)
     channel.release_submit(fut)
-    assert channel.owed() == 3
+    assert channel.lockstep_due() == 3
 
 
 def test_worker_failure_during_a_requested_close_stays_a_failure():
@@ -2913,7 +2923,9 @@ def test_locally_rejected_advance_value_withdraws_its_reservation(harness):
                 s.advance([1, 2, 3, 4, 5])  # over the bound: refused before anything is sent
             with pytest.raises(ValueError):
                 s.advance(object())
-            assert channel._submit is None and channel._reader is None and channel.owed() == 0
+            assert (
+                channel._submit is None and channel._reader is None and channel.lockstep_due() == 0
+            )
             r = s.advance(1)
             assert r.advance_index == 0 and pipe.advances == [{"controls": 1, "camera": 0}]
 

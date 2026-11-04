@@ -37,6 +37,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.session import (
+    ResultKind,
     SessionActivity,
     SessionAdmitted,
     SessionClose,
@@ -1358,38 +1359,35 @@ class PendingSubmit(NamedTuple):
     admission: Future
 
 
-_EOF = object()  # the terminal was taken: the stream has ended
-_CLOSED = object()  # the client closed: nothing further is readable
-
-
 class SessionChannel:
     """Coordinator side of one session: the hand-off point between the main
     thread (the public ``VisualGenSession`` calls) and the client's background
-    thread (which routes the worker's replies here). Eight members, one per fact:
-
-    ``_opened``: the open reply, a future of ``SessionResources`` (or the open
-    error); read through ``wait_open``, ``wait_open_async``, ``on_open``,
-    ``capabilities`` and ``slots``.
-    ``_closed``: absent while no close has begun; pending once requested; done when
-    the worker confirmed; failed when the worker group is gone, its exception is
-    the sticky failure.
-    ``_submit``: the submit operation in progress, held until its caller finishes.
-    ``_reader``: the read operation in progress (a plain read or an advance),
-    held until its caller finishes; also the notification the caller awaits.
-    ``_results``: unread results in order, then an end marker.
-    ``_owed``: media promised to a lockstep client and not yet taken.
-    Everything but ``_opened`` and ``session_id`` is touched under ``_lock``.
+    thread (which routes the worker's replies here). Eight members, one per
+    fact, each described at its field below.
     """
 
     def __init__(self, session_id: int):
         self.session_id = session_id
-        self._opened: Future = Future()
-        self._closed: Optional[Future] = None
+        # The open reply: resources on success, the open error otherwise. Set once,
+        # never replaced, so it is read without the lock; its own state is atomic.
+        self._opened: Future[SessionResources] = Future()
+        # Guards every member below: which operations exist and that they agree.
         self._lock = threading.Lock()
+        # None until a close begins; then the close operation. Completes on the
+        # worker's confirmation, or with the sticky failure if the worker group died.
+        self._closed: Optional[Future] = None
+        # The one submit in flight: input name plus the admission reply. Set until
+        # its caller finishes, so a second submit is refused meanwhile.
         self._submit: Optional[PendingSubmit] = None
+        # The one read in flight. A fresh future per wait: the router completes it
+        # when the queue changes; the reader re-arms under the lock, never missing one.
         self._reader: Optional[Future] = None
-        self._results: Deque[Any] = deque()
-        self._owed = 0
+        # Unread stream entries in order: MEDIA and TERMINAL from the worker, then
+        # one client-local ENDED or CLOSED entry. Bounded by the slot count plus two.
+        self._results: Deque[SessionResultMessage] = deque()
+        # Lockstep only: media the worker owes the client and the client has not
+        # taken, from the initial result and each admission. advance() refuses while > 0.
+        self._lockstep_due = 0
 
     # ---- derived views
 
@@ -1457,11 +1455,11 @@ class SessionChannel:
 
     def unread_media(self) -> bool:
         with self._lock:
-            return any(isinstance(m, SessionResultMessage) and not m.done for m in self._results)
+            return any(m.kind is ResultKind.MEDIA for m in self._results)
 
-    def owed(self) -> int:
+    def lockstep_due(self) -> int:
         with self._lock:
-            return self._owed
+            return self._lockstep_due
 
     def _queued_input(self) -> Optional[str]:
         caps = self.capabilities or {}
@@ -1478,7 +1476,7 @@ class SessionChannel:
         with self._lock:
             caps = resources.capabilities
             if caps.get("lockstep") and caps.get("initial_result"):
-                self._owed = 1
+                self._lockstep_due = 1
         self._complete(self._opened, resources)
 
     def open_failed(self, error: Exception) -> None:
@@ -1494,7 +1492,7 @@ class SessionChannel:
         with self._lock:
             close = self._closed
             if (close is not None and close.done()) or (
-                self._results and self._results[-1] is _CLOSED
+                self._results and self._results[-1].kind is ResultKind.CLOSED
             ):
                 return  # after the end: a stray
             self._results.append(message)
@@ -1516,8 +1514,9 @@ class SessionChannel:
         build: Callable[[SessionResultMessage], Any],
         expected_index: Any = None,
     ) -> Any:
-        """One step of a reserved read. Returns the built result, ``_EOF`` when
-        the stream has ended, or ``None`` when nothing is readable yet; in that
+        """One step of a reserved read. Returns the built result,
+        ``ResultKind.ENDED`` when the stream has ended, or ``None`` when nothing
+        is readable yet; in that
         case the wakeup is armed in the same critical section, so a delivery,
         close or failure landing afterwards is never missed by the following
         ``notification()``. Raises the sticky failure or ``SessionEnded`` after an
@@ -1536,13 +1535,13 @@ class SessionChannel:
                     self._reader = Future()  # re-armed with the predicate still false
                 return None
             head = self._results[0]
-            if head is _CLOSED:
+            if head.kind is ResultKind.CLOSED:
                 raise SessionEnded(f"session {self.session_id} is closed")
-            if head is _EOF:
-                return _EOF
+            if head.kind is ResultKind.ENDED:
+                return ResultKind.ENDED
             if (
                 expected_index is not None
-                and not head.done
+                and head.kind is ResultKind.MEDIA
                 and head.advance_index != expected_index
             ):
                 raise SessionError(
@@ -1551,10 +1550,12 @@ class SessionChannel:
                 )
             result = build(head)
             self._results.popleft()
-            if head.done:
-                self._results.appendleft(_EOF)
-            elif head.advance_index is not None or self._owed:
-                self._owed = max(0, self._owed - 1) if self._queued_input() else 0
+            if head.kind is ResultKind.TERMINAL:
+                self._results.appendleft(
+                    SessionResultMessage.end(self.session_id, ResultKind.ENDED)
+                )
+            elif head.kind is ResultKind.MEDIA and self._lockstep_due > 0:
+                self._lockstep_due -= 1
             return result
 
     def notification(self) -> Future:
@@ -1584,9 +1585,9 @@ class SessionChannel:
                 raise SessionEnded(f"session {self.session_id} is closed")
             if self._submit is not None:
                 raise SessionError("a submit is already in progress on this session")
-            if for_advance and self._owed:
+            if for_advance and self._lockstep_due:
                 raise SessionError(
-                    f"{self._owed} earlier result(s) are unread; take them through results() "
+                    f"{self._lockstep_due} earlier result(s) are unread; take them through results() "
                     "before calling advance()"
                 )
             fut: Future = Future()
@@ -1605,17 +1606,17 @@ class SessionChannel:
             if failure is not None:
                 raise failure
             head = self._results[0] if self._results else None
-            if head is _CLOSED or head is _EOF:
+            if head is not None and head.kind in (ResultKind.CLOSED, ResultKind.ENDED):
                 raise SessionEnded(f"session {self.session_id} has ended")
-            if isinstance(head, SessionResultMessage) and head.done:
+            if head is not None and head.kind is ResultKind.TERMINAL:
                 return None
             if self._closed is not None:
                 raise SessionEnded(f"session {self.session_id} is closed")
             if self._submit is not None:
                 raise SessionError("a submit is already in progress on this session")
-            if self._owed:
+            if self._lockstep_due:
                 raise SessionError(
-                    f"{self._owed} earlier result(s) are unread; take them through results() "
+                    f"{self._lockstep_due} earlier result(s) are unread; take them through results() "
                     "before calling advance()"
                 )
             fut: Future = Future()
@@ -1632,7 +1633,7 @@ class SessionChannel:
                 )
                 return
             if error is None and pending.name == self._queued_input():
-                self._owed += 1  # owed from now on, whether or not the caller still waits
+                self._lockstep_due += 1  # owed from now on, whether or not the caller still waits
             # Completed under the lock: either the caller still owns the future
             # and retires the record when done, or it had cancelled and the
             # record retires here, with the reply. No window between the two.
@@ -1670,14 +1671,18 @@ class SessionChannel:
             if self._closed is not None:
                 # Already closing or closed (a worker-initiated close may have
                 # retained a terminal): the client's close still discards the stream.
-                if self.failure is None and not (self._results and self._results[-1] is _CLOSED):
+                if self.failure is None and not (
+                    self._results and self._results[-1].kind is ResultKind.CLOSED
+                ):
                     self._results.clear()
-                    self._results.append(_CLOSED)
+                    self._results.append(
+                        SessionResultMessage.end(self.session_id, ResultKind.CLOSED)
+                    )
                 return self._closed, False
             self._closed = Future()
             self._results.clear()
-            self._results.append(_CLOSED)
-            self._owed = 0
+            self._results.append(SessionResultMessage.end(self.session_id, ResultKind.CLOSED))
+            self._lockstep_due = 0
             pending, self._submit = self._submit, None
             reader = self._reader
         if pending is not None:
@@ -1692,10 +1697,12 @@ class SessionChannel:
         with self._lock:
             if self._closed is None:
                 self._closed = Future()
-                kept = [m for m in self._results if m is _EOF or getattr(m, "done", False)]
+                kept = [
+                    m for m in self._results if m.kind in (ResultKind.ENDED, ResultKind.TERMINAL)
+                ]
                 self._results.clear()
                 self._results.extend(kept)
-            self._owed = 0
+            self._lockstep_due = 0
             pending, self._submit = self._submit, None
             reader = self._reader
             resources = self._resources()
@@ -1721,7 +1728,7 @@ class SessionChannel:
             # every caller sees the failure, never a graceful close in progress.
             self._complete(close, error=error)
             self._results.clear()
-            self._owed = 0
+            self._lockstep_due = 0
             pending, self._submit = self._submit, None
             reader = self._reader
             resources = self._resources()
