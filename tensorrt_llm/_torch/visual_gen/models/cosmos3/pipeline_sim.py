@@ -37,7 +37,7 @@ from ...cache import BlockCausalKVCacheManager, RolloutSpec
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from ...pipeline import AdvanceOutcome, InputSpec, SessionCapabilities, StreamSpec
 from ...pipeline_registry import register_pipeline
-from ...session import input_nbytes
+from ...session_protocol import input_nbytes
 from ...utils import make_noise_generator, postprocess_video_tensor
 from ..wan.vae_loader import load_wan_vae
 from .action import load_action_tensor, normalize_action_mode, pad_action_to_dim

@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch.visual_gen.session import (
+from tensorrt_llm._torch.visual_gen.session_protocol import (
     ResultKind,
     SessionEnded,
     SessionError,

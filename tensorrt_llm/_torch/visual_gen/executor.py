@@ -36,7 +36,7 @@ import zmq
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm._torch.visual_gen.session import (
+from tensorrt_llm._torch.visual_gen.session_protocol import (
     ResultKind,
     SessionActivity,
     SessionAdmitted,
@@ -50,10 +50,10 @@ from tensorrt_llm._torch.visual_gen.session import (
     SessionReply,
     SessionResultMessage,
     SessionSlotReturn,
-    SessionState,
     SessionSubmit,
     check_input_size,
 )
+from tensorrt_llm._torch.visual_gen.session_state import SessionState
 from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, SlotPool
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog

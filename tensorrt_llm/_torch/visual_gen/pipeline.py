@@ -149,7 +149,7 @@ class InputSpec(StrictBaseModel):
             )
         if not declared:
             return self
-        from .session import input_nbytes
+        from .session_protocol import input_nbytes
 
         size = input_nbytes(self.default, self.max_bytes)
         if size > self.max_bytes:

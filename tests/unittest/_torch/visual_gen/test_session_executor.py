@@ -49,7 +49,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     SessionCapabilities,
     StreamSpec,
 )
-from tensorrt_llm._torch.visual_gen.session import (
+from tensorrt_llm._torch.visual_gen.session_protocol import (
     ResultKind,
     SessionActivity,
     SessionAdmitted,

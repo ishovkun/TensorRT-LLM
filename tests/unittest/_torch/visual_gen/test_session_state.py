@@ -24,13 +24,13 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     SessionCapabilities,
     StreamSpec,
 )
-from tensorrt_llm._torch.visual_gen.session import (
+from tensorrt_llm._torch.visual_gen.session_protocol import (
     ResultKind,
     SessionEnded,
     SessionQueueFull,
-    SessionState,
     input_nbytes,
 )
+from tensorrt_llm._torch.visual_gen.session_state import SessionState
 from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, SlotPool
 
 pytestmark = pytest.mark.cpu_only
@@ -278,7 +278,7 @@ def test_input_nbytes_counts_what_a_value_retains_or_expands_to():
 
     import numpy as np
 
-    from tensorrt_llm._torch.visual_gen.session import _NUMBER
+    from tensorrt_llm._torch.visual_gen.session_protocol import _NUMBER
 
     assert input_nbytes(7) == _NUMBER == input_nbytes(7.5)
     assert input_nbytes(b"abc") == sys.getsizeof(b"abc")
@@ -504,7 +504,7 @@ def test_supported_input_forms_survive_the_wire_serialization():
 
     import numpy as np
 
-    from tensorrt_llm._torch.visual_gen.session import SessionSubmit
+    from tensorrt_llm._torch.visual_gen.session_protocol import SessionSubmit
 
     forms = [
         1,
