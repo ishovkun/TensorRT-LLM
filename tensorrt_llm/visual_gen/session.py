@@ -83,35 +83,33 @@ class SessionResult:
         done: bool,
         error: Optional[str],
         *,
-        owned: bool,
-        channel: Optional["SessionChannel"] = None,
+        lease: Optional[Tuple[SessionChannel, int]] = None,
     ):
-        self.request_id = request_id
-        self.sequence = sequence
-        self.advance_index = advance_index
-        self.position = dict(position)
-        self.done = done
-        self.error = error
-        self._outputs = dict(outputs)
-        self._owned = owned
-        self._expired = False
-        self._slot_id: Optional[int] = None
-        # A view's storage belongs to the worker; once the session is closed or
-        # the worker group has failed, the view is gone, whatever the lease said.
-        # A result without storage (a terminal, a copy) has nothing to lose.
-        self._channel = None if owned or not outputs else channel
+        self.request_id: int = request_id  # the session
+        self.sequence: int = sequence  # delivery order within the session
+        self.advance_index: Optional[int] = advance_index  # the submit that produced it
+        self.position: Dict[str, Tuple[int, int]] = dict(position)  # per stream: start, count
+        self.done: bool = done
+        self.error: Optional[str] = error
+        # Views over the worker's slot, or the caller's own memory after copy().
+        # None once the slot went back to the worker: reading outputs then raises.
+        self._outputs: Optional[Dict[str, torch.Tensor]] = dict(outputs)
+        # Set while the media views a worker slot: the session's channel, asked at
+        # access time whether the session is gone, and the slot to return. None
+        # for a copy or a terminal, which own nothing on the worker.
+        self._lease: Optional[Tuple[SessionChannel, int]] = lease
 
     @property
     def outputs(self) -> Dict[str, torch.Tensor]:
-        if self._expired:
+        if self._outputs is None:
             raise SessionLeaseExpired(
                 f"result {self.sequence} of session {self.request_id} expired; "
                 "call copy() before requesting the next result to keep its media"
             )
-        if self._channel is not None and self._channel.lease_lost is not None:
+        if self._lease is not None and self._lease[0].lease_lost is not None:
             raise SessionLeaseExpired(
                 f"result {self.sequence} of session {self.request_id} expired: "
-                f"{self._channel.lease_lost}"
+                f"{self._lease[0].lease_lost}"
             )
         return self._outputs
 
@@ -120,7 +118,7 @@ class SessionResult:
         """``outputs["video"]`` when that stream exists."""
         return self.outputs.get("video")
 
-    def copy(self) -> "SessionResult":
+    def copy(self) -> SessionResult:
         """Return this result with its media in memory the caller owns.
 
         The copies are complete on return, so the slot may be reused as soon as
@@ -146,16 +144,22 @@ class SessionResult:
             self.position,
             self.done,
             self.error,
-            owned=True,
         )
 
-    def _expire(self) -> None:
-        if not self._owned:
-            self._expired = True
-            self._outputs = {}
+    def release(self) -> Optional[int]:
+        """Give up the lease.
+
+        The views die; the result is the slot to return to the worker, or ``None``
+        for a copy or a terminal, which hold no slot.
+        """
+        lease, self._lease = self._lease, None
+        if lease is None:
+            return None
+        self._outputs = None
+        return lease[1]
 
     def __repr__(self) -> str:
-        streams = {name: tuple(t.shape) for name, t in self._outputs.items()}
+        streams = {name: tuple(t.shape) for name, t in (self._outputs or {}).items()}
         return (
             f"SessionResult(sequence={self.sequence}, advance_index={self.advance_index}, "
             f"streams={streams}, position={self.position}, done={self.done}, error={self.error!r})"
@@ -173,11 +177,11 @@ class SessionResultsIterator:
     bare ``break`` does not.
     """
 
-    def __init__(self, session: "VisualGenSession"):
+    def __init__(self, session: VisualGenSession):
         self._session = session
         self._closed = False
 
-    def __iter__(self) -> "SessionResultsIterator":
+    def __iter__(self) -> SessionResultsIterator:
         return self
 
     def __next__(self) -> SessionResult:
@@ -187,7 +191,7 @@ class SessionResultsIterator:
             raise StopIteration
         return result
 
-    def __aiter__(self) -> "SessionResultsIterator":
+    def __aiter__(self) -> SessionResultsIterator:
         return self
 
     async def __anext__(self) -> SessionResult:
@@ -206,14 +210,14 @@ class SessionResultsIterator:
             self._closed = True
             self._session._release_held()
 
-    def __enter__(self) -> "SessionResultsIterator":
+    def __enter__(self) -> SessionResultsIterator:
         return self
 
     def __exit__(self, *exc) -> bool:
         self.close()
         return False
 
-    async def __aenter__(self) -> "SessionResultsIterator":
+    async def __aenter__(self) -> SessionResultsIterator:
         return self
 
     async def __aexit__(self, *exc) -> bool:
@@ -238,10 +242,11 @@ class VisualGenSession:
     :class:`SessionError` instead of waiting.
     """
 
-    def __init__(self, request_id: int, client: "DiffusionRemoteClient", channel: "SessionChannel"):
-        del request_id  # the channel knows its session
-        self._client = client
-        self._channel = channel
+    def __init__(self, client: DiffusionRemoteClient, channel: SessionChannel):
+        self._client = client  # sends the session's commands to the worker
+        self._channel = channel  # this session's record on the client: replies land here
+        # The one result whose slot the client is holding; requesting the next
+        # result, or closing, expires it and returns the slot.
         self._held: Optional[SessionResult] = None
 
     # ---- introspection
@@ -453,14 +458,14 @@ class VisualGenSession:
             closing.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
             raise
 
-    def __enter__(self) -> "VisualGenSession":
+    def __enter__(self) -> VisualGenSession:
         return self
 
     def __exit__(self, *exc) -> bool:
         self.close()
         return False
 
-    async def __aenter__(self) -> "VisualGenSession":
+    async def __aenter__(self) -> VisualGenSession:
         return self
 
     async def __aexit__(self, *exc) -> bool:
@@ -486,10 +491,10 @@ class VisualGenSession:
         held, self._held = self._held, None
         if held is None:
             return False
-        held._expire()
-        if held._slot_id is None or self._channel.lease_lost is not None:
+        slot_id = held.release()
+        if slot_id is None or self._channel.lease_lost is not None:
             return False
-        self._client.session_return_slot(self._channel, held._slot_id)
+        self._client.session_return_slot(self._channel, slot_id)
         return True
 
     def _build_result(self, message: SessionResultMessage) -> SessionResult:
@@ -500,7 +505,8 @@ class VisualGenSession:
                 outputs[name] = slots.view(
                     message.slot_id, name, tuple(shape), torch_dtype_from_str(dtype_name)
                 )
-        result = SessionResult(
+        lease = None if message.slot_id is None else (self._channel, message.slot_id)
+        return SessionResult(
             self.request_id,
             message.sequence,
             message.advance_index,
@@ -508,8 +514,5 @@ class VisualGenSession:
             message.position,
             message.kind is ResultKind.TERMINAL,
             message.error,
-            owned=False,
-            channel=self._channel,
+            lease=lease,
         )
-        result._slot_id = message.slot_id
-        return result

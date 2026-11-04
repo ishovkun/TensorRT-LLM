@@ -500,7 +500,7 @@ class VisualGen:
         request = self._session_request(prompt, params)
         channel = self.executor.open_session(request)
         channel.wait_open()
-        return VisualGenSession(request.request_id, self.executor, channel)
+        return VisualGenSession(self.executor, channel)
 
     @set_api_status("prototype")
     async def open_session_async(
@@ -515,7 +515,7 @@ class VisualGen:
         """
         request = self._session_request(prompt, params)
         channel = await self.executor.open_session_async(request)
-        return VisualGenSession(request.request_id, self.executor, channel)
+        return VisualGenSession(self.executor, channel)
 
     def __enter__(self):
         return self

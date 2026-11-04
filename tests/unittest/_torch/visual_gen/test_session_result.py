@@ -27,7 +27,7 @@ def test_copy_of_device_media_is_complete_when_it_returns():
     with no view of that stream. ``copy()`` returns only once its reads are done,
     so a slot overwritten right after the return cannot leak into the owned copy."""
     slot = torch.full((16 << 20,), 1, dtype=torch.uint8, device="cuda")
-    result = SessionResult(1, 0, 0, {"video": slot}, {"video": (0, 1)}, False, None, owned=False)
+    result = SessionResult(1, 0, 0, {"video": slot}, {"video": (0, 1)}, False, None)
     worker = torch.cuda.Stream()
     torch.cuda.synchronize()
     torch.cuda._sleep(2_000_000_000)  # the caller's own pending work, ahead of the clone
