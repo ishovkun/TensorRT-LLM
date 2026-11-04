@@ -273,9 +273,11 @@ class SessionCapabilities(StrictBaseModel):
 class AdvanceOutcome:
     """What ``advance`` and ``open_session`` hand back to the executor.
 
-    ``event`` is a CUDA event recorded after every write into the slot, or ``None``
-    when all writes have completed on return. ``done`` ends the session after this
-    result. What was written is recorded by the slot itself.
+    ``event`` is a CUDA event recorded behind this rank's work for the call, its
+    session-state updates and every write into the slot, or ``None`` when all of
+    it has completed on return. Every rank returns one, slot or no slot. ``done``
+    ends the session after this result. What was written is recorded by the slot
+    itself.
     """
 
     event: Optional[torch.cuda.Event] = None
@@ -656,10 +658,10 @@ class BasePipeline(nn.Module):
         conditioning, cache open, graph warmup, whole-clip denoise if that is the
         model. Returns the session state (opaque to the executor) and the initial
         outcome. ``initial_slot`` is the executor's reserved slot when the
-        capabilities declare an initial result, else ``None``; the outcome's
-        ``written`` names what was put into it and its ``event`` covers those
-        writes on this rank. If opening fails, release partial allocations and
-        raise."""
+        capabilities declare an initial result, else ``None``; the slot records
+        what was put into it and the outcome's ``event`` covers this rank's work,
+        state and slot alike, so a rank given no slot still returns one. If
+        opening fails, release partial allocations and raise."""
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def validate_input(self, state: Any, name: str, value: Any) -> None:
@@ -672,9 +674,10 @@ class BasePipeline(nn.Module):
         """One unit of work. ``inputs`` holds one value per queued input and the
         current value of every live input. Write each produced stream into
         ``slot.buffer(name, shape, dtype)``; the slot records what was written.
-        Return a CUDA event recorded after the last write (``None`` when every
-        write has completed on return) and ``done``. Advances never overlap; a
-        non-final advance must write at least one stream."""
+        Return a CUDA event recorded behind this rank's state updates and its
+        last write (``None`` when all of it has completed on return) and ``done``;
+        a rank given no slot still returns the event for its state work. Advances
+        never overlap; a non-final advance must write at least one stream."""
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def close_session(self, state: Any) -> None:

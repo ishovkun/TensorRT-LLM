@@ -1091,12 +1091,13 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                     session.domain_tensor((f1 - f0) * A),
                     commit=True,
                 )
-            outcome = AdvanceOutcome()
             if initial_slot is not None:
                 self.vae.decode_stream_start()
                 session.decode_started = True
                 image_latent = prepared.condition_latents[:, :, 0:1]
                 outcome = self._session_write_frames(session, image_latent, initial_slot)
+            else:
+                outcome = AdvanceOutcome(event=self._completion_event())
         except Exception:
             self.close_session(session)
             raise
@@ -1131,7 +1132,7 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             state.remaining -= 1
             done = state.remaining <= 0
         if slot is None:
-            return AdvanceOutcome(done=done)
+            return AdvanceOutcome(event=self._completion_event(), done=done)
         new_frames = x[:, :, (1 if f0 == 0 else 0) :]
         outcome = self._session_write_frames(state, new_frames, slot)
         outcome.done = done
@@ -1147,11 +1148,17 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
                 raise ValueError("Cosmos3 Sim session: the video was blocked by the guardrails")
         view = slot.buffer("video", tuple(frames.shape), torch.uint8)
         view.copy_(frames, non_blocking=True)
-        event = None
-        if frames.is_cuda:
-            event = torch.cuda.Event()
-            event.record(torch.cuda.current_stream())
-        return AdvanceOutcome(event=event)
+        return AdvanceOutcome(event=self._completion_event())
+
+    def _completion_event(self) -> Optional[torch.cuda.Event]:
+        """An event recorded behind everything this rank queued on the current
+        stream: the rollout's cache writes and any slot copy. ``None`` off CUDA,
+        where that work ran synchronously."""
+        if self.device.type != "cuda":
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        return event
 
     def close_session(self, state: "_SimSession") -> None:
         if state.decode_started:

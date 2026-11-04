@@ -207,6 +207,35 @@ def test_advance_rejects_the_wrong_row_count(model):  # noqa: F811
         pipe.close_session(session)
 
 
+def test_ranks_without_a_slot_still_return_a_completion_event(model):  # noqa: F811
+    """A rank that writes no slot (every rank but 0) still queues the rollout's
+    cache writes; its open and advance outcomes carry an event that covers them,
+    so the executor's completion boundary waits for this rank's work too."""
+    prepared = _prepared(model, 5, seed=7)
+    pipe = make_sim_pipeline(model)
+    pipe.vae = StubStreamingVAE()
+    text_ids, text_mask = prompt()
+    with torch.inference_mode():
+        ro = pipe._rollout_begin(
+            _request(), prepared, cond_ids=text_ids, cond_mask=text_mask, seed=7
+        )
+        session, outcome = pipe._session_start(
+            ro, prepared, None, domain_id=2, use_guardrails=False, remaining=None
+        )
+        assert isinstance(outcome.event, torch.cuda.Event)
+        outcome.event.synchronize()
+        assert outcome.event.query()
+        rows = prepared.action_latents[0, : pipe.sim.chunk_frames * A]
+        outcome = pipe.advance(session, {"actions": rows}, None)
+        assert isinstance(outcome.event, torch.cuda.Event)
+        assert not outcome.done
+        outcome.event.synchronize()
+        assert outcome.event.query()
+        assert session.peek_range() == (1 + pipe.sim.chunk_frames, 1 + 2 * pipe.sim.chunk_frames)
+        pipe.close_session(session)
+    assert not pipe._kv_cache.is_open
+
+
 def test_session_rows_per_advance_follow_the_partition(model):  # noqa: F811
     pipe = make_sim_pipeline(model)
     sizes = pipe._action_rows_per_advance()
