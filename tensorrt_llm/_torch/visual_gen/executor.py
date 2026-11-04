@@ -1367,8 +1367,10 @@ class SessionChannel:
     thread (the public ``VisualGenSession`` calls) and the client's background
     thread (which routes the worker's replies here). Eight members, one per fact:
 
-    ``opened``: the opening, a future of ``SessionResources`` (or the open error).
-    ``_close``: absent while no close has begun; pending once requested; done when
+    ``_opened``: the open reply, a future of ``SessionResources`` (or the open
+    error); read through ``wait_open``, ``wait_open_async``, ``on_open``,
+    ``capabilities`` and ``slots``.
+    ``_closed``: absent while no close has begun; pending once requested; done when
     the worker confirmed; failed when the worker group is gone, its exception is
     the sticky failure.
     ``_submit``: the submit operation in progress, held until its caller finishes.
@@ -1376,13 +1378,13 @@ class SessionChannel:
     held until its caller finishes; also the notification the caller awaits.
     ``_results``: unread results in order, then an end marker.
     ``_owed``: media promised to a lockstep client and not yet taken.
-    Everything but ``opened`` and ``session_id`` is touched under ``_lock``.
+    Everything but ``_opened`` and ``session_id`` is touched under ``_lock``.
     """
 
     def __init__(self, session_id: int):
         self.session_id = session_id
-        self.opened: Future = Future()
-        self._close: Optional[Future] = None
+        self._opened: Future = Future()
+        self._closed: Optional[Future] = None
         self._lock = threading.Lock()
         self._submit: Optional[PendingSubmit] = None
         self._reader: Optional[Future] = None
@@ -1397,15 +1399,44 @@ class SessionChannel:
         return None if resources is None else resources.capabilities
 
     def _resources(self) -> Optional[SessionResources]:
-        fut = self.opened
+        fut = self._opened
         if fut.done() and not fut.cancelled() and fut.exception() is None:
             return fut.result()
         return None
 
     @property
+    def slots(self) -> ClientSlotMap:
+        """The client's mapping of the delivery slots. Only after a successful open."""
+        resources = self._resources()
+        if resources is None:
+            raise RuntimeError(f"session {self.session_id} is not open")
+        return resources.slots
+
+    def wait_open(self, timeout: Optional[float] = None) -> SessionResources:
+        """Block until the worker answered the open; the resources, or the open
+        error raised."""
+        return self._opened.result(timeout)
+
+    def wait_open_async(self) -> "asyncio.Future":
+        """The open reply as a future of the running event loop."""
+        return asyncio.wrap_future(self._opened)
+
+    def on_open(self, callback: Callable[[Optional[BaseException]], None]) -> None:
+        """Run ``callback`` once the open is answered, at once if it already was:
+        with ``None`` on success, else with the open error."""
+
+        def done(fut: Future) -> None:
+            if fut.cancelled():
+                callback(RuntimeError("open cancelled"))
+            else:
+                callback(fut.exception())
+
+        self._opened.add_done_callback(done)
+
+    @property
     def failure(self) -> Optional[BaseException]:
         """The sticky worker failure, if the worker group is gone."""
-        close = self._close
+        close = self._closed
         if close is not None and close.done() and not close.cancelled():
             return close.exception()
         return None
@@ -1414,7 +1445,7 @@ class SessionChannel:
     def lease_lost(self) -> Optional[str]:
         """Why views over the slots are no longer usable; ``None`` while they are.
         Set as soon as a close has begun, requested or worker-initiated."""
-        close = self._close
+        close = self._closed
         if close is None:
             return None
         failure = self.failure
@@ -1422,7 +1453,7 @@ class SessionChannel:
 
     def closing(self) -> Optional[Future]:
         """The close operation, if one has begun."""
-        return self._close
+        return self._closed
 
     def unread_media(self) -> bool:
         with self._lock:
@@ -1448,12 +1479,12 @@ class SessionChannel:
             caps = resources.capabilities
             if caps.get("lockstep") and caps.get("initial_result"):
                 self._owed = 1
-        self._complete(self.opened, resources)
+        self._complete(self._opened, resources)
 
     def open_failed(self, error: Exception) -> None:
-        self._complete(self.opened, error=error)
+        self._complete(self._opened, error=error)
         with self._lock:
-            close = self._close
+            close = self._closed
         if close is not None:
             self._complete(close, None)  # a close requested while opening: nothing to send
 
@@ -1461,7 +1492,7 @@ class SessionChannel:
 
     def deliver(self, message: SessionResultMessage) -> None:
         with self._lock:
-            close = self._close
+            close = self._closed
             if (close is not None and close.done()) or (
                 self._results and self._results[-1] is _CLOSED
             ):
@@ -1499,7 +1530,7 @@ class SessionChannel:
             if failure is not None:
                 raise failure
             if not self._results:
-                if self._close is not None:
+                if self._closed is not None:
                     raise SessionEnded(f"session {self.session_id} is closed")
                 if self._reader is not None and self._reader.done():
                     self._reader = Future()  # re-armed with the predicate still false
@@ -1549,7 +1580,7 @@ class SessionChannel:
             failure = self.failure
             if failure is not None:
                 raise failure
-            if self._close is not None:
+            if self._closed is not None:
                 raise SessionEnded(f"session {self.session_id} is closed")
             if self._submit is not None:
                 raise SessionError("a submit is already in progress on this session")
@@ -1578,7 +1609,7 @@ class SessionChannel:
                 raise SessionEnded(f"session {self.session_id} has ended")
             if isinstance(head, SessionResultMessage) and head.done:
                 return None
-            if self._close is not None:
+            if self._closed is not None:
                 raise SessionEnded(f"session {self.session_id} is closed")
             if self._submit is not None:
                 raise SessionError("a submit is already in progress on this session")
@@ -1636,14 +1667,14 @@ class SessionChannel:
         progress, expire the leases. Returns the close operation and whether this
         call began it (the caller then arranges the one close command)."""
         with self._lock:
-            if self._close is not None:
+            if self._closed is not None:
                 # Already closing or closed (a worker-initiated close may have
                 # retained a terminal): the client's close still discards the stream.
                 if self.failure is None and not (self._results and self._results[-1] is _CLOSED):
                     self._results.clear()
                     self._results.append(_CLOSED)
-                return self._close, False
-            self._close = Future()
+                return self._closed, False
+            self._closed = Future()
             self._results.clear()
             self._results.append(_CLOSED)
             self._owed = 0
@@ -1652,15 +1683,15 @@ class SessionChannel:
         if pending is not None:
             self._complete(pending.admission, error=SessionEnded("session closed"))
         self._notify(reader)
-        return self._close, True
+        return self._closed, True
 
     def worker_closed(self) -> None:
         """The worker confirmed (or initiated) the close. Media still unread is
         dropped with its mappings; a terminal is kept unless the client had
         closed; the close operation completes."""
         with self._lock:
-            if self._close is None:
-                self._close = Future()
+            if self._closed is None:
+                self._closed = Future()
                 kept = [m for m in self._results if m is _EOF or getattr(m, "done", False)]
                 self._results.clear()
                 self._results.extend(kept)
@@ -1670,7 +1701,7 @@ class SessionChannel:
             resources = self._resources()
             if resources is not None:
                 resources.slots.close()
-            close = self._close
+            close = self._closed
         if pending is not None:
             self._complete(pending.admission, error=SessionEnded("session closed"))
         self._complete(close, None)
@@ -1681,11 +1712,11 @@ class SessionChannel:
         the close operation fails with ``error`` (sticky), every waiter is woken
         with it and the mappings are released. Never raises."""
         with self._lock:
-            close = self._close
+            close = self._closed
             if close is not None and close.done():
                 return  # already over
             if close is None:
-                self._close = close = Future()
+                self._closed = close = Future()
             # Published inside the critical section: from here every reader and
             # every caller sees the failure, never a graceful close in progress.
             self._complete(close, error=error)
@@ -1698,7 +1729,7 @@ class SessionChannel:
                 resources.slots.close()
         # The opening completes after the close outcome: a close callback that
         # fires on it finds the failure already recorded and cannot soften it.
-        self._complete(self.opened, error=error)
+        self._complete(self._opened, error=error)
         if pending is not None:
             self._complete(pending.admission, error=error)
         self._notify(reader)
@@ -2283,8 +2314,8 @@ class DiffusionRemoteClient:
     # ------------------------------------------------------------------ sessions
 
     def open_session(self, request: DiffusionRequest) -> SessionChannel:
-        """Send ``SessionOpen``; the caller waits on ``channel.opened``, which resolves
-        to the session's resources once the worker has opened it (or raises).
+        """Send ``SessionOpen``; the caller waits through ``channel.wait_open`` (or
+        its async form) for the session's resources once the worker has opened it.
 
         One session per model instance: while another session is opening or open
         (its entry stays in ``_sessions`` until its close is confirmed or its open
@@ -2319,7 +2350,7 @@ class DiffusionRemoteClient:
         closed (the one close operation: sent once the open is acknowledged,
         settled if the open fails) and the ``CancelledError`` propagates."""
         channel = self.open_session(request)
-        opening = asyncio.wrap_future(channel.opened)
+        opening = channel.wait_open_async()
         try:
             await asyncio.shield(opening)
         except asyncio.CancelledError:
@@ -2395,16 +2426,16 @@ class DiffusionRemoteClient:
         close, first = channel.request_close()
         if first:
 
-            def after_open(opened: Future) -> None:
-                if opened.cancelled() or opened.exception() is not None:
-                    channel.open_failed(opened.exception() or RuntimeError("open cancelled"))
+            def after_open(error: Optional[BaseException]) -> None:
+                if error is not None:
+                    channel.open_failed(error)
                     return
                 if self._worker_failure is None:
                     self._enqueue_control(
                         (channel.session_id, "close"), SessionClose(channel.session_id)
                     )
 
-            channel.opened.add_done_callback(after_open)
+            channel.on_open(after_open)
         return close
 
     def _route_session_reply(self, reply: Any) -> None:

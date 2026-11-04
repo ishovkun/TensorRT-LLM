@@ -329,7 +329,7 @@ class Harness:
     def open(self, prompt="p", timeout=10.0) -> VisualGenSession:
         req = DiffusionRequest(request_id=1, prompt=[prompt], params=SimpleNamespace())
         channel = self.client.open_session(req)
-        channel.opened.result(timeout=timeout)
+        channel.wait_open(timeout=timeout)
         return VisualGenSession(req.request_id, self.client, channel)
 
     def stop(self):
@@ -645,7 +645,7 @@ def test_close_discards_queued_inputs_and_second_session_opens(harness):
         # The model instance is free again.
         req = DiffusionRequest(request_id=2, prompt=["q"], params=SimpleNamespace())
         channel = h.client.open_session(req)
-        channel.opened.result(timeout=10)
+        channel.wait_open(timeout=10)
         VisualGenSession(2, h.client, channel).close()
         assert pipe.opened == 2
 
@@ -660,7 +660,7 @@ def test_async_forms(harness):
         async def run():
             req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
             channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             async with s, s.results() as results:
                 assert await s.submit_async("controls", 1) == 0
@@ -1206,7 +1206,7 @@ def test_close_async_settles_a_parked_reader(harness):
         async def run():
             req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
             channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             results = s.results()
             reader = asyncio.ensure_future(results.__anext__())
@@ -1459,7 +1459,7 @@ def test_iterator_request_is_refused_while_advance_async_awaits_admission(harnes
         async def run():
             req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
             channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             results = s.results()
             h.hold(SessionAdmitted)
@@ -1570,7 +1570,7 @@ def test_advance_async_does_not_submit_when_the_terminal_is_known(harness):
         async def run():
             req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
             channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             assert (await s.advance_async(1)).advance_index == 0
             loop = asyncio.get_running_loop()
@@ -1639,7 +1639,7 @@ def test_cancelled_submit_keeps_its_admission_and_its_media(harness):
         async def run():
             req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
             channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             h.hold(SessionAdmitted, SessionResultMessage)  # released later in wire order
             task = asyncio.ensure_future(s.submit_async("controls", 1))
@@ -1677,7 +1677,7 @@ def test_cancelled_advance_async_keeps_its_admission(harness):
         async def run():
             req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
             channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             h.hold(SessionAdmitted, SessionResultMessage)
             task = asyncio.ensure_future(s.advance_async(1))
@@ -1711,7 +1711,7 @@ def _drive_cancelled_submit_then_advance(h, start_call):
     async def run():
         req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
         channel = h.client.open_session(req)
-        await asyncio.wrap_future(channel.opened)
+        await channel.wait_open_async()
         s = VisualGenSession(1, h.client, channel)
         loop = asyncio.get_running_loop()
         h.hold(SessionAdmitted, SessionResultMessage)
@@ -1794,7 +1794,7 @@ def test_advance_async_returns_the_terminal_when_the_idle_close_lands_before_its
         async def run():
             req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
             channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             restore = _idle_closes_before_the_submit(s, channel)
             terminal = await s.advance_async(1)
@@ -1867,7 +1867,7 @@ def test_second_open_async_is_refused_at_once(harness):
 
         async def run():
             channel = h.client.open_session(_request(1))
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             with pytest.raises(MemoryError):
                 h.client.open_session(_request(2))
@@ -1912,7 +1912,7 @@ def test_competing_opens_admit_exactly_one(harness):
         channels = [o for o in outcomes if isinstance(o, SessionChannel)]
         assert len(channels) == 1 and len(outcomes) == 4
         channel = channels[0]
-        channel.opened.result(timeout=10)
+        channel.wait_open(timeout=10)
         VisualGenSession(channel.session_id, h.client, channel).close()
 
 
@@ -1921,7 +1921,7 @@ def test_open_succeeds_again_after_close_idle_close_and_open_failure(harness):
     with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
         channel = h.client.open_session(_request(1))
         with pytest.raises(ValueError):  # the pipeline refuses the open
-            channel.opened.result(timeout=10)
+            channel.wait_open(timeout=10)
         assert h.client._sessions == {}  # the reservation went with the failure
         pipe.open_fails = False
         s = h.open()  # explicit close releases it
@@ -2035,7 +2035,7 @@ def test_abort_after_the_reservation_fails_the_opener_and_drains_its_message():
     assert list(client._sessions) == [3] and client.pending_requests.qsize() == 1
     client._abort_worker_group("review probe: worker exited")
     with pytest.raises(RuntimeError, match="worker exited"):
-        channel.opened.result(timeout=1)  # the opener raises promptly
+        channel.wait_open(timeout=1)  # the opener raises promptly
     assert client._sessions == {}  # no reservation remains ...
     assert client.pending_requests.empty()  # ... and the unsent open is gone
     assert req.ref_handles is None and ref.content == b"\x07" * 4096  # payload released
@@ -2075,7 +2075,7 @@ def test_cancelled_open_relinquishes_the_session_when_the_open_succeeds_later(ha
             with pytest.raises(asyncio.CancelledError):
                 await task
             channel = h.client._sessions[1]
-            assert not channel.opened.cancelled()
+            assert not channel._opened.cancelled()
             assert list(h.client._sessions) == [1]  # still reserved: the worker holds it
             h.release()  # the late success: no InvalidStateError, closed at once
             await loop.run_in_executor(
@@ -2127,7 +2127,7 @@ def test_cancellation_after_the_open_completed_but_before_the_handle_is_returned
             # Let the task start and send its open; block the loop thread until the
             # worker's success is in, so the task cannot have resumed yet.
             await asyncio.sleep(0)
-            channels[0].opened.result(timeout=10)
+            channels[0].wait_open(timeout=10)
             task.cancel()  # arrives before the task sees its completed future
             with pytest.raises(asyncio.CancelledError):
                 await task
@@ -2171,7 +2171,7 @@ def test_cancelled_open_still_unsent_does_not_leave_an_ownerless_session(harness
 def test_open_reply_routing_tolerates_a_cancelled_lifecycle_future():
     client = _make_client()
     channel = client.open_session(_request(9))
-    channel.opened.cancel()  # a caller that bypassed the shield
+    channel._opened.cancel()  # a caller that bypassed the shield
     client._route_session_reply(
         SessionOpened(9, capabilities={"inputs": [], "streams": []}, slots=[])
     )
@@ -2179,7 +2179,7 @@ def test_open_reply_routing_tolerates_a_cancelled_lifecycle_future():
     client._route_session_reply(SessionClosed(9))
     assert client._sessions == {}
     channel = client.open_session(_request(10))
-    channel.opened.cancel()
+    channel._opened.cancel()
     client._route_session_reply(SessionOpened(10, error="bad prompt", error_type="client"))
     assert client._sessions == {}
 
@@ -2363,7 +2363,7 @@ def test_unserializable_open_fails_the_opener_and_releases_everything():
     channel = client.open_session(req)
     client._process_requests()
     with pytest.raises(ValueError, match="cannot be serialized"):
-        channel.opened.result(timeout=1)
+        channel.wait_open(timeout=1)
     assert client._sessions == {} and client._worker_failure is None
     assert req.ref_handles is None and ref.content == b"\x07" * 4096  # references released
     client.requests_ipc.exc = None
@@ -2394,7 +2394,7 @@ def test_transport_failure_on_a_session_command_aborts_the_group(command):
             client._sessions.clear()  # make room: a fresh open whose send then fails
         channel = client.open_session(_request(5))
         client.requests_ipc.exc = OSError("probe: send failed")
-        waiters.append(channel.opened)
+        waiters.append(channel._opened)
     client._process_controls()
     client._process_requests()
     assert client._worker_failure is not None and "send failed" in client._worker_failure
@@ -2428,7 +2428,7 @@ def test_transport_failure_on_an_open_releases_its_references_exactly_once():
     channel = client.open_session(req)
     client._process_requests()
     with pytest.raises(RuntimeError, match="send failed"):
-        channel.opened.result(timeout=1)
+        channel.wait_open(timeout=1)
     assert client._sessions == {} and client._request_to_send is None
     assert req.ref_handles is None and ref.content == b"\x07" * 4096  # consumed by the abort
     req.refs_from_shm()  # a second release is a no-op: nothing left to consume
@@ -2446,7 +2446,7 @@ def test_transport_failure_releases_the_failing_open_and_the_queued_payload_once
     client.requests_ipc.exc = OSError("probe: send failed")
     client._process_requests()
     with pytest.raises(RuntimeError, match="send failed"):
-        channel.opened.result(timeout=1)
+        channel.wait_open(timeout=1)
     assert client.pending_requests.empty()
     assert req.ref_handles is None and ref.content == b"\x07" * 4096
     assert queued.ref_handles is None and queued_ref.content == b"\x07" * 4096
@@ -2687,7 +2687,7 @@ def test_a_cancelled_reader_loses_no_media_and_order_holds(harness):
 
         async def run():
             channel = h.client.open_session(_request(1))
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             results = s.results()
             first = asyncio.ensure_future(results.__anext__())
@@ -2717,7 +2717,7 @@ def test_channel_failure_before_any_call_raises_everywhere():
         channel.take(lambda m: m)
     channel.release_read()
     with pytest.raises(RuntimeError, match="gone"):
-        channel.opened.result()
+        channel.wait_open()
     assert channel.lease_lost is not None and "gone" in channel.lease_lost
 
 
@@ -2741,8 +2741,8 @@ def test_channel_members_are_the_eight_and_the_session_the_three(harness):
             channel = h.client._sessions[s.request_id]
             assert set(vars(channel)) == {
                 "session_id",
-                "opened",
-                "_close",
+                "_opened",
+                "_closed",
                 "_lock",
                 "_submit",
                 "_reader",
@@ -2847,7 +2847,7 @@ def test_worker_failure_during_a_requested_close_stays_a_failure():
     closing = client.session_close(channel)
     client._abort_worker_group("probe: worker exited during opening")
     with pytest.raises(RuntimeError, match="exited"):
-        channel.opened.result(timeout=1)
+        channel.wait_open(timeout=1)
     with pytest.raises(RuntimeError, match="exited"):
         closing.result(timeout=1)
     assert channel.failure is not None and "exited" in channel.lease_lost
@@ -3064,7 +3064,7 @@ def test_advance_async_returns_the_terminal_when_the_close_lands_between_reserva
 
         async def run():
             channel = h.client.open_session(_request(1))
-            await asyncio.wrap_future(channel.opened)
+            await channel.wait_open_async()
             s = VisualGenSession(1, h.client, channel)
             _worker_closes_after_the_reservation(h, s)
             terminal = await s.advance_async(1)

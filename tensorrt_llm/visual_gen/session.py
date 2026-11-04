@@ -495,7 +495,7 @@ class VisualGenSession:
 
     def _build_result(self, message: SessionResultMessage) -> SessionResult:
         outputs: Dict[str, torch.Tensor] = {}
-        slots = self._channel.opened.result().slots
+        slots = self._channel.slots
         if message.slot_id is not None:
             for name, (shape, dtype_name) in message.streams.items():
                 outputs[name] = slots.view(

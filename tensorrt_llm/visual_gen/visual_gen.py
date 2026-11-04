@@ -499,7 +499,7 @@ class VisualGen:
         """
         request = self._session_request(prompt, params)
         channel = self.executor.open_session(request)
-        channel.opened.result()
+        channel.wait_open()
         return VisualGenSession(request.request_id, self.executor, channel)
 
     @set_api_status("prototype")
