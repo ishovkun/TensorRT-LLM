@@ -117,23 +117,17 @@ class InputSpec(StrictBaseModel):
 
     A ``queued`` input supplies one value per advance and the worker waits for it;
     a ``live`` input is a state value the worker reads at each advance and never
-    waits for. ``max_bytes`` bounds one value, measured as the bytes it retains
-    (see ``input_nbytes``: a tensor's backing storage, a container with its
-    items at their object sizes); a larger value is refused as
-    ``SessionQueueFull``, by the client before it is sent and by the worker
-    before it is admitted. Memory held per input is therefore at most
-    ``queue_depth`` values for a queued input, and the current value plus the
-    snapshot of the advance in flight for a live one. ``validator`` runs on rank
-    0 before admission, after the size check, and raises ``ValueError`` for a
-    bad value. ``default`` is the value a live input holds until its first
-    submit; a live input must declare one, and a declared default, ``None``
-    included, is checked like a submitted value.
+    waits for. A queued input holds at most ``queue_depth`` values; a live one the
+    current value plus the snapshot of the advance in flight. ``validator`` runs
+    on rank 0 before admission and raises ``ValueError`` for a bad value; it is
+    what bounds a value's shape and size. ``default`` is the value a live input
+    holds until its first submit; a live input must declare one, and a declared
+    default, ``None`` included, passes the validator like a submitted value.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str
-    max_bytes: int = Field(gt=0)
     policy: Literal["queued", "live"] = "queued"
     validator: Optional[Callable[[Any], None]] = None
     default: Any = None
@@ -149,14 +143,6 @@ class InputSpec(StrictBaseModel):
             )
         if not declared:
             return self
-        from .session_protocol import input_nbytes
-
-        size = input_nbytes(self.default, self.max_bytes)
-        if size > self.max_bytes:
-            raise ValueError(
-                f"input {self.name!r}: the default holds at least {size} bytes, "
-                f"the declared bound is {self.max_bytes}"
-            )
         if self.validator is not None:
             try:
                 self.validator(self.default)
@@ -261,7 +247,6 @@ class SessionCapabilities(StrictBaseModel):
                     "policy": s.policy,
                     "default": s.default,
                     "queue_depth": s.queue_depth,
-                    "max_bytes": s.max_bytes,
                 }
                 for s in self.inputs
             ],

@@ -51,7 +51,6 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionResultMessage,
     SessionSlotReturn,
     SessionSubmit,
-    check_input_size,
 )
 from tensorrt_llm._torch.visual_gen.session_state import SessionState
 from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, SlotPool
@@ -1133,10 +1132,8 @@ class DiffusionExecutor:
                 return
             reply = SessionAdmitted(state.session_id)
             try:
-                # Name and size first: nothing of the pipeline runs on a value the
-                # declaration does not admit. ``admit`` mutates nothing until its
-                # own checks have passed.
-                check_input_size(state.capabilities.input(message.name), message.value)
+                # The pipeline's schema check first; ``admit`` mutates nothing
+                # until its own checks have passed.
                 self.pipeline.validate_input(pipeline_state, message.name, message.value)
                 reply.advance_index = state.admit(message.name, message.value)
             except SessionQueueFull as e:
@@ -2377,8 +2374,7 @@ class DiffusionRemoteClient:
         if self._worker_failure is not None:
             raise RuntimeError(self._worker_failure)
         inputs = (channel.capabilities or {}).get("inputs", [])
-        spec = next((s for s in inputs if s["name"] == name), None)
-        if spec is None:
+        if not any(s["name"] == name for s in inputs):
             raise ValueError(f"unknown input {name!r}; declared: {[s['name'] for s in inputs]}")
         if for_advance:
             # The stream decides first: a terminal at the head means nothing is
@@ -2387,13 +2383,10 @@ class DiffusionRemoteClient:
             if fut is None:
                 return None
         else:
-            check_input_size(spec, value)  # before the value reaches the queue
             fut = channel.reserve_submit(name)
         # Reserved, not yet sent: until the command is in the queue any exit,
         # an interrupt included, withdraws the reservation.
         try:
-            if for_advance:
-                check_input_size(spec, value)
             # Publication is conditional on the session still being live and
             # happens under the lock that retirement (close, abort) takes, so a
             # command is either seen by the retirement that follows or never

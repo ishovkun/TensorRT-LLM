@@ -63,7 +63,6 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionQueueFull,
     SessionResultMessage,
     SessionSubmit,
-    input_nbytes,
 )
 from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap
 from tensorrt_llm.visual_gen.session import VisualGenSession
@@ -71,7 +70,6 @@ from tensorrt_llm.visual_gen.session import VisualGenSession
 pytestmark = pytest.mark.cpu_only
 
 FRAMES, H, W = 4, 2, 3
-ONE_INT = input_nbytes(1)  # the declared bound of the harness inputs: one small int
 
 
 class CountingPipeline:
@@ -105,12 +103,8 @@ class CountingPipeline:
     def session_capabilities(self, req):
         inputs = []
         if self.queued:
-            inputs.append(
-                InputSpec(
-                    name="controls", max_bytes=ONE_INT, validator=_non_negative, queue_depth=2
-                )
-            )
-        inputs.append(InputSpec(name="camera", max_bytes=ONE_INT, policy="live", default=0))
+            inputs.append(InputSpec(name="controls", validator=_non_negative, queue_depth=2))
+        inputs.append(InputSpec(name="camera", policy="live", default=0))
         return SessionCapabilities(
             inputs=tuple(inputs),
             streams=(
@@ -2200,111 +2194,13 @@ def test_open_reply_routing_tolerates_a_cancelled_lifecycle_future():
 # --------------------------------------------------------------------------- input byte bound, end to end
 
 
-def test_oversize_inputs_are_refused_before_they_are_sent(harness):
-    pipe = CountingPipeline(initial=False)
-    validated = []
-    pipe.validate_input = lambda state, name, value: validated.append(name)
-    with harness(pipe) as h:
-        with h.open() as s:
-            assert s.capabilities["inputs"][0]["max_bytes"] == ONE_INT
-            h.send_gate.clear()  # anything queued would stay visible in pending_requests
-            import numpy as np
-
-            oversize = (
-                [1, 2],
-                torch.zeros(262144)[:1],
-                torch.zeros(262144)[:1].numpy(),
-                b"x" * 64,
-                {"a": 1.0},
-                [b""] * 100000,
-                np.broadcast_to(np.array([1.0]), (1_000_000,)),  # 8 bytes retained, 8 MB expanded
-                torch.zeros(1).expand(1_000_000),
-            )
-            for value in oversize:
-                with pytest.raises(SessionQueueFull, match="declared bound"):
-                    s.submit("controls", value)
-                with pytest.raises(SessionQueueFull, match="declared bound"):
-                    s.submit("camera", value)
-            with pytest.raises(ValueError, match="object references"):
-                s.submit("controls", np.array([b"x" * 16], dtype=object))
-            structured = np.empty(1, dtype=[("payload", object)])
-            structured["payload"][0] = b"x" * (1 << 20)
-            with pytest.raises(ValueError, match="object references"):
-                s.submit("controls", structured)
-            decorated_array = np.zeros(1, dtype=np.dtype("uint8", metadata={"p": b"x" * (1 << 20)}))
-            with pytest.raises(ValueError, match="dtype metadata"):
-                s.submit("controls", decorated_array)
-            decorated_tensor = torch.zeros(1, dtype=torch.uint8)
-            decorated_tensor.payload = b"x" * (1 << 20)
-            with pytest.raises(ValueError, match="attributes"):
-                s.submit("controls", decorated_tensor)
-            with pytest.raises(ValueError, match="attributes"):
-                s.submit("controls", decorated_tensor[:])  # a plain view of a decorated base
-            with pytest.raises(ValueError, match="dtype metadata"):
-                s.submit("controls", decorated_array.view(np.uint8))  # plain view, decorated owner
-            with pytest.raises(ValueError, match="unknown input"):
-                s.submit("unknown", bytes(1 << 20))  # no spec: refused, not queued
-            assert h.client.pending_requests.empty()  # nothing staged, nothing grew
-            assert s._channel._submit is None
-            h.send_gate.set()
-            assert s.submit("controls", 1) == 0  # exactly the bound (one small int)
-            assert s.submit("camera", 2) == 1
-            assert next(s.results()).advance_index == 0
-            assert h.pipeline.advances == [{"controls": 1, "camera": 0}]
-            assert validated == ["controls", "camera"]  # the pipeline saw only admitted values
-
-
-def test_worker_rejects_an_oversize_input_before_its_pipeline_sees_it(harness):
-    """The worker checks name and size again, before pipeline.validate_input: a
-    submit put straight on its socket with an oversize value is refused as
-    capacity, the validator never runs on it, and the queue index does not move."""
-    pipe = CountingPipeline(initial=False)
-    validated = []
-    pipe.validate_input = lambda state, name, value: validated.append(value)
-    with harness(pipe) as h:
-        with h.open() as s:
-            replies = []
-            original = h.client._route_session_reply
-            h.client._route_session_reply = lambda r: (replies.append(r), original(r))[1]
-            import numpy as np
-
-            decorated_array = np.zeros(1, dtype=np.dtype("uint8", metadata={"p": b"x" * 4096}))
-            decorated_tensor = torch.zeros(1, dtype=torch.uint8)
-            decorated_tensor.payload = b"x" * 4096
-            put = h.executor.requests_ipc.put_nowait
-            put(SessionSubmit(s.request_id, "controls", [1, 2]))
-            put(SessionSubmit(s.request_id, "nope", 1))
-            put(SessionSubmit(s.request_id, "controls", decorated_array))
-            put(SessionSubmit(s.request_id, "controls", decorated_tensor))
-            put(SessionSubmit(s.request_id, "controls", decorated_tensor[:]))
-            put(SessionSubmit(s.request_id, "controls", decorated_array.view(np.uint8)))
-            # Wake the worker with a control, not a submit: these raw submits are
-            # strays with no pending record, and their answers must not be taken
-            # for a real admission.
-            h.client.session_activity(h.client._sessions[s.request_id])
-            answers = lambda: [r for r in replies if isinstance(r, SessionAdmitted) and r.error]  # noqa: E731
-            _wait_until(lambda: len(answers()) == 6, what="the worker's answers")
-            kinds = [(r.error_kind, r.error) for r in answers()]
-            assert kinds[0][0] == "queue_full" and "declared bound" in kinds[0][1]
-            assert kinds[1][0] == "invalid" and "unknown input" in kinds[1][1]
-            assert kinds[2][0] == "invalid" and "dtype metadata" in kinds[2][1]
-            assert kinds[3][0] == "invalid" and "attributes" in kinds[3][1]
-            assert kinds[4][0] == "invalid" and "attributes" in kinds[4][1]
-            assert kinds[5][0] == "invalid" and "dtype metadata" in kinds[5][1]
-            assert validated == []  # none of the strays reached the pipeline validator
-            h.client._route_session_reply = original
-            s.submit("camera", 1)
-            assert validated == [1]  # only an admitted value does
-            assert s.submit("controls", 1) == 0  # the next index is still 0
-
-
 def test_repeated_rejected_submits_do_not_grow_staging(harness):
     with harness(CountingPipeline(initial=False)) as h:
         with h.open() as s:
             channel = h.client._sessions[s.request_id]
             for _ in range(50):
-                with pytest.raises(SessionQueueFull):
-                    s.submit("controls", [1, 2])
+                with pytest.raises(ValueError):
+                    s.submit("controls", -1)  # the worker's validator refuses it
             assert h.client.pending_requests.empty() and channel._submit is None
             assert s.submit("controls", 1) == 0
 
@@ -2337,7 +2233,7 @@ def _declared(client, session_id):
     channel.open_succeeded(
         SessionResources(
             {
-                "inputs": [{"name": "x", "policy": "queued", "max_bytes": 1024}],
+                "inputs": [{"name": "x", "policy": "queued"}],
                 "initial_result": False,
             },
             ClientSlotMap([]),
@@ -2774,7 +2670,7 @@ def _media(session_id, sequence, index):
 def _open_channel(session_id=1, lockstep=True):
     channel = SessionChannel(session_id)
     caps = {
-        "inputs": [{"name": "controls", "policy": "queued", "max_bytes": 1024}],
+        "inputs": [{"name": "controls", "policy": "queued"}],
         "initial_result": False,
         "lockstep": lockstep,
     }
@@ -2914,13 +2810,13 @@ def test_known_terminal_is_returned_without_looking_at_the_advance_value(harness
         assert terminal.done and "idle timeout" in terminal.error
 
 
-def test_locally_rejected_advance_value_withdraws_its_reservation(harness):
+def test_rejected_advance_value_withdraws_its_reservation(harness):
     pipe = CountingPipeline(initial=False)
     with harness(pipe) as h:
         with h.open() as s:
             channel = h.client._sessions[s.request_id]
-            with pytest.raises(SessionQueueFull):
-                s.advance([1, 2, 3, 4, 5])  # over the bound: refused before anything is sent
+            with pytest.raises(ValueError):
+                s.advance(-1)  # the worker's validator refuses it
             with pytest.raises(ValueError):
                 s.advance(object())
             assert (
@@ -3020,17 +2916,17 @@ def test_interrupted_advance_validation_releases_both_reservations(harness):
             channel = h.client._sessions[s.request_id]
             import tensorrt_llm._torch.visual_gen.executor as executor_module
 
-            original = executor_module.check_input_size
+            original = executor_module.SessionSubmit
 
-            def interrupt(spec, value):
+            def interrupt(*args):  # between the reservation and the publication
                 raise KeyboardInterrupt
 
-            executor_module.check_input_size = interrupt
+            executor_module.SessionSubmit = interrupt
             try:
                 with pytest.raises(KeyboardInterrupt):
                     s.advance(1)
             finally:
-                executor_module.check_input_size = original
+                executor_module.SessionSubmit = original
             assert channel._submit is None and channel._reader is None  # nothing leaked
             r = s.advance(1)
             assert r.advance_index == 0 and pipe.advances == [{"controls": 1, "camera": 0}]

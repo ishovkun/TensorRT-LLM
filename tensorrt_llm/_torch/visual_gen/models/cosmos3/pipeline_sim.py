@@ -37,7 +37,6 @@ from ...cache import BlockCausalKVCacheManager, RolloutSpec
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from ...pipeline import AdvanceOutcome, InputSpec, SessionCapabilities, StreamSpec
 from ...pipeline_registry import register_pipeline
-from ...session_protocol import input_nbytes
 from ...utils import make_noise_generator, postprocess_video_tensor
 from ..wan.vae_loader import load_wan_vae
 from .action import load_action_tensor, normalize_action_mode, pad_action_to_dim
@@ -998,12 +997,8 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
         max_generated = max(allowed) // sim.action_tokens_per_frame
         frames_per_advance = max_generated * self.vae_scale_factor_temporal
-        # The most the largest accepted value can cost in its largest supported
-        # form, a list of rows of Python numbers however it was built (a tensor
-        # or array of the same shape is smaller).
-        action_bytes = input_nbytes([[0.0] * width for _ in range(max(allowed))], worst_case=True)
         return SessionCapabilities(
-            inputs=(InputSpec(name="actions", max_bytes=action_bytes, validator=validate_rows),),
+            inputs=(InputSpec(name="actions", validator=validate_rows),),
             streams=(
                 StreamSpec(
                     name="video",

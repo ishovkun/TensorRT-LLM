@@ -254,7 +254,7 @@ class VisualGenSession:
     def capabilities(self) -> Dict[str, Any]:
         """What the pipeline declared for this session.
 
-        ``inputs`` (name, policy, default, queue_depth, max_bytes), ``streams``
+        ``inputs`` (name, policy, default, queue_depth), ``streams``
         (name, kind, dtype, max_shape, axis, rate, placement), ``initial_result``,
         ``length``, ``lockstep``.
         """
@@ -278,8 +278,7 @@ class VisualGenSession:
         for a live input it is the next advance not yet dispatched when the value
         was admitted, so every advance from that index on reads this value or a
         later one for the same input. Raises ``ValueError`` (invalid input),
-        ``SessionQueueFull`` (retry after the next advance, or the value exceeds
-        the input's byte bound) or ``SessionEnded``.
+        ``SessionQueueFull`` (retry after the next advance) or ``SessionEnded``.
         """
         fut = self._client.session_submit(self._channel, name, value)
         try:

@@ -26,13 +26,7 @@ from typing import Any, Deque, Dict, Optional, Tuple
 import torch
 
 from .pipeline import SessionCapabilities
-from .session_protocol import (
-    ResultKind,
-    SessionEnded,
-    SessionQueueFull,
-    SessionResultMessage,
-    check_input_size,
-)
+from .session_protocol import ResultKind, SessionEnded, SessionQueueFull, SessionResultMessage
 
 
 class SessionState:
@@ -62,7 +56,7 @@ class SessionState:
     def admit(self, name: str, value: Any) -> int:
         """Validate and admit one value. Returns the advance index: for a queued input
         the advance that will consume the value; for a live input the next advance to
-        be dispatched. Raises ``ValueError`` (size, then the validator),
+        be dispatched. Raises ``ValueError`` (the validator),
         ``SessionQueueFull`` or ``SessionEnded``; a rejection changes nothing."""
         if self.terminal is not None or self.closing:
             raise SessionEnded(
@@ -70,7 +64,6 @@ class SessionState:
                 + ("closing" if self.closing else "a terminal result exists")
             )
         spec = self.capabilities.input(name)
-        check_input_size(spec, value)
         if spec.validator is not None:
             spec.validator(value)
         if spec.policy == "live":
