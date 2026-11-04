@@ -125,7 +125,9 @@ class InputSpec(StrictBaseModel):
     ``queue_depth`` values for a queued input, and the current value plus the
     snapshot of the advance in flight for a live one. ``validator`` runs on rank
     0 before admission, after the size check, and raises ``ValueError`` for a
-    bad value.
+    bad value. ``default`` is the value a live input holds until its first
+    submit; a live input must declare one, and a declared default, ``None``
+    included, is checked like a submitted value.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -139,6 +141,14 @@ class InputSpec(StrictBaseModel):
 
     @model_validator(mode="after")
     def _check_default(self) -> "InputSpec":
+        declared = "default" in self.model_fields_set
+        if self.policy == "live" and not declared:
+            raise ValueError(
+                f"live input {self.name!r} needs a default: the first advance reads it "
+                "before any submit"
+            )
+        if not declared:
+            return self
         if self.default is not None:
             from .session import input_nbytes
 
@@ -148,6 +158,11 @@ class InputSpec(StrictBaseModel):
                     f"input {self.name!r}: the default holds at least {size} bytes, "
                     f"the declared bound is {self.max_bytes}"
                 )
+        if self.validator is not None:
+            try:
+                self.validator(self.default)
+            except (ValueError, TypeError) as e:
+                raise ValueError(f"input {self.name!r}: the default is refused: {e}") from e
         return self
 
 

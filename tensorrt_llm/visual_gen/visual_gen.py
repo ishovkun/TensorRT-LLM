@@ -493,7 +493,9 @@ class VisualGen:
         Blocks until the worker has initialized the session. Behind an ordinary
         ``generate()`` it waits as any request does; while another session is open
         on this model instance it raises without waiting. Raises ``ValueError`` when
-        the pipeline does not support sessions or rejects the request.
+        the pipeline does not support sessions, or when it refuses the request and
+        reports the request as the cause; ``MemoryError`` when it lacks the
+        capacity; ``RuntimeError`` for any other failure to open.
         """
         request = self._session_request(prompt, params)
         channel = self.executor.open_session(request)

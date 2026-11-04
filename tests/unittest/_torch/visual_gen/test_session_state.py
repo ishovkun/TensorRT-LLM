@@ -424,6 +424,55 @@ def test_live_default_must_fit_the_bound():
     assert spec.default == (0.0, 0.0)
 
 
+def test_live_input_must_declare_a_default():
+    with pytest.raises(ValueError, match="needs a default"):
+        InputSpec(name="camera", policy="live", max_bytes=ONE_INT)
+    # A queued input reads no default, so it may leave it out.
+    assert InputSpec(name="controls", max_bytes=ONE_INT).default is None
+
+
+def _nonnegative(value):
+    if not isinstance(value, int) or value < 0:
+        raise ValueError(f"{value!r} is not a nonnegative int")
+
+
+def test_declared_default_is_checked_like_a_submitted_value():
+    with pytest.raises(ValueError, match="default is refused"):
+        InputSpec(
+            name="camera", policy="live", max_bytes=ONE_INT, validator=_nonnegative, default=-1
+        )
+    with pytest.raises(ValueError, match="default is refused"):
+        InputSpec(
+            name="camera", policy="live", max_bytes=ONE_INT, validator=_nonnegative, default=None
+        )
+
+    def allows_none(value):
+        if value is not None:
+            _nonnegative(value)
+
+    spec = InputSpec(
+        name="camera", policy="live", max_bytes=ONE_INT, validator=allows_none, default=None
+    )
+    assert spec.default is None
+
+
+def test_valid_live_default_reaches_the_first_advance():
+    caps = SessionCapabilities(
+        inputs=(
+            InputSpec(name="controls", max_bytes=ONE_INT),
+            InputSpec(
+                name="camera", policy="live", max_bytes=ONE_INT, validator=_nonnegative, default=3
+            ),
+        ),
+        streams=(_video_stream(),),
+    )
+    state = SessionState(1, caps)
+    state.initialized = True
+    state.admit("controls", 1)
+    assert state.can_advance(1)
+    assert state.take_inputs() == {"controls": 1, "camera": 3}
+
+
 def test_queue_full_and_size_rejections_leave_the_next_index_unchanged():
     state = SessionState(1, lockstep_caps(initial=False))
     state.initialized = True

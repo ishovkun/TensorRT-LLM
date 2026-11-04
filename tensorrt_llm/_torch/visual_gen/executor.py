@@ -908,7 +908,7 @@ class DiffusionExecutor:
             self._merge_defaults(req)
             pipeline.prepare_request(req)
             if not pipeline.supports_sessions:
-                raise ValueError(f"{type(pipeline).__name__} does not support sessions")
+                raise SessionsUnsupported(f"{type(pipeline).__name__} does not support sessions")
             caps = pipeline.session_capabilities(req)
             state = SessionState(session_id, caps)
             device = (
@@ -927,11 +927,14 @@ class DiffusionExecutor:
             self._broadcast_session_tag(("open_abort",))
             if pool is not None:
                 pool.close()
-            self.response_queue.put(
-                SessionOpened(
-                    session_id, error=str(e), error_type=pipeline.classify_request_failure(e)
-                )
+            # Asking an unsupported pipeline for a session is the caller's mistake;
+            # what the pipeline itself raised is classified by the pipeline.
+            error_type = (
+                "client"
+                if isinstance(e, SessionsUnsupported)
+                else pipeline.classify_request_failure(e)
             )
+            self.response_queue.put(SessionOpened(session_id, error=str(e), error_type=error_type))
             return
 
         self._broadcast_session_tag(("open_go",))
@@ -1323,6 +1326,11 @@ def run_diffusion_worker(
 def _consume_exception(fut: "asyncio.Future") -> None:
     if not fut.cancelled():
         fut.exception()
+
+
+class SessionsUnsupported(ValueError):
+    """A session was requested from a pipeline that does not implement the session
+    hooks. Refused by the worker before any pipeline work, as the caller's mistake."""
 
 
 class FatalRankError(RuntimeError):

@@ -530,6 +530,17 @@ def test_open_failure_raises_with_the_failure_class(harness):
             h.open()
 
 
+def test_unsupported_pipeline_refuses_a_session_as_a_client_error(harness):
+    class NoSessions(CountingPipeline):
+        supports_sessions = False
+
+    pipe = NoSessions()
+    with harness(pipe) as h:
+        with pytest.raises(ValueError, match="does not support sessions"):
+            h.open()
+    assert pipe.opened == 0
+
+
 def test_execution_error_ends_the_session_with_a_terminal_error(harness):
     pipe = CountingPipeline(initial=False, fail_at=1)
     with harness(pipe) as h:
