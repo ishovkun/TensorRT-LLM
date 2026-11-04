@@ -424,6 +424,14 @@ def test_live_default_must_fit_the_bound():
     assert spec.default == (0.0, 0.0)
 
 
+def test_explicit_none_default_is_measured_like_a_submitted_none():
+    none_bytes = input_nbytes(None)
+    with pytest.raises(ValueError, match="default holds"):
+        InputSpec(name="camera", policy="live", max_bytes=none_bytes - 1, default=None)
+    spec = InputSpec(name="camera", policy="live", max_bytes=none_bytes, default=None)
+    assert spec.default is None
+
+
 def test_live_input_must_declare_a_default():
     with pytest.raises(ValueError, match="needs a default"):
         InputSpec(name="camera", policy="live", max_bytes=ONE_INT)

@@ -534,6 +534,9 @@ def test_unsupported_pipeline_refuses_a_session_as_a_client_error(harness):
     class NoSessions(CountingPipeline):
         supports_sessions = False
 
+        def classify_request_failure(self, exc):
+            return None  # the base pipeline leaves every failure unclassified
+
     pipe = NoSessions()
     with harness(pipe) as h:
         with pytest.raises(ValueError, match="does not support sessions"):

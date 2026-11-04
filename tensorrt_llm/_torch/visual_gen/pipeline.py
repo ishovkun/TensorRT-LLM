@@ -149,15 +149,14 @@ class InputSpec(StrictBaseModel):
             )
         if not declared:
             return self
-        if self.default is not None:
-            from .session import input_nbytes
+        from .session import input_nbytes
 
-            size = input_nbytes(self.default, self.max_bytes)
-            if size > self.max_bytes:
-                raise ValueError(
-                    f"input {self.name!r}: the default holds at least {size} bytes, "
-                    f"the declared bound is {self.max_bytes}"
-                )
+        size = input_nbytes(self.default, self.max_bytes)
+        if size > self.max_bytes:
+            raise ValueError(
+                f"input {self.name!r}: the default holds at least {size} bytes, "
+                f"the declared bound is {self.max_bytes}"
+            )
         if self.validator is not None:
             try:
                 self.validator(self.default)
