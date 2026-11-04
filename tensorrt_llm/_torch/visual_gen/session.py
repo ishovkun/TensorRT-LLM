@@ -41,15 +41,20 @@ if TYPE_CHECKING:
 # --------------------------------------------------------------------------- input size
 
 
-def input_nbytes(value: Any, limit: float = math.inf) -> int:
+def input_nbytes(value: Any, limit: float = math.inf, worst_case: bool = False) -> int:
     """The bytes a submitted value costs: the measure ``InputSpec.max_bytes``
     bounds. Counts what a value retains and what it expands to, whichever is
     larger: a tensor or NumPy array the larger of its backing storage (a narrow
     view keeps all of it alive; an array is followed down its ``base`` chain to
     the owner) and its logical size (a broadcast or expanded layout materializes
-    to it in transport and validation); a memoryview its exporter; bytes,
-    numbers, strings and containers their CPython object size, containers plus
-    every item, a repeated reference counted each time it appears. Stops as soon
+    to it in transport and validation); bytes, strings, numbers and containers
+    their CPython object size (an arbitrary-precision int costs what it holds),
+    containers plus every item, a repeated reference counted each time it
+    appears. With ``worst_case`` the walk charges instead the most any value of
+    this shape can cost: a number at the larger of a small int and a float, a
+    list at its maximum over-allocation under CPython's growth policy
+    (``n + n // 8 + 6`` slots); a declared bound computed that way from a
+    canonical value admits every ordinary construction of it. Stops as soon
     as the total passes ``limit`` and never expands a container before its own
     size has been counted and checked, so the walk's memory and time are bounded
     by the limit, not by the value. Supported forms only, and only plain ones,
@@ -90,7 +95,10 @@ def input_nbytes(value: Any, limit: float = math.inf) -> int:
         elif kind in (list, tuple, dict):
             if id(v) in on_path:
                 raise ValueError("a container that contains itself is not a supported input form")
-            total += sys.getsizeof(v)
+            if worst_case and kind is list:
+                total += _SEQUENCE_HEADER + _SLOT * (len(v) + (len(v) >> 3) + 6)
+            else:
+                total += sys.getsizeof(v)
             if total > limit:
                 return total  # not expanded: its slots alone are past the bound
             on_path.add(id(v))
@@ -98,11 +106,18 @@ def input_nbytes(value: Any, limit: float = math.inf) -> int:
                 frames.append((id(v), itertools.chain(v.keys(), v.values())))
             else:
                 frames.append((id(v), iter(v)))
-        elif v is None or kind in (bytes, bytearray, str, bool, int, float):
+        elif kind in (bool, int, float):
+            total += max(_NUMBER, sys.getsizeof(v)) if not worst_case else _NUMBER
+        elif v is None or kind in (bytes, bytearray, str):
             total += sys.getsizeof(v)
         else:
             raise ValueError(f"{kind.__name__} is not a supported input form")
     return total
+
+
+_NUMBER = max(sys.getsizeof(0), sys.getsizeof(0.0))  # a small int or a float, whichever is larger
+_SEQUENCE_HEADER = sys.getsizeof([])  # a list with no items
+_SLOT = 8  # one reference in a list
 
 
 _OWNER_CHAIN_LIMIT = 64  # views of views; anything deeper is not a plain input
@@ -203,7 +218,6 @@ class SessionOpen:
 @dataclass
 class SessionSubmit:
     session_id: int
-    seq: int
     name: str
     value: Any
 
@@ -238,8 +252,9 @@ class SessionOpened:
 
 @dataclass
 class SessionAdmitted:
+    """The answer to the one submit a session has in flight."""
+
     session_id: int
-    seq: int
     advance_index: Optional[int] = None
     error: Optional[str] = None
     error_kind: Optional[str] = None  # "invalid" | "queue_full" | "ended"

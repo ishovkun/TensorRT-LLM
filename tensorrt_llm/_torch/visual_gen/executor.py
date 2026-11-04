@@ -1,7 +1,6 @@
 import asyncio
 import atexit
 import contextlib
-import itertools
 import os
 import pickle
 import queue
@@ -11,11 +10,23 @@ import threading
 import time
 import traceback
 import weakref
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.distributed as dist
@@ -480,6 +491,8 @@ class DiffusionExecutor:
         req_hmac_key: Optional[bytes] = None,
         resp_hmac_key: Optional[bytes] = None,
         in_client_process: bool = False,
+        control_queue_addr: Optional[str] = None,
+        ctl_hmac_key: Optional[bytes] = None,
     ):
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
@@ -490,6 +503,9 @@ class DiffusionExecutor:
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
+        # Session control (slot returns, close, activity) arrives on its own
+        # socket, so it is serviced whatever the state of the request socket.
+        self.controls_ipc = None
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
         self.response_queue = queue.Queue()
@@ -508,6 +524,13 @@ class DiffusionExecutor:
                 socket_type=zmq.PULL,
                 use_hmac_encryption=True,
             )
+            if control_queue_addr is not None:
+                self.controls_ipc = ZeroMqQueue(
+                    (control_queue_addr, ctl_hmac_key),
+                    is_server=False,
+                    socket_type=zmq.PULL,
+                    use_hmac_encryption=True,
+                )
             self.sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
             self.sender_thread.start()
 
@@ -663,10 +686,23 @@ class DiffusionExecutor:
             self.process_request(req)
 
     def _next_message(self) -> Any:
-        """Rank 0: the next message, serving anything deferred during a session first."""
+        """Rank 0: the next message, serving anything deferred during a session
+        first. Controls that arrive with no session open are strays (a close
+        that crossed its SessionClosed): answered, never queued."""
         if self._deferred:
             return self._deferred.pop(0)
-        return self.requests_ipc.get()
+        while True:
+            for command in self._drain_controls():
+                self._answer_stray_command(command)
+            try:
+                return self.requests_ipc.get(timeout=POLL_TIMEOUT)
+            except queue.Empty:
+                continue
+
+    def _drain_controls(self) -> List[Any]:
+        if self.controls_ipc is None:
+            return []
+        return self.controls_ipc.drain()
 
     def _answer_stray_command(self, command: Any) -> None:
         """A session command with no open session: a submit is refused so the
@@ -675,7 +711,6 @@ class DiffusionExecutor:
             self.response_queue.put(
                 SessionAdmitted(
                     command.session_id,
-                    command.seq,
                     error=f"session {command.session_id} is not open",
                     error_kind="ended",
                 )
@@ -1056,17 +1091,30 @@ class DiffusionExecutor:
         block: bool,
         timeout: Optional[float] = None,
     ) -> bool:
-        """Handle every command currently on the socket. With ``block`` wait for the
-        first one up to ``timeout`` seconds; returns False when that wait expired."""
-        if block:
-            try:
-                message = self.requests_ipc.get(timeout=timeout)
-            except queue.Empty:
+        """Handle every command currently on either socket, controls first. With
+        ``block`` wait for the first one up to ``timeout`` seconds (``None``: no
+        limit); returns False when that wait expired. Both sockets are watched
+        while waiting, in slices of ``POLL_TIMEOUT``, so a slot return or a close
+        is seen whatever sits unread on the request socket."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            commands = self._drain_controls() + self.requests_ipc.drain()
+            if commands:
+                for message in commands:
+                    self._handle_session_command(message, state, pool, pipeline_state)
+                return True
+            if not block:
+                return True
+            if deadline is not None and time.monotonic() >= deadline:
                 return False
+            try:
+                message = self.requests_ipc.get(timeout=POLL_TIMEOUT)
+            except queue.Empty:
+                continue
             self._handle_session_command(message, state, pool, pipeline_state)
-        for message in self.requests_ipc.drain():
-            self._handle_session_command(message, state, pool, pipeline_state)
-        return True
+            for message in self._drain_controls() + self.requests_ipc.drain():
+                self._handle_session_command(message, state, pool, pipeline_state)
+            return True
 
     def _handle_session_command(
         self, message: Any, state: SessionState, pool: SlotPool, pipeline_state: Any
@@ -1079,7 +1127,7 @@ class DiffusionExecutor:
             if message.session_id != state.session_id:
                 self._answer_stray_command(message)
                 return
-            reply = SessionAdmitted(state.session_id, message.seq)
+            reply = SessionAdmitted(state.session_id)
             try:
                 # Name and size first: nothing of the pipeline runs on a value the
                 # declaration does not admit. ``admit`` mutates nothing until its
@@ -1185,6 +1233,8 @@ def run_diffusion_worker(
     local_rank: Optional[int] = None,
     in_client_process: bool = False,
     parent_pid: Optional[int] = None,
+    control_queue_addr: Optional[str] = None,
+    ctl_hmac_key: Optional[bytes] = None,
 ):
     """Entry point for worker process.
 
@@ -1256,6 +1306,8 @@ def run_diffusion_worker(
             req_hmac_key=req_hmac_key,
             resp_hmac_key=resp_hmac_key,
             in_client_process=in_client_process,
+            control_queue_addr=control_queue_addr,
+            ctl_hmac_key=ctl_hmac_key,
         )
         executor.serve_forever()
         if executor.pipeline is not None:
@@ -1268,6 +1320,11 @@ def run_diffusion_worker(
         raise
 
 
+def _consume_exception(fut: "asyncio.Future") -> None:
+    if not fut.cancelled():
+        fut.exception()
+
+
 class FatalRankError(RuntimeError):
     """A rank hit an exception while its peers may be inside a collective. Raised
     only when the rank shares the client's process; a dedicated worker process
@@ -1275,119 +1332,372 @@ class FatalRankError(RuntimeError):
     group, so the client gets the failure raised, not a terminal result."""
 
 
-class SessionChannel:
-    """Coordinator side of one session: the hand-off point between the two threads
-    of the coordinator process that touch a session.
+class SessionResources(NamedTuple):
+    """What the worker handed over at open: the declared capabilities and the
+    client's mapping of the delivery slots. Immutable; the mapping is closed in
+    place when the session ends."""
 
-    The main thread runs the public ``VisualGenSession`` calls (``submit``,
-    ``advance``, ``next(results)``). The client's background thread reads the
-    worker's response socket and routes each session message here. Everything
-    both threads touch sits behind ``_lock``; what crosses between them is a
-    ``concurrent.futures.Future`` that one side creates and the other completes.
+    capabilities: Dict[str, Any]
+    slots: ClientSlotMap
+
+
+class PendingSubmit(NamedTuple):
+    """The one submit operation in progress: its input and the admission future
+    the caller waits on (result: advance index; exception: rejection;
+    cancelled: the caller gave up before the reply)."""
+
+    name: str
+    admission: Future
+
+
+_EOF = object()  # the terminal was taken: the stream has ended
+_CLOSED = object()  # the client closed: nothing further is readable
+
+
+class SessionChannel:
+    """Coordinator side of one session: the hand-off point between the main
+    thread (the public ``VisualGenSession`` calls) and the client's background
+    thread (which routes the worker's replies here). Eight members, one per fact:
+
+    ``opened``: the opening, a future of ``SessionResources`` (or the open error).
+    ``_close``: absent while no close has begun; pending once requested; done when
+    the worker confirmed; failed when the worker group is gone, its exception is
+    the sticky failure.
+    ``_submit``: the submit operation in progress, held until its caller finishes.
+    ``_reader``: the read operation in progress (a plain read or an advance),
+    held until its caller finishes; also the notification the caller awaits.
+    ``_results``: unread results in order, then an end marker.
+    ``_owed``: media promised to a lockstep client and not yet taken.
+    Everything but ``opened`` and ``session_id`` is touched under ``_lock``.
     """
 
     def __init__(self, session_id: int):
         self.session_id = session_id
-        # Two moments in the session's life, each completed once by the
-        # background thread while the main thread waits on it: ``opened`` when
-        # the worker reports the session open (result: this channel; exception:
-        # the open error), ``closed`` when the worker reports it torn down.
         self.opened: Future = Future()
-        self.closed: Future = Future()
-        # Declared by the worker at open and written once, before ``opened``
-        # completes: the capabilities dict and the client's mapping of the
-        # worker's delivery slots (the shared-memory buffers results land in).
-        self.capabilities: Optional[Dict[str, Any]] = None
-        self.delivery_slots: Optional[ClientSlotMap] = None
-        # Guards the three fields below. The main thread and the background thread
-        # both read and write them, and two steps must be atomic: "take the next
-        # unread result, or park a future if there is none" on the main thread,
-        # and "complete the parked future, or append to the unread messages if
-        # there is none" on the background thread. Held only for those few lines,
-        # never while waiting. Futures are completed outside it.
+        self._close: Optional[Future] = None
         self._lock = threading.Lock()
-        # Set once by ``fail`` when the worker group is gone. Every later call
-        # raises it; nothing is delivered after it.
-        self.failure: Optional[Exception] = None
-        # Set once by ``close`` when the worker reports the session closed
-        # (explicit close, idle timeout). Media not yet requested is gone with the
-        # slot mappings; a terminal result not yet requested is still delivered,
-        # once. New submits and later requests raise ``SessionEnded``.
-        self.closed_reason: Optional[str] = None
-        # Set by ``abandon_open`` when the caller that was opening the session was
-        # cancelled before it got its handle. A successful open then closes at
-        # once; the reservation is released when the worker confirms the close.
-        self.abandoned = False
-        # Set by ``cancel`` when the client asked for the close. Then the close
-        # discards everything undelivered, terminal results included; a close the
-        # worker initiated (idle timeout) keeps its terminal for one delivery.
-        self.cancelled = False
-        # The one submit awaiting admission: sent to the worker, not yet answered. The
-        # sequence number stamped on its ``SessionSubmit`` message, so the
-        # ``SessionAdmitted`` reply can be matched to it, and the future the
-        # calling ``submit()`` blocks on until that reply brings the advance index
-        # or a rejection. A second submit while one awaits admission is refused.
-        self._seq = itertools.count()
-        self._awaiting_admission: Optional[Tuple[int, Future, str]] = None
-        # What the worker owes this client and has not delivered: the declared
-        # initial result and the queued-input admissions whose media has not been
-        # taken. Kept here, not on the public session, because an admission is
-        # recorded by the background thread when the reply arrives, whether or
-        # not the submit that asked for it is still waiting (it may have been
-        # cancelled). ``advance`` consults it so it never takes an older result.
-        self._queued_names: set = set()
-        self._owed_initial = False
-        self._admitted_queued: set = set()
-        # Result messages the worker delivered that no call has asked for yet,
-        # oldest first; the views over the slots are built when one is taken.
-        # Bounded by the slot count: the worker cannot produce a result without a
-        # free delivery slot.
-        self._unread_messages: Deque[SessionResultMessage] = deque()
-        # The future for the next result, parked here only while a call waits for
-        # one and ``_unread_messages`` is empty; the next delivery completes it
-        # instead of joining ``_unread_messages``. The two are never both non-empty.
-        self._next_result: Optional[Future] = None
+        self._submit: Optional[PendingSubmit] = None
+        self._reader: Optional[Future] = None
+        self._results: Deque[Any] = deque()
+        self._owed = 0
 
-    # ---- admission (one submit at a time)
+    # ---- derived views
 
-    def declare(self, capabilities: Dict[str, Any]) -> None:
-        """What the worker declared at open; sets what is owed from the start."""
-        self.capabilities = capabilities
+    @property
+    def capabilities(self) -> Optional[Dict[str, Any]]:
+        resources = self._resources()
+        return None if resources is None else resources.capabilities
+
+    def _resources(self) -> Optional[SessionResources]:
+        fut = self.opened
+        if fut.done() and not fut.cancelled() and fut.exception() is None:
+            return fut.result()
+        return None
+
+    @property
+    def failure(self) -> Optional[BaseException]:
+        """The sticky worker failure, if the worker group is gone."""
+        close = self._close
+        if close is not None and close.done() and not close.cancelled():
+            return close.exception()
+        return None
+
+    @property
+    def lease_lost(self) -> Optional[str]:
+        """Why views over the slots are no longer usable; ``None`` while they are.
+        Set as soon as a close has begun, requested or worker-initiated."""
+        close = self._close
+        if close is None:
+            return None
+        failure = self.failure
+        return str(failure) if failure is not None else f"session {self.session_id} is closed"
+
+    def closing(self) -> Optional[Future]:
+        """The close operation, if one has begun."""
+        return self._close
+
+    def unread_media(self) -> bool:
         with self._lock:
-            self._queued_names = {
-                spec["name"]
-                for spec in capabilities.get("inputs", [])
-                if spec["policy"] == "queued"
-            }
-            self._owed_initial = bool(capabilities.get("initial_result"))
+            return any(isinstance(m, SessionResultMessage) and not m.done for m in self._results)
 
-    def expect_admission(self, name: str, nothing_owed: bool = False) -> Tuple[int, Future]:
-        """Register the submit awaiting admission; returns its sequence number and
-        future. With ``nothing_owed`` (an ``advance``) the submit is refused while
-        an earlier result is still owed, checked under the same lock that reserves
-        the admission, so no reply can slip in between."""
-        fut: Future = Future()
+    def owed(self) -> int:
         with self._lock:
-            if self.failure is not None:
-                raise self.failure
-            if self.closed_reason is not None:
-                raise SessionEnded(self.closed_reason)
-            if self._awaiting_admission is not None:
-                raise SessionError("a submit is already waiting on this session")
-            if nothing_owed:
-                owed = self._owed_locked()
-                if owed is not None:
-                    raise SessionError(
-                        f"{owed}; take it through results() before calling advance()"
-                    )
-            seq = next(self._seq)
-            self._awaiting_admission = (seq, fut, name)
-        return seq, fut
+            return self._owed
+
+    def _queued_input(self) -> Optional[str]:
+        caps = self.capabilities or {}
+        if not caps.get("lockstep"):
+            return None
+        for spec in caps.get("inputs", []):
+            if spec["policy"] == "queued":
+                return spec["name"]
+        return None
+
+    # ---- opening (background thread)
+
+    def open_succeeded(self, resources: SessionResources) -> None:
+        with self._lock:
+            caps = resources.capabilities
+            if caps.get("lockstep") and caps.get("initial_result"):
+                self._owed = 1
+        self._complete(self.opened, resources)
+
+    def open_failed(self, error: Exception) -> None:
+        self._complete(self.opened, error=error)
+        with self._lock:
+            close = self._close
+        if close is not None:
+            self._complete(close, None)  # a close requested while opening: nothing to send
+
+    # ---- results
+
+    def deliver(self, message: SessionResultMessage) -> None:
+        with self._lock:
+            close = self._close
+            if (close is not None and close.done()) or (
+                self._results and self._results[-1] is _CLOSED
+            ):
+                return  # after the end: a stray
+            self._results.append(message)
+            reader = self._reader
+        self._notify(reader)
+
+    def reserve_read(self) -> None:
+        with self._lock:
+            if self._reader is not None:
+                raise SessionError("a result request is already in progress on this session")
+            self._reader = Future()
+
+    def release_read(self) -> None:
+        with self._lock:
+            self._reader = None
+
+    def take(
+        self,
+        build: Callable[[SessionResultMessage], Any],
+        expected_index: Any = None,
+    ) -> Any:
+        """One step of a reserved read. Returns the built result, ``_EOF`` when
+        the stream has ended, or ``None`` when nothing is readable yet; in that
+        case the wakeup is armed in the same critical section, so a delivery,
+        close or failure landing afterwards is never missed by the following
+        ``notification()``. Raises the sticky failure or ``SessionEnded`` after an
+        explicit close. With ``expected_index`` (an advance), media at the head
+        carrying another advance index raises ``SessionError`` before anything is
+        taken, so the head stays readable. Builds under the lock, so the mapping
+        cannot be torn down meanwhile."""
+        with self._lock:
+            failure = self.failure
+            if failure is not None:
+                raise failure
+            if not self._results:
+                if self._close is not None:
+                    raise SessionEnded(f"session {self.session_id} is closed")
+                if self._reader is not None and self._reader.done():
+                    self._reader = Future()  # re-armed with the predicate still false
+                return None
+            head = self._results[0]
+            if head is _CLOSED:
+                raise SessionEnded(f"session {self.session_id} is closed")
+            if head is _EOF:
+                return _EOF
+            if (
+                expected_index is not None
+                and not head.done
+                and head.advance_index != expected_index
+            ):
+                raise SessionError(
+                    f"advance() admitted index {expected_index} but the next result is advance "
+                    f"{head.advance_index}; the worker broke result ordering"
+                )
+            result = build(head)
+            self._results.popleft()
+            if head.done:
+                self._results.appendleft(_EOF)
+            elif head.advance_index is not None or self._owed:
+                self._owed = max(0, self._owed - 1) if self._queued_input() else 0
+            return result
+
+    def notification(self) -> Future:
+        """The future to await before the next ``take``: whatever ``take`` armed
+        when it found nothing readable. Never re-armed here: a completed one
+        means something changed since, and the next ``take`` sees it."""
+        with self._lock:
+            if self._reader is None:
+                raise SessionError("no read is reserved")
+            return self._reader
+
+    def _notify(self, reader: Optional[Future]) -> None:
+        if reader is not None:
+            self._complete(reader, None)
+
+    # ---- admission
+
+    def reserve_submit(self, name: str, for_advance: bool = False) -> Future:
+        """Register the one submit in progress; returns its admission future. For
+        an advance, also refuse while an earlier result is still owed; the check
+        and the reservation are one step."""
+        with self._lock:
+            failure = self.failure
+            if failure is not None:
+                raise failure
+            if self._close is not None:
+                raise SessionEnded(f"session {self.session_id} is closed")
+            if self._submit is not None:
+                raise SessionError("a submit is already in progress on this session")
+            if for_advance and self._owed:
+                raise SessionError(
+                    f"{self._owed} earlier result(s) are unread; take them through results() "
+                    "before calling advance()"
+                )
+            fut: Future = Future()
+            self._submit = PendingSubmit(name, fut)
+            return fut
+
+    def plan_advance(self, name: str) -> Optional[Future]:
+        """Start an advance under a reserved read: ``None`` when the head of the
+        stream is already a terminal (take it, submit nothing), else the
+        admission future of the reserved submit. Sticky failure first; an ended
+        or explicitly closed stream ends the call; a retained terminal is
+        claimable even after a graceful worker close; only then does a close
+        prevent a new submit."""
+        with self._lock:
+            failure = self.failure
+            if failure is not None:
+                raise failure
+            head = self._results[0] if self._results else None
+            if head is _CLOSED or head is _EOF:
+                raise SessionEnded(f"session {self.session_id} has ended")
+            if isinstance(head, SessionResultMessage) and head.done:
+                return None
+            if self._close is not None:
+                raise SessionEnded(f"session {self.session_id} is closed")
+            if self._submit is not None:
+                raise SessionError("a submit is already in progress on this session")
+            if self._owed:
+                raise SessionError(
+                    f"{self._owed} earlier result(s) are unread; take them through results() "
+                    "before calling advance()"
+                )
+            fut: Future = Future()
+            self._submit = PendingSubmit(name, fut)
+            return fut
+
+    def admitted(self, index: Optional[int], error: Optional[Exception]) -> None:
+        """The worker's answer to the one pending submit (background thread)."""
+        with self._lock:
+            pending = self._submit
+            if pending is None:
+                logger.warning(
+                    f"DiffusionClient: admission for session {self.session_id} with no submit pending"
+                )
+                return
+            if error is None and pending.name == self._queued_input():
+                self._owed += 1  # owed from now on, whether or not the caller still waits
+            # Completed under the lock: either the caller still owns the future
+            # and retires the record when done, or it had cancelled and the
+            # record retires here, with the reply. No window between the two.
+            if not self._complete(pending.admission, index, error):
+                self._submit = None
+
+    def withdraw_submit(self, fut: Future) -> None:
+        """A reserved submit that was never sent (refused locally): the record
+        goes, nothing is owed, no index moved."""
+        with self._lock:
+            pending = self._submit
+            if pending is not None and pending.admission is fut:
+                self._submit = None
+
+    def release_submit(self, fut: Future) -> None:
+        """The caller of the submit that owns ``fut`` is done with it. A reply
+        already received retires the record; a caller leaving before the reply
+        marks it cancelled and the reply retires it."""
+        with self._lock:
+            pending = self._submit
+            if pending is None or pending.admission is not fut:
+                return
+            if fut.done() and not fut.cancelled():
+                self._submit = None
+                return
+            fut.cancel()
+
+    # ---- close and failure
+
+    def request_close(self) -> Tuple[Future, bool]:
+        """The client closes: discard the unread stream, settle the submit in
+        progress, expire the leases. Returns the close operation and whether this
+        call began it (the caller then arranges the one close command)."""
+        with self._lock:
+            if self._close is not None:
+                # Already closing or closed (a worker-initiated close may have
+                # retained a terminal): the client's close still discards the stream.
+                if self.failure is None and not (self._results and self._results[-1] is _CLOSED):
+                    self._results.clear()
+                    self._results.append(_CLOSED)
+                return self._close, False
+            self._close = Future()
+            self._results.clear()
+            self._results.append(_CLOSED)
+            self._owed = 0
+            pending, self._submit = self._submit, None
+            reader = self._reader
+        if pending is not None:
+            self._complete(pending.admission, error=SessionEnded("session closed"))
+        self._notify(reader)
+        return self._close, True
+
+    def worker_closed(self) -> None:
+        """The worker confirmed (or initiated) the close. Media still unread is
+        dropped with its mappings; a terminal is kept unless the client had
+        closed; the close operation completes."""
+        with self._lock:
+            if self._close is None:
+                self._close = Future()
+                kept = [m for m in self._results if m is _EOF or getattr(m, "done", False)]
+                self._results.clear()
+                self._results.extend(kept)
+            self._owed = 0
+            pending, self._submit = self._submit, None
+            reader = self._reader
+            resources = self._resources()
+            if resources is not None:
+                resources.slots.close()
+            close = self._close
+        if pending is not None:
+            self._complete(pending.admission, error=SessionEnded("session closed"))
+        self._complete(close, None)
+        self._notify(reader)
+
+    def fail(self, error: Exception) -> None:
+        """The worker group is gone. Unless the session already ended gracefully,
+        the close operation fails with ``error`` (sticky), every waiter is woken
+        with it and the mappings are released. Never raises."""
+        with self._lock:
+            close = self._close
+            if close is not None and close.done():
+                return  # already over
+            if close is None:
+                self._close = close = Future()
+            # Published inside the critical section: from here every reader and
+            # every caller sees the failure, never a graceful close in progress.
+            self._complete(close, error=error)
+            self._results.clear()
+            self._owed = 0
+            pending, self._submit = self._submit, None
+            reader = self._reader
+            resources = self._resources()
+            if resources is not None:
+                resources.slots.close()
+        # The opening completes after the close outcome: a close callback that
+        # fires on it finds the failure already recorded and cannot soften it.
+        self._complete(self.opened, error=error)
+        if pending is not None:
+            self._complete(pending.admission, error=error)
+        self._notify(reader)
 
     @staticmethod
-    def _complete(fut: Future, value: Any = None, error: Optional[Exception] = None) -> bool:
-        """Complete a future the other thread may have cancelled or already
-        completed; returns whether this call completed it."""
+    def _complete(fut: Future, value: Any = None, error: Optional[BaseException] = None) -> bool:
+        """Complete a future the other side may have cancelled or completed."""
         try:
             if error is not None:
                 fut.set_exception(error)
@@ -1396,205 +1706,6 @@ class SessionChannel:
             return True
         except InvalidStateError:
             return False
-
-    def resolve_admission(self, seq: int, index: Optional[int], error: Optional[Exception]) -> None:
-        with self._lock:
-            pending = self._awaiting_admission
-            if pending is None or pending[0] != seq:
-                logger.warning(
-                    f"DiffusionClient: unexpected admission {seq} for session {self.session_id}"
-                )
-                return
-            self._awaiting_admission = None
-            if error is None and pending[2] in self._queued_names:
-                self._admitted_queued.add(index)  # owed from now on, waiter or not
-        if not self._complete(pending[1], index, error):
-            logger.warning(
-                f"DiffusionClient: admission {seq} for session {self.session_id} "
-                "arrived after its submit was cancelled"
-            )
-
-    # ---- results (one request outstanding)
-
-    def request_next_result(self) -> Future:
-        """A future for the next result message, completed at once when one has
-        already arrived. One request outstanding at a time."""
-        fut: Future = Future()
-        with self._lock:
-            if self.failure is not None:
-                raise self.failure
-            if self._next_result is not None:
-                raise SessionError("a result request is already waiting on this session")
-            if self._unread_messages:
-                message = self._unread_messages.popleft()
-            elif self.closed_reason is not None:
-                raise SessionEnded(self.closed_reason)
-            else:
-                self._next_result = fut
-                return fut
-        fut.set_result(message)
-        return fut
-
-    def settle(self, message: SessionResultMessage, build: Callable[[SessionResultMessage], Any]):
-        """The reader got ``message`` from its future and now turns it into a
-        result with ``build``. Done under the lock: a close or failure that landed
-        in between is honoured here. After a failure the failure is raised. After
-        a close the client asked for, nothing handed out before it is built:
-        ``SessionEnded``. After a close the worker initiated, media handed out
-        before it is dropped like other unread media (its slots are gone) and
-        the terminal kept by the close is built instead; a terminal handed out
-        before it is built as is, it owns no storage."""
-        with self._lock:
-            if self.failure is not None:
-                raise self.failure
-            if self.closed_reason is not None:
-                if self.cancelled:
-                    raise SessionEnded(self.closed_reason)
-                if message.slot_id is not None:
-                    if not self._unread_messages:
-                        raise SessionEnded(self.closed_reason)
-                    message = self._unread_messages.popleft()
-            if not message.done:
-                if message.advance_index is None:
-                    self._owed_initial = False
-                else:
-                    self._admitted_queued.discard(message.advance_index)
-            return build(message)
-
-    def owed_media(self) -> Optional[str]:
-        """Why the next result is not the caller's to take: an earlier result is
-        still owed, or an earlier submit has not been answered yet (its admission
-        may be in flight). ``None`` when nothing older is pending."""
-        with self._lock:
-            return self._owed_locked()
-
-    def _owed_locked(self) -> Optional[str]:
-        if self._owed_initial:
-            return "the declared initial result is unread"
-        if self._admitted_queued:
-            return f"media of earlier queued input (advance {min(self._admitted_queued)}) is unread"
-        if self._awaiting_admission is not None:
-            return "an earlier submit is still awaiting admission"
-        return None
-
-    def terminal_next(self) -> bool:
-        """Whether the next result to take is a terminal: one has arrived and no
-        media sits in front of it. Then nothing older can still come, whatever
-        is recorded as owed: those inputs ended without media."""
-        with self._lock:
-            return bool(self._unread_messages) and all(m.done for m in self._unread_messages)
-
-    @property
-    def lease_lost(self) -> Optional[str]:
-        """Why every view over the slots is invalid, or ``None`` while they hold."""
-        if self.failure is not None:
-            return str(self.failure)
-        return self.closed_reason
-
-    def abandon(self, fut: Future) -> None:
-        """Withdraw a request that will not be read; a message it already received
-        goes back to the front of the line."""
-        with self._lock:
-            if self._next_result is fut:
-                self._next_result = None
-            elif fut.done() and not fut.cancelled() and fut.exception() is None:
-                self._requeue(fut.result())
-
-    def _requeue(self, message: SessionResultMessage) -> None:
-        """Put a handed-out message back at the front, unless the session is gone
-        in the meantime: after a failure nothing comes back; after a close media
-        is dropped (its slots are gone) and a terminal is kept only when the
-        worker initiated the close. A request parked meanwhile gets it directly:
-        the parked future and the unread deque are never both non-empty. Lock
-        held."""
-        if self.failure is not None:
-            return
-        if self.closed_reason is not None and (self.cancelled or message.slot_id is not None):
-            return
-        request, self._next_result = self._next_result, None
-        if request is not None and self._complete(request, message):
-            return
-        self._unread_messages.appendleft(message)
-
-    def deliver(self, message: SessionResultMessage) -> None:
-        with self._lock:
-            if self.failure is not None or self.closed_reason is not None:
-                return  # nothing is delivered after the session is gone
-            request, self._next_result = self._next_result, None
-            if request is None:
-                self._unread_messages.append(message)
-            elif not self._complete(request, message):
-                # The requester was cancelled between parking and delivery; the
-                # message is still the next result. Completed and requeued under
-                # the one lock, so a replacement request cannot park in between
-                # and end up waiting beside it.
-                self._requeue(message)
-
-    def cancel(self) -> None:
-        """The client is closing the session: whatever is undelivered is discarded,
-        a terminal included, now if the worker already closed, else when it does."""
-        with self._lock:
-            self.cancelled = True
-            if self.closed_reason is not None:
-                self._unread_messages.clear()
-
-    def close(self, reason: str) -> None:
-        """The worker reported the session closed. Settle everything outstanding:
-        a submit awaiting admission and a parked result request get
-        ``SessionEnded``; unread media is dropped and the slot mappings are
-        closed, under the lock so no view is being built meanwhile; the
-        ``closed`` future completes. A close the worker initiated keeps an unread
-        terminal result for one delivery (a parked request gets it at once); a
-        close the client asked for (``cancel``) discards it too. Idempotent; a
-        failure already recorded wins."""
-        with self._lock:
-            if self.failure is not None or self.closed_reason is not None:
-                return
-            self.closed_reason = reason
-            pending, self._awaiting_admission = self._awaiting_admission, None
-            request, self._next_result = self._next_result, None
-            kept = [] if self.cancelled else [m for m in self._unread_messages if m.done]
-            self._unread_messages.clear()
-            self._unread_messages.extend(kept)
-            handoff = self._unread_messages.popleft() if request and kept else None
-            if self.delivery_slots is not None:
-                self.delivery_slots.close()
-        if pending is not None:
-            self._complete(pending[1], error=SessionEnded(reason))
-        if request is not None:
-            if handoff is not None:
-                self._complete(request, handoff)
-            else:
-                self._complete(request, error=SessionEnded(reason))
-        self._complete(self.closed, None)
-
-    def media_pending(self) -> bool:
-        """Whether a media result has arrived that nobody asked for yet."""
-        with self._lock:
-            return any(not m.done for m in self._unread_messages)
-
-    def fail(self, message: str) -> None:
-        """Worker group gone. Every waiter and every later call gets the failure
-        raised: the open and close futures, the submit awaiting admission, the
-        parked result request. Unread results are dropped and the views of
-        delivered ones expire (``failure`` is checked by every view): the slots
-        belong to a producer that no longer exists. There is no terminal result,
-        a dead worker is not a session outcome. Never raises: the abort path
-        must go on to contain the surviving workers."""
-        error = RuntimeError(message)
-        with self._lock:
-            if self.failure is not None or self.closed_reason is not None:
-                return  # already over; a later worker failure changes nothing
-            self.failure = error
-            pending, self._awaiting_admission = self._awaiting_admission, None
-            request, self._next_result = self._next_result, None
-            self._unread_messages.clear()
-        for fut in (self.opened, self.closed):
-            self._complete(fut, error=error)
-        if pending is not None:
-            self._complete(pending[1], error=error)
-        if request is not None:
-            self._complete(request, error=error)
 
 
 class DiffusionRemoteClient:
@@ -1652,33 +1763,46 @@ class DiffusionRemoteClient:
 
             # Setup IPC addresses
             self.host_ip = get_ip_address()
-            req_port, resp_port = find_free_port(), find_free_port()
+            req_port, resp_port, ctl_port = find_free_port(), find_free_port(), find_free_port()
 
             self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
             self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+            self.control_queue_addr = f"tcp://0.0.0.0:{ctl_port}"
             self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
             self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
+            self.ctl_addr_connect = f"tcp://{self.host_ip}:{ctl_port}"
 
         else:
             # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
             rank, local_rank, world_size, master_addr, master_port = ext
             req_port = find_free_port()
             resp_port = find_free_port()
+            ctl_port = find_free_port()
             self.master_addr = master_addr
             self.master_port = master_port
             self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
             self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+            self.control_queue_addr = f"tcp://0.0.0.0:{ctl_port}"
             self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
             self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
+            self.ctl_addr_connect = f"tcp://{master_addr}:{ctl_port}"
 
         # Generate shared HMAC keys for IPC authentication
         self.req_hmac_key = os.urandom(32)
         self.resp_hmac_key = os.urandom(32)
+        self.ctl_hmac_key = os.urandom(32)
 
         # IPC setup
         self.requests_ipc = None
         self.responses_ipc = None
+        self.controls_ipc = None
         self.pending_requests = queue.Queue()
+        # Session control commands (slot returns, close, activity): their own
+        # outbox and socket, so a request parked on a non-writable request socket
+        # never holds them up. Keyed, so repeats coalesce; an entry stays until
+        # its send succeeded, so it also stands for a command being retried.
+        self._controls: "OrderedDict[Tuple[Any, ...], Any]" = OrderedDict()
+        self._controls_lock = threading.Lock()
         self.completed_responses: Dict[int, DiffusionResponse] = {}
         self._sessions: Dict[int, SessionChannel] = {}
         self._sessions_lock = threading.Lock()
@@ -1749,6 +1873,8 @@ class DiffusionRemoteClient:
                             "visual_gen_args": self.args,
                             "req_hmac_key": self.req_hmac_key,
                             "resp_hmac_key": self.resp_hmac_key,
+                            "control_queue_addr": self.ctl_addr_connect,
+                            "ctl_hmac_key": self.ctl_hmac_key,
                             "log_level": logger.level,
                             "local_rank": rank,
                             "parent_pid": parent_pid,
@@ -1781,6 +1907,8 @@ class DiffusionRemoteClient:
                         "visual_gen_args": self.args,
                         "req_hmac_key": self.req_hmac_key,
                         "resp_hmac_key": self.resp_hmac_key,
+                        "control_queue_addr": self.ctl_addr_connect,
+                        "ctl_hmac_key": self.ctl_hmac_key,
                         "log_level": logger.level,
                         "local_rank": local_rank,
                         "in_client_process": True,
@@ -1922,6 +2050,12 @@ class DiffusionRemoteClient:
                 socket_type=zmq.PULL,
                 use_hmac_encryption=True,
             )
+            self.controls_ipc = ZeroMqQueue(
+                (self.control_queue_addr, self.ctl_hmac_key),
+                is_server=True,
+                socket_type=zmq.PUSH,
+                use_hmac_encryption=True,
+            )
             logger.info("DiffusionClient: IPC ready")
             return True
         except Exception as e:
@@ -1992,16 +2126,74 @@ class DiffusionRemoteClient:
             logger.error(traceback.format_exc())
             self._session_send_failed(req, e)
 
+    def _retire_unsent(self, session_id: int) -> None:
+        """The session is closed on the worker: a submit of it still unsent (parked
+        on the request socket, or queued behind other requests) is dropped, so it
+        neither holds its payload nor reaches a session that no longer exists;
+        its control commands still in the outbox go too. Runs on the background
+        thread, which owns the send slot."""
+        parked = self._request_to_send
+        if isinstance(parked, SessionSubmit) and parked.session_id == session_id:
+            self._request_to_send = None
+        with self._sessions_lock:  # serialized against a submit being published
+            kept = []
+            while True:
+                try:
+                    item = self.pending_requests.get_nowait()
+                except queue.Empty:
+                    break
+                if not (isinstance(item, SessionSubmit) and item.session_id == session_id):
+                    kept.append(item)
+            for item in kept:
+                self.pending_requests.put(item)
+        with self._controls_lock:
+            for key in [k for k in self._controls if k[0] == session_id]:
+                del self._controls[key]
+
+    def _enqueue_control(self, key: Tuple[Any, ...], command: Any) -> None:
+        with self._controls_lock:
+            if key not in self._controls:
+                self._controls[key] = command
+
+    def _process_controls(self):
+        """Send the first pending session control command, if any: the control
+        socket's counterpart of ``_process_requests``, with the same ``Again``
+        retry and the same containment on any other failure. The entry is
+        removed by its key after the send, never by position: a close or a
+        failure may have retired it meanwhile."""
+        with self._controls_lock:
+            if not self._controls:
+                return
+            key, command = next(iter(self._controls.items()))
+        try:
+            self.controls_ipc.put_nowait(command)
+        except zmq.Again:
+            worker_failure = self._check_worker_liveness()
+            if worker_failure is not None:
+                self._abort_worker_group(worker_failure)
+            return
+        except Exception as e:
+            logger.error(f"DiffusionClient: Error sending session control: {e}")
+            logger.error(traceback.format_exc())
+            with self._controls_lock:
+                if self._controls.get(key) is command:
+                    del self._controls[key]
+            self._session_send_failed(command, e)
+            return
+        with self._controls_lock:
+            if self._controls.get(key) is command:
+                del self._controls[key]
+
     _PAYLOAD_ERRORS = (TypeError, pickle.PicklingError, AttributeError, ValueError)
 
     def _session_send_failed(self, req: Any, exc: Exception) -> None:
         """A session command did not leave the process. A payload that cannot be
         serialized (nothing was sent, the transport is intact) fails just the
-        call that made it: the submit awaiting admission gets ``ValueError`` and
-        consumes no index; an open gets ``ValueError``, its reservation and its
-        request references are released. Any other failure means control
-        messages may be lost on a transport we can no longer trust, so the
-        worker group is aborted and every session call raises that failure."""
+        call that made it: the pending submit gets ``ValueError`` and consumes no
+        index; an open gets ``ValueError``, its reservation and its request
+        references are released. Any other failure means control messages may be
+        lost on a transport we can no longer trust, so the worker group is
+        aborted and every session call raises that failure."""
         if not isinstance(
             req, (SessionOpen, SessionSubmit, SessionSlotReturn, SessionClose, SessionActivity)
         ):
@@ -2011,26 +2203,25 @@ class DiffusionRemoteClient:
         with self._sessions_lock:
             channel = self._sessions.get(session_id)
         if not payload_error or isinstance(req, (SessionSlotReturn, SessionClose, SessionActivity)):
-            # The failing command is already out of the send slot; hand it back so
-            # the abort releases its references with everything else, once.
-            self._request_to_send = req
+            # A failing data request goes back into the send slot so the abort
+            # releases its references with everything else, once; a control
+            # command owns nothing and must not displace a parked request.
+            if isinstance(req, (SessionOpen, SessionSubmit)) and self._request_to_send is None:
+                self._request_to_send = req
             self._abort_worker_group(f"DiffusionClient: could not send {type(req).__name__}: {exc}")
-            self._request_to_send = None
             return
         if isinstance(req, SessionSubmit):
             if channel is not None:
-                channel.resolve_admission(
-                    req.seq, None, ValueError(f"input {req.name!r} cannot be serialized: {exc}")
+                channel.admitted(
+                    None, ValueError(f"input {req.name!r} cannot be serialized: {exc}")
                 )
             return
-        # SessionOpen: the open fails like a rejected request.
         with self._sessions_lock:
             self._sessions.pop(session_id, None)
         self._discard_unsent_request(req)
         if channel is not None:
-            channel._complete(
-                channel.opened,
-                error=ValueError(f"Session open failed: request cannot be serialized: {exc}"),
+            channel.open_failed(
+                ValueError(f"Session open failed: request cannot be serialized: {exc}")
             )
 
     def _process_responses(self):
@@ -2085,7 +2276,7 @@ class DiffusionRemoteClient:
 
     def open_session(self, request: DiffusionRequest) -> SessionChannel:
         """Send ``SessionOpen``; the caller waits on ``channel.opened``, which resolves
-        to the channel once the worker has opened the session (or raises).
+        to the session's resources once the worker has opened it (or raises).
 
         One session per model instance: while another session is opening or open
         (its entry stays in ``_sessions`` until its close is confirmed or its open
@@ -2115,60 +2306,98 @@ class DiffusionRemoteClient:
     async def open_session_async(self, request: DiffusionRequest) -> SessionChannel:
         """``open_session`` plus the wait, safe against the caller's cancellation.
 
-        The lifecycle future is shielded: cancelling the caller never cancels it,
-        so the worker's reply always completes it. On cancellation the channel is
-        abandoned (see ``abandon_open``) and the ``CancelledError`` propagates."""
+        The opening future is shielded: cancelling the caller never cancels it,
+        so the worker's reply always completes it. On cancellation the session is
+        closed (the one close operation: sent once the open is acknowledged,
+        settled if the open fails) and the ``CancelledError`` propagates."""
         channel = self.open_session(request)
+        opening = asyncio.wrap_future(channel.opened)
         try:
-            await asyncio.shield(asyncio.wrap_future(channel.opened))
+            await asyncio.shield(opening)
         except asyncio.CancelledError:
-            self.abandon_open(channel)
+            # Nobody awaits the wrapper any more; its eventual exception is the
+            # channel's business (recorded there), not an unretrieved one.
+            opening.add_done_callback(_consume_exception)
+            self.session_close(channel)
             raise
         return channel
 
-    def abandon_open(self, channel: SessionChannel) -> None:
-        """The caller opening ``channel`` gave up before getting its handle. An
-        open that already succeeded is closed now; one still in progress is
-        closed by the reply routing when it succeeds, or just dropped when it
-        fails. Either way the reservation stays until the worker confirms."""
-        with self._sessions_lock:
-            channel.abandoned = True
-            opened = channel.opened
-            opened_ok = opened.done() and not opened.cancelled() and opened.exception() is None
-        if opened_ok:
-            self.session_close(channel)
-
     def session_submit(
-        self, channel: SessionChannel, name: str, value: Any, nothing_owed: bool = False
+        self, channel: SessionChannel, name: str, value: Any, for_advance: bool = False
     ) -> Future:
         """Send one value; the future resolves to the advance index or raises
-        ``ValueError`` / ``SessionQueueFull`` / ``SessionEnded``. ``nothing_owed``
-        refuses the submit while an earlier result is owed (see the channel)."""
+        ``ValueError`` / ``SessionQueueFull`` / ``SessionEnded``. The caller must
+        hand the future to ``channel.release_submit`` when done with it."""
         if self._worker_failure is not None:
             raise RuntimeError(self._worker_failure)
         inputs = (channel.capabilities or {}).get("inputs", [])
         spec = next((s for s in inputs if s["name"] == name), None)
         if spec is None:
             raise ValueError(f"unknown input {name!r}; declared: {[s['name'] for s in inputs]}")
-        check_input_size(spec, value)  # before the value reaches the queue
-        seq, fut = channel.expect_admission(name, nothing_owed=nothing_owed)
-        self.pending_requests.put(SessionSubmit(channel.session_id, seq, name, value))
+        if for_advance:
+            # The stream decides first: a terminal at the head means nothing is
+            # submitted, so the unused value is not even looked at.
+            fut = channel.plan_advance(name)
+            if fut is None:
+                return None
+        else:
+            check_input_size(spec, value)  # before the value reaches the queue
+            fut = channel.reserve_submit(name)
+        # Reserved, not yet sent: until the command is in the queue any exit,
+        # an interrupt included, withdraws the reservation.
+        try:
+            if for_advance:
+                check_input_size(spec, value)
+            # Publication is conditional on the session still being live and
+            # happens under the lock that retirement (close, abort) takes, so a
+            # command is either seen by the retirement that follows or never
+            # queued behind a close that came first.
+            with self._sessions_lock:
+                if self._worker_failure is not None:
+                    raise RuntimeError(self._worker_failure)
+                if channel.closing() is not None:
+                    raise SessionEnded(f"session {channel.session_id} is closed")
+                self.pending_requests.put(SessionSubmit(channel.session_id, name, value))
+        except BaseException:
+            channel.withdraw_submit(fut)
+            raise
         return fut
 
     def session_return_slot(self, channel: SessionChannel, slot_id: int) -> None:
         if self._worker_failure is None:
-            self.pending_requests.put(SessionSlotReturn(channel.session_id, slot_id))
+            self._enqueue_control(
+                (channel.session_id, "slot", slot_id),
+                SessionSlotReturn(channel.session_id, slot_id),
+            )
 
     def session_activity(self, channel: SessionChannel) -> None:
-        """Tell the worker the client asked for a result (restarts its idle clock)."""
+        """Tell the worker the client asked for a result (restarts its idle clock);
+        repeats coalesce in the outbox while one is pending."""
         if self._worker_failure is None and channel.lease_lost is None:
-            self.pending_requests.put(SessionActivity(channel.session_id))
+            self._enqueue_control(
+                (channel.session_id, "activity"), SessionActivity(channel.session_id)
+            )
 
     def session_close(self, channel: SessionChannel) -> Future:
-        channel.cancel()
-        if self._worker_failure is None and not channel.closed.done():
-            self.pending_requests.put(SessionClose(channel.session_id))
-        return channel.closed
+        """Close the session; the future completes on the worker's confirmation.
+        The first call begins the one close operation and arranges the one close
+        command: sent once the open is acknowledged (so the worker has the
+        session before its close can reach it on the other socket), or nothing
+        if the open fails. Later calls return the same operation."""
+        close, first = channel.request_close()
+        if first:
+
+            def after_open(opened: Future) -> None:
+                if opened.cancelled() or opened.exception() is not None:
+                    channel.open_failed(opened.exception() or RuntimeError("open cancelled"))
+                    return
+                if self._worker_failure is None:
+                    self._enqueue_control(
+                        (channel.session_id, "close"), SessionClose(channel.session_id)
+                    )
+
+            channel.opened.add_done_callback(after_open)
+        return close
 
     def _route_session_reply(self, reply: Any) -> None:
         with self._sessions_lock:
@@ -2190,17 +2419,11 @@ class DiffusionRemoteClient:
                     if error_type == "capacity"
                     else RuntimeError(message)
                 )
-                channel._complete(channel.opened, error=exc)
+                channel.open_failed(exc)
                 return
-            channel.declare(reply.capabilities or {})
-            channel.delivery_slots = ClientSlotMap(reply.slots or [])
-            with self._sessions_lock:
-                abandoned = channel.abandoned
-                channel._complete(channel.opened, channel)
-            if abandoned:
-                # Nobody will ever hold this session: close it now; SessionClosed
-                # releases the mappings and the reservation.
-                self.session_close(channel)
+            channel.open_succeeded(
+                SessionResources(reply.capabilities or {}, ClientSlotMap(reply.slots or []))
+            )
         elif isinstance(reply, SessionAdmitted):
             error: Optional[Exception] = None
             if reply.error is not None:
@@ -2208,13 +2431,14 @@ class DiffusionRemoteClient:
                     "queue_full": SessionQueueFull,
                     "ended": SessionEnded,
                 }.get(reply.error_kind, ValueError)(reply.error)
-            channel.resolve_admission(reply.seq, reply.advance_index, error)
+            channel.admitted(reply.advance_index, error)
         elif isinstance(reply, SessionResultMessage):
             channel.deliver(reply)
         elif isinstance(reply, SessionClosed):
             with self._sessions_lock:
                 self._sessions.pop(reply.session_id, None)
-            channel.close(f"session {reply.session_id} is closed")
+            channel.worker_closed()
+            self._retire_unsent(reply.session_id)
 
     def get_iteration_stats(self) -> List[Dict]:
         """Return all buffered iteration-stats snapshots and clear the buffer.
@@ -2253,6 +2477,7 @@ class DiffusionRemoteClient:
         logger.info("DiffusionClient: Cleaning up IPC")
         self._close_socket(self.requests_ipc)
         self._close_socket(self.responses_ipc)
+        self._close_socket(self.controls_ipc)
 
     def _serve_forever_thread(self):
         """Background thread wrapper that creates and runs an event loop."""
@@ -2286,6 +2511,10 @@ class DiffusionRemoteClient:
             if worker_failure is not None:
                 self._abort_worker_group(worker_failure)
             if self._worker_failure is None:
+                # Controls first: they never wait behind a request. The one
+                # request serialized per pass bounds how long they wait by the
+                # declared input size, nothing more.
+                self._process_controls()
                 self._process_requests()
                 self._process_responses()
             await asyncio.sleep(0.001)  # Yield control to allow other coroutines to run
@@ -2351,15 +2580,20 @@ class DiffusionRemoteClient:
             # shared-memory payloads parked there (an unsent open, a generate).
             pending = getattr(self, "pending_requests", None)
             if pending is not None:
-                while True:
-                    try:
-                        self._discard_unsent_request(pending.get_nowait())
-                    except queue.Empty:
-                        break
+                with sessions_lock:  # serialized against a submit being published
+                    while True:
+                        try:
+                            self._discard_unsent_request(pending.get_nowait())
+                        except queue.Empty:
+                            break
+            controls_lock = getattr(self, "_controls_lock", None)
+            if controls_lock is not None:
+                with controls_lock:
+                    self._controls.clear()
             if channels:
                 for channel in channels:
                     try:
-                        channel.fail(worker_failure)
+                        channel.fail(RuntimeError(worker_failure))
                     except Exception as e:
                         logger.error(f"DiffusionClient: failing session {channel.session_id}: {e}")
         finally:

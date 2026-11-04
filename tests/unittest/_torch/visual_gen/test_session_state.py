@@ -276,9 +276,35 @@ def test_input_nbytes_counts_what_a_value_retains_or_expands_to():
 
     import numpy as np
 
-    assert input_nbytes(7) == sys.getsizeof(7) and input_nbytes(b"abc") == sys.getsizeof(b"abc")
-    assert input_nbytes([1.0, 2.0]) == sys.getsizeof([1.0, 2.0]) + 2 * sys.getsizeof(1.0)
-    assert input_nbytes({"a": 1}) == sys.getsizeof({"a": 1}) + sys.getsizeof("a") + sys.getsizeof(1)
+    from tensorrt_llm._torch.visual_gen.session import _NUMBER
+
+    assert input_nbytes(7) == _NUMBER == input_nbytes(7.5)
+    assert input_nbytes(b"abc") == sys.getsizeof(b"abc")
+    big_int = 1 << (8 * 1048576)
+    assert input_nbytes(big_int) == sys.getsizeof(big_int)  # an arbitrary-precision int costs
+    assert input_nbytes([1.0, 2.0]) == sys.getsizeof([1.0, 2.0]) + 2 * _NUMBER
+    assert input_nbytes({"a": 1}) == sys.getsizeof({"a": 1}) + sys.getsizeof("a") + _NUMBER
+    appended: list = []
+    for i in range(17):
+        appended.append(i)
+    assert input_nbytes(appended) == sys.getsizeof(appended) + 17 * _NUMBER  # actual allocation
+    # A worst-case bound from a canonical value admits every ordinary construction
+    # of the same shape: slice, literal, append-built, comprehension, ints for floats.
+    import json
+
+    bound = input_nbytes([[0.0] * 7 for _ in range(8)], worst_case=True)
+    loaded = json.loads(json.dumps([[0.1 * j for j in range(7)] for _ in range(16)]))
+    built: list = []
+    for _ in range(8):
+        row: list = []
+        for j in range(7):
+            row.append(j)
+        built.append(row)
+    forms = (loaded[0:8], loaded[8:16], [[0] * 7] * 8, built, [list(range(7)) for _ in range(8)])
+    for form in forms:
+        assert input_nbytes(form) <= bound, form
+    # The headroom is for construction variance, not for more rows: twice the rows is refused.
+    assert input_nbytes([[0.0] * 7 for _ in range(16)]) > bound
     big = torch.zeros(262144, dtype=torch.float32)  # 1 MiB of storage
     assert input_nbytes(big) == 1 << 20
     assert input_nbytes(big[:1]) == 1 << 20  # a view keeps the whole storage alive
@@ -361,7 +387,7 @@ def test_input_nbytes_walk_is_bounded_by_the_limit_not_the_value():
     size = input_nbytes(huge, limit=64)
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
-    assert size == sys.getsizeof(huge)  # the list object alone is past the bound: not expanded
+    assert size == sys.getsizeof(huge)  # the list object alone: not expanded
     assert peak - before < 64 * 1024  # the walk allocated no reference array for the items
     nested = [[0] * 1000 for _ in range(10_000)]
     tracemalloc.start()
@@ -436,7 +462,7 @@ def test_supported_input_forms_survive_the_wire_serialization():
     ]
     for value in forms:
         assert input_nbytes(value) >= 0  # accepted
-        back = pickle.loads(pickle.dumps(SessionSubmit(1, 0, "x", value))).value
+        back = pickle.loads(pickle.dumps(SessionSubmit(1, "x", value))).value
         if isinstance(value, torch.Tensor):
             assert torch.equal(back, value)
         elif isinstance(value, np.ndarray):
@@ -445,3 +471,18 @@ def test_supported_input_forms_survive_the_wire_serialization():
             assert back == value
     with pytest.raises(TypeError):
         pickle.dumps(memoryview(b"abc"))  # which is why it is not a supported form
+
+
+def test_the_bench_action_slice_fits_the_sim_style_bound():
+    """What the native end-to-end run sends: rows loaded from JSON, sliced per
+    advance; the Sim bound is the worst case of the canonical float rows."""
+    import json
+
+    width, rows_per_advance = 29, 8
+    actions = json.loads(json.dumps([[float(i % 3) for _ in range(width)] for i in range(296)]))
+    bound = input_nbytes([[0.0] * width for _ in range(rows_per_advance)], worst_case=True)
+    for start in range(0, 296, rows_per_advance):
+        assert input_nbytes(actions[start : start + rows_per_advance]) <= bound
+    assert (
+        input_nbytes(actions[0 : 2 * rows_per_advance]) > bound
+    )  # the shape validator does the rest

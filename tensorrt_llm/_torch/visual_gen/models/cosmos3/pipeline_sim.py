@@ -998,9 +998,10 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
 
         max_generated = max(allowed) // sim.action_tokens_per_frame
         frames_per_advance = max_generated * self.vae_scale_factor_temporal
-        # The largest accepted value in its largest supported form: a list of
-        # rows of Python floats (a tensor or array of the same shape is smaller).
-        action_bytes = input_nbytes([[0.0] * width for _ in range(max(allowed))])
+        # The most the largest accepted value can cost in its largest supported
+        # form, a list of rows of Python numbers however it was built (a tensor
+        # or array of the same shape is smaller).
+        action_bytes = input_nbytes([[0.0] * width for _ in range(max(allowed))], worst_case=True)
         return SessionCapabilities(
             inputs=(InputSpec(name="actions", max_bytes=action_bytes, validator=validate_rows),),
             streams=(

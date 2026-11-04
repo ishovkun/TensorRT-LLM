@@ -26,7 +26,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import Future
+from collections import OrderedDict
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
@@ -41,6 +41,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionRequest,
     FatalRankError,
     SessionChannel,
+    SessionResources,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import (
     AdvanceOutcome,
@@ -49,7 +50,9 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     StreamSpec,
 )
 from tensorrt_llm._torch.visual_gen.session import (
+    SessionActivity,
     SessionAdmitted,
+    SessionClose,
     SessionClosed,
     SessionEnded,
     SessionError,
@@ -61,6 +64,7 @@ from tensorrt_llm._torch.visual_gen.session import (
     SessionSubmit,
     input_nbytes,
 )
+from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap
 from tensorrt_llm.visual_gen.session import VisualGenSession
 
 pytestmark = pytest.mark.cpu_only
@@ -190,6 +194,7 @@ def _make_executor(pipeline, session_config=None, *, rank=0, world_size=1, in_cl
     ex.in_client_process = in_client_process  # True: same process as the client, local handles
     ex.response_queue = queue.Queue()
     ex.requests_ipc = FakeRequestSocket()
+    ex.controls_ipc = FakeRequestSocket()
     ex.session_config = session_config
     ex._deferred = []
     ex._shutdown_requested = False
@@ -201,6 +206,9 @@ def _make_client():
     client._sessions = {}
     client._sessions_lock = threading.Lock()
     client.pending_requests = queue.Queue()
+    client._controls = OrderedDict()
+    client._controls_lock = threading.Lock()
+    client._request_to_send = None
     client._worker_failure = None
     return client
 
@@ -210,9 +218,10 @@ class Harness:
     executor's responses to the client's router, each on its own thread, and runs
     the executor's session loop on a third."""
 
-    def __init__(self, pipeline, session_config=None):
+    def __init__(self, pipeline, session_config=None, *, forward_controls=True):
         self.pipeline = pipeline
         self.executor = _make_executor(pipeline, session_config)
+        self.forward_controls = forward_controls  # False: the test drives the control path
         self.client = _make_client()
         self._stop = threading.Event()
         self.worker_error: Optional[BaseException] = None
@@ -225,8 +234,14 @@ class Harness:
         # Cleared by a test to keep the client's commands in pending_requests.
         self.send_gate = threading.Event()
         self.send_gate.set()
+        # Cleared by a test to model a request socket that no longer accepts
+        # submits: they are held here (never forwarded) while controls flow.
+        self.payload_gate = threading.Event()
+        self.payload_gate.set()
+        self.held_payloads: list = []
         self.threads = [
             threading.Thread(target=self._forward_commands, daemon=True),
+            threading.Thread(target=self._forward_controls, daemon=True),
             threading.Thread(target=self._forward_replies, daemon=True),
             threading.Thread(target=self._worker, daemon=True),
         ]
@@ -242,7 +257,28 @@ class Harness:
             while not self.send_gate.wait(timeout=0.02):  # a test holds commands unsent
                 if self._stop.is_set():
                     return
+            if isinstance(item, SessionSubmit) and not self.payload_gate.is_set():
+                self.held_payloads.append(item)  # the request socket is not taking payloads
+                continue
             self.executor.requests_ipc.q.put(item)
+
+    def _forward_controls(self):
+        """What the client's control dispatcher does on a writable socket: send
+        the first outbox entry, then retire it by key."""
+        while not self._stop.is_set():
+            if not self.forward_controls:
+                time.sleep(0.02)
+                continue
+            with self.client._controls_lock:
+                entry = next(iter(self.client._controls.items()), None)
+            if entry is None:
+                time.sleep(0.005)
+                continue
+            key, item = entry
+            self.executor.controls_ipc.q.put(item)
+            with self.client._controls_lock:
+                if self.client._controls.get(key) is item:
+                    del self.client._controls[key]
 
     def _forward_replies(self):
         while not self._stop.is_set():
@@ -301,6 +337,7 @@ class Harness:
         if gate is not None:
             gate.set()  # never leave the worker parked inside an advance
         self.send_gate.set()
+        self.payload_gate.set()
         self.release()
         self._stop.set()
         # A worker still inside a session (a test that failed the channel without
@@ -530,7 +567,7 @@ def test_client_send_loop_forwards_session_commands():
     client.requests_ipc = FakeRequestSocket()
     req = DiffusionRequest(request_id=7, prompt=["p"], params=SimpleNamespace())
     client.pending_requests.put(SessionOpen(req))
-    client.pending_requests.put(SessionSubmit(7, 0, "controls", 1))
+    client.pending_requests.put(SessionSubmit(7, "controls", 1))
     client._process_requests()
     client._process_requests()
     sent = client.requests_ipc.drain()
@@ -642,7 +679,7 @@ def test_worker_failure_raises_to_the_client_instead_of_a_terminal_result(harnes
         s.submit("controls", 1)  # produces a result nobody asks for
         time.sleep(0.2)
         channel = h.client._sessions[s.request_id]
-        assert channel.media_pending()
+        assert channel.unread_media()
         caught = []
 
         def wait_for_result():
@@ -651,10 +688,12 @@ def test_worker_failure_raises_to_the_client_instead_of_a_terminal_result(harnes
             except BaseException as exc:  # noqa: BLE001  (the test inspects the type)
                 caught.append(exc)
 
-        channel.fail("DiffusionClient: local worker processes exited: pid=1, exitcode=1")
+        channel.fail(
+            RuntimeError("DiffusionClient: local worker processes exited: pid=1, exitcode=1")
+        )
         with pytest.raises(SessionLeaseExpired, match="exited"):
             held.outputs  # the held view expired with its producer
-        assert not channel.media_pending()  # the unread result was dropped, not served
+        assert not channel.unread_media()  # the unread result was dropped, not served
         t = threading.Thread(target=wait_for_result)
         t.start()
         t.join(timeout=10)
@@ -684,39 +723,10 @@ def test_worker_failure_wakes_a_parked_request(harness):
         t = threading.Thread(target=wait_for_result)
         t.start()
         time.sleep(0.1)  # nothing submitted: the request is parked in the channel
-        h.client._sessions[s.request_id].fail("worker died")
+        h.client._sessions[s.request_id].fail(RuntimeError("worker died"))
         t.join(timeout=10)
         assert len(caught) == 1 and isinstance(caught[0], RuntimeError)
         s.close()
-
-
-def test_channel_fail_before_any_request():
-    channel = SessionChannel(7)
-    channel.fail("gone")
-    with pytest.raises(RuntimeError, match="gone"):
-        channel.expect_admission("controls")
-    with pytest.raises(RuntimeError, match="gone"):
-        channel.request_next_result()
-    with pytest.raises(RuntimeError, match="gone"):
-        channel.opened.result()
-
-
-def test_channel_tolerates_cancelled_futures():
-    """asyncio cancellation reaches the concurrent future; fail() and the reply
-    routing must not raise on it, and a delivery to a cancelled request stays
-    the next result."""
-    channel = SessionChannel(7)
-    seq, admission = channel.expect_admission("controls")
-    admission.cancel()
-    request = channel.request_next_result()
-    request.cancel()
-    message = SessionResultMessage(7, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
-    channel.deliver(message)
-    assert channel.request_next_result().result(timeout=1) is message
-    channel.resolve_admission(seq, 0, None)  # late reply to a cancelled submit: dropped
-    channel.fail("gone")  # cancelled admission future: no InvalidStateError
-    with pytest.raises(RuntimeError, match="gone"):
-        channel.request_next_result()
 
 
 def test_liveness_check_sees_a_dead_in_process_worker_thread():
@@ -865,7 +875,7 @@ def _run_rank(rank, port, fail_rank, fail_phase, events, in_client_process, hold
     holder["executor"] = ex
     req = _session_request()
     if rank == 0:
-        ex.requests_ipc.put_nowait(SessionSubmit(1, 0, "controls", 1))
+        ex.requests_ipc.put_nowait(SessionSubmit(1, "controls", 1))
     ex._run_session(req)
 
 
@@ -1082,8 +1092,9 @@ def test_coordinator_contains_the_group_when_a_rank_dies(tmp_path):
     client.worker_processes = [rank0, rank1]
     channel = SessionChannel(1)
     client._sessions[1] = channel
-    channel.capabilities = CountingPipeline().session_capabilities(None).public()
-    channel.opened.set_result(channel)
+    channel.open_succeeded(
+        SessionResources(CountingPipeline().session_capabilities(None).public(), ClientSlotMap([]))
+    )
     session = VisualGenSession(1, client, channel)
     results = session.results()
     waiter = {}
@@ -1133,6 +1144,17 @@ def test_coordinator_contains_the_group_when_a_rank_dies(tmp_path):
 
 
 # --------------------------------------------------------------------------- close and idle timeout
+
+
+def _closed(channel) -> bool:
+    """The worker confirmed the close (or the group failed)."""
+    close = channel.closing()
+    return close is not None and close.done()
+
+
+def _terminal_next(channel) -> bool:
+    head = channel._results[0] if channel._results else None
+    return isinstance(head, SessionResultMessage) and head.done
 
 
 def _wait_until(predicate, timeout=10.0, what="condition"):
@@ -1193,12 +1215,12 @@ def test_idle_timeout_expires_held_and_unread_media_and_keeps_its_terminal_once(
         assert held.video is not None
         s.submit("controls", 1)  # one media result nobody reads
         channel = h.client._sessions[s.request_id]
-        _wait_until(channel.media_pending, what="the unread result")
-        _wait_until(channel.closed.done, what="the idle close")
+        _wait_until(channel.unread_media, what="the unread result")
+        _wait_until(lambda: _closed(channel), what="the idle close")
         assert s.closed
         with pytest.raises(SessionLeaseExpired, match="closed"):
             held.outputs
-        assert not channel.media_pending()  # dropped with its mapping
+        assert not channel.unread_media()  # dropped with its mapping
         terminal = next(results)  # the timeout terminal survives the close
         assert terminal.done and "idle timeout" in terminal.error
         with pytest.raises(StopIteration):
@@ -1217,7 +1239,7 @@ def test_idle_timeout_keeps_an_existing_terminal_and_adds_none(harness):
         s = h.open()
         s.submit("controls", 1)  # the one advance: media, then the normal terminal
         channel = h.client._sessions[s.request_id]
-        _wait_until(channel.closed.done, timeout=10, what="the idle close")
+        _wait_until(lambda: _closed(channel), timeout=10, what="the idle close")
         results = s.results()
         terminal = next(results)  # media dropped, the normal terminal kept
         assert terminal.done and terminal.error is None
@@ -1240,41 +1262,10 @@ def test_first_result_request_restarts_the_idle_clock(harness):
         requested = time.monotonic()
         assert first.advance_index is None
         time.sleep(idle * 0.6)  # past the original deadline, inside the restarted one
-        assert not channel.closed.done(), "the request did not restart the clock"
-        _wait_until(channel.closed.done, timeout=idle * 3, what="the idle close")
+        assert not _closed(channel), "the request did not restart the clock"
+        _wait_until(lambda: _closed(channel), timeout=idle * 3, what="the idle close")
         assert time.monotonic() - requested >= idle * 0.9
         assert time.monotonic() - opened >= idle * 1.5
-
-
-def test_replies_racing_with_close_are_harmless():
-    client = _make_client()
-    channel = client.open_session(
-        DiffusionRequest(request_id=3, prompt=["p"], params=SimpleNamespace())
-    )
-    channel.capabilities = {}
-    channel.opened.set_result(channel)
-    seq, admission = channel.expect_admission("controls")
-    parked = channel.request_next_result()
-    client._route_session_reply(SessionClosed(3))
-    assert channel.closed.done() and channel.closed.result() is None
-    with pytest.raises(SessionEnded):
-        admission.result(timeout=1)
-    with pytest.raises(SessionEnded):
-        parked.result(timeout=1)
-    # In flight behind the close: a late admission, media, a second close.
-    client._route_session_reply(SessionAdmitted(3, seq, advance_index=0))
-    client._route_session_reply(
-        SessionResultMessage(3, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
-    )
-    client._route_session_reply(SessionClosed(3))
-    assert not channel.media_pending()
-    with pytest.raises(SessionEnded):
-        channel.request_next_result()
-    with pytest.raises(SessionEnded):
-        channel.expect_admission("controls")
-    # A failure after the close changes nothing.
-    channel.fail("worker died")
-    assert channel.lease_lost is not None and "closed" in channel.lease_lost
 
 
 # --------------------------------------------------------------------------- close racing a handed-out result
@@ -1297,107 +1288,13 @@ def _timeout_terminal(session_id, sequence):
     )
 
 
-def test_media_handed_out_before_a_timeout_close_yields_the_terminal(harness):
-    with harness(CountingPipeline(initial=True)) as h:
-        s = h.open()
-        channel = h.client._sessions[s.request_id]
-        fut = s._begin_receive()  # the initial media completes it at once
-        media = fut.result(timeout=5)
-        assert media.slot_id is not None
-        # Before the reader resumes: the worker times out and closes.
-        channel.deliver(_timeout_terminal(s.request_id, 7))
-        h.client._route_session_reply(SessionClosed(s.request_id))
-        assert channel.closed.done()
-        result = s._end_receive(media)  # resumes: the media is gone, the terminal is next
-        assert result.done and "idle timeout" in result.error
-        assert result.outputs == {} and result.copy().outputs == {}  # no storage to expire
-        assert not channel.media_pending()
-        with pytest.raises(StopIteration):
-            next(s.results())
-
-
-def test_media_handed_out_before_an_explicit_close_ends_the_read(harness):
-    with harness(CountingPipeline(initial=True)) as h:
-        s = h.open()
-        fut = s._begin_receive()
-        media = fut.result(timeout=5)
-        h.client._route_session_reply(SessionClosed(s.request_id))  # no terminal: explicit close
-        with pytest.raises(SessionEnded):
-            s._end_receive(media)
-        assert not s._receiving.locked()  # the busy flag was released on the way out
-        with pytest.raises(SessionEnded):
-            s._begin_receive()
-
-
-def test_media_handed_out_before_a_close_is_dropped_async(harness):
-    """The async reader resumes after the close; same outcome, same ordering,
-    driven from the loop's own thread."""
-    with harness(CountingPipeline(initial=True)) as h:
-
-        async def run():
-            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
-            channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
-            s = VisualGenSession(1, h.client, channel)
-            fut = s._begin_receive()
-            media = await asyncio.wrap_future(fut)  # completed by the initial result
-            channel.deliver(_timeout_terminal(1, 7))
-            h.client._route_session_reply(SessionClosed(1))
-            result = s._end_receive(media)
-            assert result.done and "idle timeout" in result.error and result.outputs == {}
-            with pytest.raises(StopAsyncIteration):
-                await s.results().__anext__()
-
-        asyncio.run(run())
-
-
-def test_abandon_after_close_does_not_resurrect_media(harness):
-    with harness(CountingPipeline(initial=False)) as h:
-        s = h.open()
-        channel = h.client._sessions[s.request_id]
-        fut = channel.request_next_result()  # parked: nothing published yet
-        s.submit("controls", 1)
-        assert fut.result(timeout=5).slot_id is not None  # the advance completed the request
-        channel.deliver(_timeout_terminal(s.request_id, 9))
-        h.client._route_session_reply(SessionClosed(s.request_id))
-        channel.abandon(fut)  # the reader gave up on it after the close
-        assert not channel.media_pending()
-        terminal = channel.request_next_result().result(timeout=1)
-        assert terminal.done
-        with pytest.raises(SessionEnded):
-            channel.request_next_result()
-        s.close()
-
-
-def test_abandon_before_close_requeues_media_and_a_terminal_survives_abandon_after_close(harness):
-    with harness(CountingPipeline(initial=True)) as h:
-        s = h.open()
-        channel = h.client._sessions[s.request_id]
-        fut = channel.request_next_result()
-        media = fut.result(timeout=5)  # the initial result
-        channel.abandon(fut)  # before any close: still the next result
-        assert channel.media_pending()
-        again = channel.request_next_result().result(timeout=1)
-        assert again.sequence == media.sequence
-        # A terminal handed out and abandoned across the close stays deliverable.
-        fut = channel.request_next_result()
-        channel.deliver(_timeout_terminal(s.request_id, 9))
-        terminal = fut.result(timeout=1)
-        h.client._route_session_reply(SessionClosed(s.request_id))
-        channel.abandon(fut)
-        assert channel.request_next_result().result(timeout=1) is terminal
-        with pytest.raises(SessionEnded):
-            channel.request_next_result()
-        s.close()
-
-
 def test_terminals_keep_empty_outputs_after_the_close(harness):
     pipe = CountingPipeline(initial=False, length=1)
     with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.2)) as h:
         s = h.open()
         s.submit("controls", 1)  # media, then the normal terminal
         channel = h.client._sessions[s.request_id]
-        _wait_until(channel.closed.done, what="the idle close")
+        _wait_until(lambda: _closed(channel), what="the idle close")
         terminal = next(s.results())
         assert terminal.done and terminal.error is None
         assert terminal.outputs == {} and terminal.video is None
@@ -1411,82 +1308,9 @@ def test_terminals_keep_empty_outputs_after_the_close(harness):
 
 def _wait_for_terminal(channel):
     """The worker publishes media then the normal terminal; wait for the latter."""
-    _wait_until(lambda: any(m.done for m in channel._unread_messages), what="the queued terminal")
-
-
-def test_explicit_close_discards_a_queued_terminal_behind_handed_out_media(harness):
-    with harness(CountingPipeline(initial=False, length=1)) as h:
-        s = h.open()
-        channel = h.client._sessions[s.request_id]
-        s.submit("controls", 1)
-        fut = s._begin_receive()
-        media = fut.result(timeout=5)
-        _wait_for_terminal(channel)
-        s.close()  # the client cancels: nothing undelivered survives
-        with pytest.raises(SessionEnded):
-            s._end_receive(media)
-        assert not channel._unread_messages
-        with pytest.raises(SessionError):  # closed by the client: calls refuse outright
-            next(s.results())
-
-
-def test_explicit_close_discards_a_handed_out_terminal(harness):
-    with harness(CountingPipeline(initial=False, length=1)) as h:
-        s = h.open()
-        s.submit("controls", 1)
-        with s.results() as results:
-            media = next(results)
-            assert not media.done
-        fut = s._begin_receive()
-        terminal = fut.result(timeout=5)
-        assert terminal.done and terminal.error is None
-        s.close()
-        with pytest.raises(SessionEnded):
-            s._end_receive(terminal)
-
-
-def test_explicit_close_async_discards_a_handed_out_terminal(harness):
-    with harness(CountingPipeline(initial=False, length=1)) as h:
-
-        async def run():
-            req = DiffusionRequest(request_id=1, prompt=["p"], params=SimpleNamespace())
-            channel = h.client.open_session(req)
-            await asyncio.wrap_future(channel.opened)
-            s = VisualGenSession(1, h.client, channel)
-            await s.submit_async("controls", 1)
-            fut = s._begin_receive()
-            media = await asyncio.wrap_future(fut)
-            s._end_receive(media)
-            fut = s._begin_receive()
-            terminal = await asyncio.wrap_future(fut)
-            assert terminal.done
-            await s.close_async()
-            with pytest.raises(SessionEnded):
-                s._end_receive(terminal)
-
-        asyncio.run(run())
-
-
-def test_terminal_abandoned_across_an_explicit_close_is_gone(harness):
-    with harness(CountingPipeline(initial=False, length=1)) as h:
-        s = h.open()
-        channel = h.client._sessions[s.request_id]
-        s.submit("controls", 1)
-        fut = channel.request_next_result()
-        assert fut.result(timeout=5).slot_id is not None
-        channel.abandon(fut)  # media back at the front, before any close
-        fut = channel.request_next_result()
-        fut.result(timeout=5)  # the media again
-        channel.abandon(fut)
-        _wait_for_terminal(channel)
-        s.close()
-        assert not channel._unread_messages  # the queued terminal went with the close
-        fut2 = Future()
-        fut2.set_result(_timeout_terminal(s.request_id, 9))
-        channel.abandon(fut2)  # a terminal handed out earlier, abandoned now: not restored
-        assert not channel._unread_messages
-        with pytest.raises(SessionEnded):
-            channel.request_next_result()
+    _wait_until(
+        lambda: any(getattr(m, "done", False) for m in channel._results), what="the queued terminal"
+    )
 
 
 def test_worker_initiated_close_still_keeps_its_terminal(harness):
@@ -1496,8 +1320,7 @@ def test_worker_initiated_close_still_keeps_its_terminal(harness):
         s = h.open()
         s.submit("controls", 1)
         channel = h.client._sessions[s.request_id]
-        _wait_until(channel.closed.done, what="the idle close")
-        assert not channel.cancelled
+        _wait_until(lambda: _closed(channel), what="the idle close")
         terminal = next(s.results())
         assert terminal.done and terminal.error is None
 
@@ -1508,14 +1331,11 @@ def test_explicit_close_after_a_timeout_close_discards_the_retained_terminal(har
     ) as h:
         s = h.open()
         channel = h.client._sessions[s.request_id]
-        fut = s._begin_receive()
-        media = fut.result(timeout=5)  # the initial result, handed out
-        channel.closed.result(timeout=5)  # the timeout won; its terminal is retained
-        assert any(m.done for m in channel._unread_messages)
+        _wait_until(lambda: _closed(channel), what="the idle close")
+        assert any(getattr(m, "done", False) for m in channel._results)  # terminal retained
         s.close()  # explicit cancellation after the worker close: discard everything
-        assert not channel._unread_messages
         with pytest.raises(SessionEnded):
-            s._end_receive(media)
+            next(s.results())
 
 
 def test_timeout_close_without_explicit_close_still_returns_its_terminal(harness):
@@ -1524,13 +1344,12 @@ def test_timeout_close_without_explicit_close_still_returns_its_terminal(harness
     ) as h:
         s = h.open()
         channel = h.client._sessions[s.request_id]
-        fut = s._begin_receive()
-        media = fut.result(timeout=5)
-        channel.closed.result(timeout=5)
-        terminal = s._end_receive(media)  # media dropped, the retained terminal built
+        _wait_until(lambda: _closed(channel), what="the idle close")
+        results = s.results()
+        terminal = next(results)  # unread initial media dropped, the retained terminal built
         assert terminal.done and "idle timeout" in terminal.error and terminal.outputs == {}
         with pytest.raises(StopIteration):
-            next(s.results())
+            next(results)
 
 
 # --------------------------------------------------------------------------- advance(): input to result
@@ -1547,8 +1366,8 @@ def test_advance_refuses_while_the_initial_result_is_in_transit(harness):
         h.hold(SessionResultMessage)  # SessionOpened passes, the initial media does not
         s = h.open()
         _wait_until(lambda: h.held(SessionResultMessage), what="the held initial result")
-        assert not h.client._sessions[s.request_id].media_pending()  # nothing arrived yet
-        with pytest.raises(SessionError, match="initial result is unread"):
+        assert not h.client._sessions[s.request_id].unread_media()  # nothing arrived yet
+        with pytest.raises(SessionError, match="unread"):
             s.advance(1)
         assert h.pipeline.advances == []  # nothing was submitted
         h.release()
@@ -1565,7 +1384,7 @@ def test_advance_refuses_while_an_earlier_input_is_still_computing(harness):
         s = h.open()
         assert s.submit("controls", 1) == 0
         _wait_until(lambda: h.executor.pipeline is pipe and pipe.advance_gate is not None)
-        with pytest.raises(SessionError, match="advance 0.*unread"):
+        with pytest.raises(SessionError, match="unread"):
             s.advance(2)  # advance 0 is computing: nothing in the deque, still refused
         pipe.advance_gate.set()
         with s.results() as results:
@@ -1583,7 +1402,7 @@ def test_advance_refuses_while_an_earlier_result_is_in_transit(harness):
         h.hold(SessionResultMessage)
         s.submit("controls", 1)
         _wait_until(lambda: h.held(SessionResultMessage), what="the held media")
-        with pytest.raises(SessionError, match="advance 0.*unread"):
+        with pytest.raises(SessionError, match="unread"):
             s.advance(2)
         h.release()
         assert next(s.results()).advance_index == 0
@@ -1615,7 +1434,7 @@ def test_iterator_request_is_refused_while_advance_awaits_admission(harness):
         t.join(timeout=10)
         assert "error" not in outcome, outcome
         assert outcome["result"].advance_index == 0 and _pixels(outcome["result"]) == (0, 1, 0)
-        assert not s._receiving.locked()
+        assert s._channel._reader is None
         assert s.advance(2).advance_index == 1
 
 
@@ -1661,11 +1480,12 @@ def test_advance_after_the_session_ended_returns_the_terminal_once_without_submi
             r = s.advance(1)
             assert r.advance_index == 0
             channel = h.client._sessions[s.request_id]
-            _wait_until(lambda: any(m.done for m in channel._unread_messages), what="the terminal")
+            _wait_until(lambda: any(m.done for m in channel._results), what="the terminal")
             sent = []
-            original = h.client.session_submit
-            h.client.session_submit = lambda *a, **k: (sent.append(a), original(*a, **k))[1]
+            original = h.client.pending_requests.put
+            h.client.pending_requests.put = lambda m: (sent.append(m), original(m))[1]
             terminal = s.advance(2)  # the terminal is already here: nothing is submitted
+            h.client.pending_requests.put = original
             assert terminal.done and terminal.error is None
             assert sent == [] and [a["controls"] for a in pipe.advances] == [1]
             with pytest.raises(SessionEnded):
@@ -1688,14 +1508,14 @@ def test_rejected_input_leaves_advance_and_results_usable(harness):
         with h.open() as s:
             with pytest.raises(ValueError):
                 s.advance(-1)  # the validator rejects it
-            assert not s._receiving.locked() and not s._submitting.locked()
+            assert s._channel._reader is None and s._channel._submit is None
             assert s.advance(1).advance_index == 0  # holds one of the two slots
             h.hold(SessionResultMessage)  # results stay in transit: no slot comes back
             for value in (2, 3, 4):  # 2 takes the last free slot, 3 and 4 fill the queue
                 s.submit("controls", value)
             with pytest.raises(SessionQueueFull):
                 s.submit("controls", 5)
-            assert not s._submitting.locked()
+            assert s._channel._submit is None
             with pytest.raises(SessionError, match="unread"):
                 s.advance(6)  # three results owed
             h.release()
@@ -1741,12 +1561,13 @@ def test_advance_async_does_not_submit_when_the_terminal_is_known(harness):
             assert (await s.advance_async(1)).advance_index == 0
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                None, lambda: _wait_until(channel.terminal_next, what="terminal")
+                None, lambda: _wait_until(lambda: _terminal_next(channel), what="terminal")
             )
             sent = []
-            original = h.client.session_submit
-            h.client.session_submit = lambda *a, **k: (sent.append(a), original(*a, **k))[1]
+            original = h.client.pending_requests.put
+            h.client.pending_requests.put = lambda m: (sent.append(m), original(m))[1]
             terminal = await s.advance_async(2)
+            h.client.pending_requests.put = original
             assert terminal.done and sent == []
             with pytest.raises(SessionEnded):
                 await s.advance_async(3)
@@ -1761,8 +1582,8 @@ def test_advance_takes_the_terminal_when_the_earlier_input_died_without_media(ha
         with h.open() as s:
             assert s.submit("controls", 1) == 0  # admitted, then the advance raises
             channel = h.client._sessions[s.request_id]
-            _wait_until(channel.terminal_next, what="the error terminal")
-            assert channel.owed_media() is not None  # index 0 is still recorded ...
+            _wait_until(lambda: _terminal_next(channel), what="the error terminal")
+            assert channel.owed() > 0  # index 0 is still recorded ...
             terminal = s.advance(2)  # ... but the terminal supersedes it; nothing submitted
             assert terminal.done and "kernel exploded" in terminal.error
             assert [a["controls"] for a in pipe.advances] == []
@@ -1775,7 +1596,7 @@ def test_advance_takes_a_retained_timeout_terminal_after_the_worker_closed(harne
     with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.15)) as h:
         s = h.open()
         channel = h.client._sessions[s.request_id]
-        _wait_until(channel.closed.done, what="the idle close")
+        _wait_until(lambda: _closed(channel), what="the idle close")
         terminal = s.advance(1)  # closed by the worker, terminal retained: delivered, not refused
         assert terminal.done and "idle timeout" in terminal.error
         with pytest.raises(SessionEnded):
@@ -1788,9 +1609,9 @@ def test_advance_still_refuses_while_real_media_precedes_the_terminal(harness):
         with h.open() as s:
             s.submit("controls", 1)  # media 0, then the normal terminal
             channel = h.client._sessions[s.request_id]
-            _wait_until(lambda: any(m.done for m in channel._unread_messages), what="terminal")
-            assert channel.media_pending()
-            with pytest.raises(SessionError, match="advance 0.*unread"):
+            _wait_until(lambda: any(m.done for m in channel._results), what="terminal")
+            assert channel.unread_media()
+            with pytest.raises(SessionError, match="unread"):
                 s.advance(2)
             with s.results() as results:
                 assert next(results).advance_index == 0
@@ -1815,19 +1636,20 @@ def test_cancelled_submit_keeps_its_admission_and_its_media(harness):
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert not s._submitting.locked()
+            pending = s._channel._submit
+            assert pending is not None and pending.admission.cancelled()  # kept until the reply
             h.release()
             await loop.run_in_executor(
-                None, lambda: _wait_until(channel.media_pending, what="media")
+                None, lambda: _wait_until(channel.unread_media, what="media")
             )
-            assert channel.owed_media() is not None  # index 0 is owed although nobody awaited it
-            with pytest.raises(SessionError, match="advance 0.*unread"):
+            assert channel.owed() > 0 and channel._submit is None  # owed; record retired
+            with pytest.raises(SessionError, match="unread"):
                 await s.advance_async(2)  # refused: nothing admitted, result 0 not consumed
             assert [a["controls"] for a in pipe.advances] == [1]
             results = s.results()
             r0 = await results.__anext__()  # the old media is still obtainable
             assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)
-            assert channel.owed_media() is None
+            assert channel.owed() == 0
             assert (await s.advance_async(2)).advance_index == 1
             await s.close_async()
 
@@ -1852,12 +1674,12 @@ def test_cancelled_advance_async_keeps_its_admission(harness):
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert not s._receiving.locked() and not s._submitting.locked()
+            assert s._channel._reader is None  # the read reservation went with the caller
             h.release()
             await loop.run_in_executor(
-                None, lambda: _wait_until(channel.media_pending, what="media")
+                None, lambda: _wait_until(channel.unread_media, what="media")
             )
-            with pytest.raises(SessionError, match="advance 0.*unread"):
+            with pytest.raises(SessionError, match="unread"):
                 await s.advance_async(2)
             r0 = await s.results().__anext__()
             assert r0.advance_index == 0
@@ -1886,21 +1708,19 @@ def _drive_cancelled_submit_then_advance(h, start_call):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert not s._receiving.locked() and not s._submitting.locked()
-        seen = {}
-        original = channel.owed_media
+        assert s._channel._reader is None  # the submit record waits for its reply
+        original = channel.plan_advance
 
-        def owed_then_replies_arrive():
-            seen["owed"] = original()
-            h.release()  # the background thread resolves the old admission now
-            _wait_until(channel.media_pending, what="media 0")
-            return seen["owed"]
+        def replies_arrive_then_plan(name):
+            # The old admission and media 0 land right before the reservation.
+            h.release()
+            _wait_until(channel.unread_media, what="media 0")
+            return original(name)
 
-        channel.owed_media = owed_then_replies_arrive
-        with pytest.raises(SessionError, match="unread|awaiting admission"):
+        channel.plan_advance = replies_arrive_then_plan
+        with pytest.raises(SessionError, match="unread|in progress"):
             await s.advance_async(2)
-        channel.owed_media = original
-        assert seen["owed"] is not None  # the unanswered submit already counted as owed
+        channel.plan_advance = original
         assert [a["controls"] for a in h.pipeline.advances] == [1]  # no second input admitted
         r0 = await s.results().__anext__()
         assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)  # media 0 still obtainable
@@ -1920,34 +1740,21 @@ def test_advance_cannot_slip_after_a_cancelled_advance_async(harness):
         _drive_cancelled_submit_then_advance(h, lambda s: s.advance_async(1))
 
 
-def test_advance_reservation_refuses_when_results_become_owed_meanwhile():
-    """The atomic half: even if the pre-check passed, the reservation refuses once
-    something is owed at that moment."""
-    channel = SessionChannel(5)
-    channel.declare({"inputs": [{"name": "controls", "policy": "queued"}], "initial_result": False})
-    seq, fut = channel.expect_admission("controls")
-    channel.resolve_admission(seq, 0, None)  # index 0 is owed from now on
-    assert fut.result(timeout=1) == 0
-    with pytest.raises(SessionError, match="advance 0.*unread"):
-        channel.expect_admission("controls", nothing_owed=True)
-    seq2, fut2 = channel.expect_admission("controls")  # an ordinary submit still queues
-    assert fut2 is not None and seq2 == seq + 1
-
-
 # --------------------------------------------------------------------------- advance(): the session ends mid-call
 
 
 def _idle_closes_before_the_submit(s, channel):
-    """Wrap _begin_submit so the worker's idle close (terminal, SessionClosed) has
-    landed by the time advance tries to reserve its admission."""
-    original = s._begin_submit
+    """Wrap the client's submit so the worker's idle close (terminal, SessionClosed)
+    has landed by the time advance tries to reserve its admission."""
+    client = s._client
+    original = client.session_submit
 
-    def wait_then_begin(*args, **kwargs):
-        _wait_until(channel.closed.done, what="the idle close")
+    def wait_then_submit(*args, **kwargs):
+        _wait_until(lambda: _closed(channel), what="the idle close")
         return original(*args, **kwargs)
 
-    s._begin_submit = wait_then_begin
-    return lambda: setattr(s, "_begin_submit", original)
+    client.session_submit = wait_then_submit
+    return lambda: setattr(client, "session_submit", original)
 
 
 def test_advance_returns_the_terminal_when_the_idle_close_lands_before_its_submit(harness):
@@ -1960,7 +1767,7 @@ def test_advance_returns_the_terminal_when_the_idle_close_lands_before_its_submi
         terminal = s.advance(1)
         restore()
         assert terminal.done and "idle timeout" in terminal.error
-        assert not s._receiving.locked() and not s._submitting.locked()
+        assert s._channel._reader is None and s._channel._submit is None
         with pytest.raises(SessionEnded):
             s.advance(2)
 
@@ -1979,7 +1786,7 @@ def test_advance_async_returns_the_terminal_when_the_idle_close_lands_before_its
             terminal = await s.advance_async(1)
             restore()
             assert terminal.done and "idle timeout" in terminal.error
-            assert not s._receiving.locked() and not s._submitting.locked()
+            assert s._channel._reader is None and s._channel._submit is None
             with pytest.raises(SessionEnded):
                 await s.advance_async(2)
 
@@ -1990,17 +1797,17 @@ def test_advance_ends_when_an_explicit_close_lands_before_its_submit(harness):
     with harness(CountingPipeline(initial=False)) as h:
         s = h.open()
         channel = h.client._sessions[s.request_id]
-        original = s._begin_submit
+        original = h.client.session_submit
 
-        def close_then_begin(*args, **kwargs):
+        def close_then_submit(*args, **kwargs):
             h.client.session_close(channel).result(timeout=10)  # the client's own close
             return original(*args, **kwargs)
 
-        s._begin_submit = close_then_begin
+        h.client.session_submit = close_then_submit
         with pytest.raises(SessionEnded):
             s.advance(1)  # cancelled close: nothing retained, the call ends
-        s._begin_submit = original
-        assert not s._receiving.locked() and not s._submitting.locked()
+        h.client.session_submit = original
+        assert s._channel._reader is None and s._channel._submit is None
         s.close()
 
 
@@ -2008,17 +1815,17 @@ def test_advance_raises_the_worker_failure_when_it_lands_before_its_submit(harne
     with harness(CountingPipeline(initial=False)) as h:
         s = h.open()
         channel = h.client._sessions[s.request_id]
-        original = s._begin_submit
+        original = h.client.session_submit
 
-        def fail_then_begin(*args, **kwargs):
-            channel.fail("DiffusionClient: local worker processes exited")
+        def fail_then_submit(*args, **kwargs):
+            channel.fail(RuntimeError("DiffusionClient: local worker processes exited"))
             return original(*args, **kwargs)
 
-        s._begin_submit = fail_then_begin
+        h.client.session_submit = fail_then_submit
         with pytest.raises(RuntimeError, match="exited"):
             s.advance(1)
-        s._begin_submit = original
-        assert not s._receiving.locked() and not s._submitting.locked()
+        h.client.session_submit = original
+        assert s._channel._reader is None and s._channel._submit is None
         s.close()
 
 
@@ -2108,7 +1915,7 @@ def test_open_succeeds_again_after_close_idle_close_and_open_failure(harness):
         assert h.client._sessions == {}
         s = h.open()  # idle close releases it too
         channel = h.client._sessions[s.request_id]
-        _wait_until(channel.closed.done, what="the idle close")
+        _wait_until(lambda: _closed(channel), what="the idle close")
         assert h.client._sessions == {}
         s = h.open()
         assert s.advance(1).advance_index == 0
@@ -2254,13 +2061,13 @@ def test_cancelled_open_relinquishes_the_session_when_the_open_succeeds_later(ha
             with pytest.raises(asyncio.CancelledError):
                 await task
             channel = h.client._sessions[1]
-            assert channel.abandoned and not channel.opened.cancelled()
+            assert not channel.opened.cancelled()
             assert list(h.client._sessions) == [1]  # still reserved: the worker holds it
             h.release()  # the late success: no InvalidStateError, closed at once
             await loop.run_in_executor(
                 None, lambda: _wait_until(lambda: not h.client._sessions, what="release")
             )
-            assert channel.closed.done() and channel.lease_lost is not None
+            assert _closed(channel) and channel.lease_lost is not None
             await loop.run_in_executor(None, lambda: _wait_until(lambda: pipe.closed == 1))
             assert pipe.opened == 1
             s = VisualGenSession(2, h.client, await h.client.open_session_async(_request(2)))
@@ -2366,79 +2173,6 @@ def test_open_reply_routing_tolerates_a_cancelled_lifecycle_future():
 # --------------------------------------------------------------------------- result request cancelled during delivery
 
 
-def test_delivery_to_a_cancelled_request_requeues_under_the_lock(harness):
-    """The reader's future is cancelled while a delivery is about to complete it:
-    the message goes back to the front under the same lock, so the next request
-    takes it at once and nothing waits beside it."""
-    pipe = CountingPipeline(initial=False)
-    with harness(pipe) as h:
-
-        async def run():
-            channel = h.client.open_session(_request(1))
-            await asyncio.wrap_future(channel.opened)
-            s = VisualGenSession(1, h.client, channel)
-            results = s.results()
-            first = asyncio.ensure_future(results.__anext__())
-            await asyncio.sleep(0)
-            old = channel._next_result
-            assert old is not None
-            old.cancel()  # what the cancelled awaiter does to the parked future
-            await s.submit_async("controls", 1)  # delivery finds a cancelled future
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, lambda: _wait_until(channel.media_pending))
-            assert channel._next_result is None  # the invariant held: no waiter beside it
-            first.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await first  # its handler abandons the cancelled future: nothing duplicated
-            assert not s._receiving.locked()
-            r0 = await results.__anext__()  # the replacement gets media 0 without another submit
-            assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)
-            await s.submit_async("controls", 2)
-            r1 = await results.__anext__()
-            assert r1.advance_index == 1 and _pixels(r1) == (1, 2, 0)
-            await s.close_async()
-
-        asyncio.run(run())
-
-
-def test_requeue_hands_the_message_to_a_parked_replacement():
-    """Channel-level: a done-but-unconsumed future is abandoned while a new
-    request is already parked; the message goes to that request, not beside it."""
-    channel = SessionChannel(4)
-    channel.declare({"inputs": [], "streams": [], "initial_result": False})
-    fut = channel.request_next_result()
-    media = SessionResultMessage(4, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
-    channel.deliver(media)
-    assert fut.result(timeout=1) is media
-    replacement = channel.request_next_result()  # parks: nothing unread
-    channel.abandon(fut)  # the owner never read it
-    assert replacement.result(timeout=1) is media
-    assert not channel.media_pending() and channel._next_result is None
-    terminal = SessionResultMessage(4, 1, None, None, {}, {}, done=True)
-    channel.deliver(terminal)
-    assert channel.request_next_result().result(timeout=1) is terminal
-
-
-def test_cancelled_delivery_still_respects_close_and_failure():
-    channel = SessionChannel(4)
-    channel.declare({"inputs": [], "streams": [], "initial_result": False})
-    media = SessionResultMessage(4, 0, 0, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {})
-    # Worker-initiated close with a cancelled parked request: the terminal is kept.
-    fut = channel.request_next_result()
-    fut.cancel()
-    channel.deliver(SessionResultMessage(4, 1, None, None, {}, {}, done=True, error="idle"))
-    channel.close("session 4 is closed")
-    assert channel.request_next_result().result(timeout=1).done
-    # Failure with a cancelled parked request: nothing is delivered afterwards.
-    channel = SessionChannel(5)
-    fut = channel.request_next_result()
-    fut.cancel()
-    channel.fail("worker died")
-    channel.deliver(media)
-    with pytest.raises(RuntimeError, match="worker died"):
-        channel.request_next_result()
-
-
 # --------------------------------------------------------------------------- input byte bound, end to end
 
 
@@ -2487,7 +2221,7 @@ def test_oversize_inputs_are_refused_before_they_are_sent(harness):
             with pytest.raises(ValueError, match="unknown input"):
                 s.submit("unknown", bytes(1 << 20))  # no spec: refused, not queued
             assert h.client.pending_requests.empty()  # nothing staged, nothing grew
-            assert not s._submitting.locked()
+            assert s._channel._submit is None
             h.send_gate.set()
             assert s.submit("controls", 1) == 0  # exactly the bound (one small int)
             assert s.submit("camera", 2) == 1
@@ -2514,27 +2248,29 @@ def test_worker_rejects_an_oversize_input_before_its_pipeline_sees_it(harness):
             decorated_tensor = torch.zeros(1, dtype=torch.uint8)
             decorated_tensor.payload = b"x" * 4096
             put = h.executor.requests_ipc.put_nowait
-            put(SessionSubmit(s.request_id, 99, "controls", [1, 2]))
-            put(SessionSubmit(s.request_id, 98, "nope", 1))
-            put(SessionSubmit(s.request_id, 97, "controls", decorated_array))
-            put(SessionSubmit(s.request_id, 96, "controls", decorated_tensor))
-            put(SessionSubmit(s.request_id, 95, "controls", decorated_tensor[:]))
-            put(SessionSubmit(s.request_id, 94, "controls", decorated_array.view(np.uint8)))
-            s.submit("camera", 1)  # makes the worker service its socket
-            seqs = {94, 95, 96, 97, 98, 99}
-            _wait_until(
-                lambda: sum(isinstance(r, SessionAdmitted) and r.seq in seqs for r in replies) == 6,
-                what="the worker's answers",
-            )
-            by_seq = {r.seq: r for r in replies if isinstance(r, SessionAdmitted)}
-            assert by_seq[99].error_kind == "queue_full" and "declared bound" in by_seq[99].error
-            assert by_seq[98].error_kind == "invalid" and "unknown input" in by_seq[98].error
-            assert by_seq[97].error_kind == "invalid" and "dtype metadata" in by_seq[97].error
-            assert by_seq[96].error_kind == "invalid" and "attributes" in by_seq[96].error
-            assert by_seq[95].error_kind == "invalid" and "attributes" in by_seq[95].error
-            assert by_seq[94].error_kind == "invalid" and "dtype metadata" in by_seq[94].error
-            assert len(validated) == 1  # only the admitted camera value reached the validator
+            put(SessionSubmit(s.request_id, "controls", [1, 2]))
+            put(SessionSubmit(s.request_id, "nope", 1))
+            put(SessionSubmit(s.request_id, "controls", decorated_array))
+            put(SessionSubmit(s.request_id, "controls", decorated_tensor))
+            put(SessionSubmit(s.request_id, "controls", decorated_tensor[:]))
+            put(SessionSubmit(s.request_id, "controls", decorated_array.view(np.uint8)))
+            # Wake the worker with a control, not a submit: these raw submits are
+            # strays with no pending record, and their answers must not be taken
+            # for a real admission.
+            h.client.session_activity(h.client._sessions[s.request_id])
+            answers = lambda: [r for r in replies if isinstance(r, SessionAdmitted) and r.error]  # noqa: E731
+            _wait_until(lambda: len(answers()) == 6, what="the worker's answers")
+            kinds = [(r.error_kind, r.error) for r in answers()]
+            assert kinds[0][0] == "queue_full" and "declared bound" in kinds[0][1]
+            assert kinds[1][0] == "invalid" and "unknown input" in kinds[1][1]
+            assert kinds[2][0] == "invalid" and "dtype metadata" in kinds[2][1]
+            assert kinds[3][0] == "invalid" and "attributes" in kinds[3][1]
+            assert kinds[4][0] == "invalid" and "attributes" in kinds[4][1]
+            assert kinds[5][0] == "invalid" and "dtype metadata" in kinds[5][1]
+            assert validated == []  # none of the strays reached the pipeline validator
             h.client._route_session_reply = original
+            s.submit("camera", 1)
+            assert validated == [1]  # only an admitted value does
             assert s.submit("controls", 1) == 0  # the next index is still 0
 
 
@@ -2545,7 +2281,7 @@ def test_repeated_rejected_submits_do_not_grow_staging(harness):
             for _ in range(50):
                 with pytest.raises(SessionQueueFull):
                     s.submit("controls", [1, 2])
-            assert h.client.pending_requests.empty() and channel._awaiting_admission is None
+            assert h.client.pending_requests.empty() and channel._submit is None
             assert s.submit("controls", 1) == 0
 
 
@@ -2568,15 +2304,21 @@ class _FailingSocket:
 def _sending_client(exc):
     client = _aborting_client()
     client.requests_ipc = _FailingSocket(exc)
+    client.controls_ipc = _FailingSocket(None)
     return client
 
 
 def _declared(client, session_id):
     channel = client.open_session(_request(session_id))
-    channel.declare(
-        {"inputs": [{"name": "x", "policy": "queued", "max_bytes": 1024}], "initial_result": False}
+    channel.open_succeeded(
+        SessionResources(
+            {
+                "inputs": [{"name": "x", "policy": "queued", "max_bytes": 1024}],
+                "initial_result": False,
+            },
+            ClientSlotMap([]),
+        )
     )
-    channel._complete(channel.opened, channel)
     return channel
 
 
@@ -2589,14 +2331,15 @@ def test_unserializable_submit_fails_that_call_only():
     client._process_requests()
     with pytest.raises(ValueError, match="cannot be serialized"):
         fut.result(timeout=1)
-    assert channel._awaiting_admission is None and client._worker_failure is None
+    channel.release_submit(fut)  # what the public submit does in its finally
+    assert channel._submit is None and client._worker_failure is None
     assert client.pending_requests.empty() and client._request_to_send is None
     client.requests_ipc.exc = None
     fut = client.session_submit(channel, "x", [1.0])  # the next submit goes out
     client._process_requests()
     sent = client.requests_ipc.sent[-1]
     assert isinstance(sent, SessionSubmit)
-    channel.resolve_admission(sent.seq, 0, None)
+    channel.admitted(0, None)
     assert fut.result(timeout=1) == 0  # no index was consumed by the failed one
 
 
@@ -2621,6 +2364,7 @@ def test_transport_failure_on_a_session_command_aborts_the_group(command):
     channel = _declared(client, 1)
     client._process_requests()
     client.requests_ipc.exc = OSError("probe: send failed")
+    client.controls_ipc = _FailingSocket(OSError("probe: send failed"))
     waiters = []
     if command == "submit":
         waiters.append(client.session_submit(channel, "x", [1.0]))
@@ -2628,10 +2372,8 @@ def test_transport_failure_on_a_session_command_aborts_the_group(command):
         waiters.append(client.session_close(channel))
     elif command == "slot_return":
         client.session_return_slot(channel, 0)
-        waiters.append(channel.request_next_result())
     elif command == "activity":
         client.session_activity(channel)
-        waiters.append(channel.request_next_result())
     else:
         client.requests_ipc.exc = None
         with client._sessions_lock:
@@ -2639,6 +2381,7 @@ def test_transport_failure_on_a_session_command_aborts_the_group(command):
         channel = client.open_session(_request(5))
         client.requests_ipc.exc = OSError("probe: send failed")
         waiters.append(channel.opened)
+    client._process_controls()
     client._process_requests()
     assert client._worker_failure is not None and "send failed" in client._worker_failure
     for fut in waiters:
@@ -2696,3 +2439,625 @@ def test_transport_failure_releases_the_failing_open_and_the_queued_payload_once
     for r, content in ((req, ref), (queued, queued_ref)):
         r.refs_from_shm()  # idempotent: handles are gone, content stays
         assert content.content == b"\x07" * 4096
+
+
+# --------------------------------------------------------------------------- the control path
+#
+# Slot returns, close and activity travel on their own socket with their own
+# send slot, so they are serviced however the request socket behaves, and the
+# worker watches both sockets while it waits.
+
+
+def test_close_and_slot_returns_pass_while_the_request_path_is_blocked(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        s = h.open()
+        h.payload_gate.clear()  # from now on submits never reach the worker
+        results = s.results()
+        outcome = {}
+
+        def read():
+            try:
+                next(results)
+            except BaseException as exc:  # noqa: BLE001
+                outcome["read"] = exc
+
+        def submit():
+            try:
+                s.submit("controls", 1)
+            except BaseException as exc:  # noqa: BLE001
+                outcome["submit"] = exc
+
+        reader, submitter = threading.Thread(target=read), threading.Thread(target=submit)
+        reader.start()
+        submitter.start()
+        _wait_until(lambda: h.held_payloads, what="the stuck submit")
+        s.close()  # travels on the control path and completes
+        reader.join(timeout=10)
+        submitter.join(timeout=10)
+        assert not reader.is_alive() and not submitter.is_alive()
+        assert isinstance(outcome["read"], SessionEnded)
+        assert isinstance(outcome["submit"], SessionEnded)
+        assert s.closed and pipe.closed == 1 and pipe.advances == []
+        # The next session opens and runs although the old submit is still held.
+        s2 = h.open()
+        h.payload_gate.set()
+        assert s2.advance(5).advance_index == 0 and _pixels(s2.advance(6)) == (1, 6, 0)
+        s2.close()
+        assert len(h.held_payloads) == 1  # the old submit was never resent
+
+
+def test_output_blocked_session_is_released_by_a_slot_return_on_the_control_path(harness):
+    pipe = CountingPipeline(queued=False, initial=False, length=3)  # autonomous: no inputs
+    with harness(pipe, SimpleNamespace(delivery_slots=1, idle_timeout=None)) as h:
+        s = h.open()
+        h.payload_gate.clear()  # irrelevant to this session, blocked anyway
+        results = s.results()
+        r0 = next(results)
+        assert r0.advance_index == 0
+        _wait_until(lambda: len(pipe.advances) == 1, what="the worker to block on its one slot")
+        time.sleep(0.1)
+        assert len(pipe.advances) == 1  # output-blocked: the single slot is held
+        r1 = next(results)  # returns the slot on the control path
+        assert r1.advance_index == 1
+        r2 = next(results)
+        assert r2.advance_index == 2 and next(results).done
+        s.close()
+
+
+def test_closed_session_retires_its_unsent_submits_in_the_dispatcher():
+    """Dispatcher level: a submit parked on Again and two more queued; the close
+    acknowledgement drops all three, settles their waiters, and the next open is
+    what goes out when the socket accepts again."""
+    import zmq
+
+    client = _sending_client(None)
+    client._monitor_worker_liveness = False
+    channel = _declared(client, 1)
+    client._process_requests()  # the open goes out
+    client.requests_ipc.exc = zmq.Again()
+    parked = client.session_submit(channel, "x", [1.0])
+    client._process_requests()  # parked in the send slot
+    assert isinstance(client._request_to_send, SessionSubmit)
+    waiting = client.session_close(channel)  # control path: goes out at once
+    client._process_controls()
+    assert isinstance(client.controls_ipc.sent[-1], SessionClose)
+    client._route_session_reply(SessionClosed(1))  # the worker confirmed
+    assert waiting.result(timeout=1) is None
+    with pytest.raises(SessionEnded):
+        parked.result(timeout=1)
+    assert client._request_to_send is None and client.pending_requests.empty()
+    client.requests_ipc.exc = None
+    new = client.open_session(_request(2))
+    client._process_requests()
+    assert isinstance(client.requests_ipc.sent[-1], SessionOpen)  # not the retired submit
+    assert all(not isinstance(m, SessionSubmit) for m in client.requests_ipc.sent)
+    assert new is client._sessions[2]
+
+
+def test_activity_notes_are_coalesced_and_close_is_sent_once():
+    client = _sending_client(None)
+    channel = _declared(client, 1)
+    client._process_requests()
+    for _ in range(5):
+        client.session_activity(channel)
+    assert len(client._controls) == 1  # one pending note per session
+    client._process_controls()
+    assert sum(isinstance(m, SessionActivity) for m in client.controls_ipc.sent) == 1
+    client.session_activity(channel)  # after it was sent, a new one is accepted
+    assert len(client._controls) == 1
+    client._process_controls()
+    client.session_close(channel)
+    client.session_close(channel)
+    client.session_close(channel)
+    assert len(client._controls) == 1
+    client._process_controls()
+    assert sum(isinstance(m, SessionClose) for m in client.controls_ipc.sent) == 1
+
+
+def test_close_before_the_open_is_acknowledged_waits_for_the_acknowledgement():
+    client = _sending_client(None)
+    channel = client.open_session(_request(1))
+    client._process_requests()
+    closed = client.session_close(channel)  # opened is still pending
+    client._process_controls()
+    assert client.controls_ipc.sent == []  # nothing crossed early
+    client._route_session_reply(
+        SessionOpened(1, capabilities={"inputs": [], "streams": []}, slots=[])
+    )
+    client._process_controls()
+    assert isinstance(client.controls_ipc.sent[-1], SessionClose)  # now, after the ack
+    client._route_session_reply(SessionClosed(1))
+    assert closed.result(timeout=1) is None and client._sessions == {}
+
+
+def test_stray_close_on_the_control_socket_does_not_touch_a_later_session(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        h.executor.controls_ipc.put_nowait(SessionClose(41))  # a close for no session
+        with h.open() as s:
+            assert s.advance(1).advance_index == 0  # the stray did not close this one
+        assert h.pipeline.closed == 1
+
+
+def test_control_socket_real_zmq_carries_close_while_the_request_path_is_blocked(harness):
+    """The control path over a real ZeroMQ pair (PUSH server on the client, PULL
+    client on the worker), HMAC on, driven by the client's real control
+    dispatcher, while the request path holds every submit."""
+    from tensorrt_llm.executor.ipc import ZeroMqQueue
+
+    port = _free_port()
+    key = os.urandom(32)
+    client_ctl = ZeroMqQueue(
+        (f"tcp://127.0.0.1:{port}", key),
+        is_server=True,
+        socket_type=zmq_push(),
+        use_hmac_encryption=True,
+    )
+    worker_ctl = ZeroMqQueue(
+        (f"tcp://127.0.0.1:{port}", key),
+        is_server=False,
+        socket_type=zmq_pull(),
+        use_hmac_encryption=True,
+    )
+    pipe = CountingPipeline(initial=False)
+    stop = threading.Event()
+    dispatcher = None
+    try:
+        with harness(pipe, forward_controls=False) as h:
+            h.executor.controls_ipc = worker_ctl  # the worker thread drains this socket
+            h.client.controls_ipc = client_ctl
+
+            def dispatch():
+                while not stop.is_set():
+                    h.client._process_controls()
+                    time.sleep(0.002)
+
+            dispatcher = threading.Thread(target=dispatch, daemon=True)
+            dispatcher.start()
+            s = h.open()
+            h.payload_gate.clear()  # submits never reach the worker from here on
+            results = s.results()
+            outcome = {}
+
+            def read():
+                try:
+                    next(results)
+                except BaseException as exc:  # noqa: BLE001
+                    outcome["read"] = exc
+
+            def submit():
+                try:
+                    s.submit("controls", 1)
+                except BaseException as exc:  # noqa: BLE001
+                    outcome["submit"] = exc
+
+            reader, submitter = threading.Thread(target=read), threading.Thread(target=submit)
+            reader.start()
+            submitter.start()
+            _wait_until(lambda: h.held_payloads, what="the stuck submit")
+            s.close()  # the close travels on the real control socket
+            reader.join(timeout=10)
+            submitter.join(timeout=10)
+            assert isinstance(outcome.get("read"), SessionEnded)
+            assert isinstance(outcome.get("submit"), SessionEnded)
+            assert s.closed and pipe.closed == 1 and pipe.advances == []
+            stop.set()
+            dispatcher.join(timeout=5)
+            assert not dispatcher.is_alive()
+    finally:
+        stop.set()
+        if dispatcher is not None:
+            dispatcher.join(timeout=5)
+        client_ctl.close()
+        worker_ctl.close()
+
+
+def zmq_push():
+    import zmq
+
+    return zmq.PUSH
+
+
+def zmq_pull():
+    import zmq
+
+    return zmq.PULL
+
+
+# --------------------------------------------------------------------------- the state model itself
+
+
+def test_a_cancelled_reader_loses_no_media_and_order_holds(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+
+        async def run():
+            channel = h.client.open_session(_request(1))
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            results = s.results()
+            first = asyncio.ensure_future(results.__anext__())
+            await asyncio.sleep(0.05)  # parked: nothing published yet
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert channel._reader is None  # the reservation went with the caller
+            await s.submit_async("controls", 1)
+            await s.submit_async("controls", 2)
+            r0 = await results.__anext__()  # nothing was lost, order holds
+            assert r0.advance_index == 0 and _pixels(r0) == (0, 1, 0)
+            r1 = await results.__anext__()
+            assert r1.advance_index == 1 and _pixels(r1) == (1, 2, 0)
+            await s.close_async()
+
+        asyncio.run(run())
+
+
+def test_channel_failure_before_any_call_raises_everywhere():
+    channel = SessionChannel(7)
+    channel.fail(RuntimeError("gone"))
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.reserve_submit("x")
+    channel.reserve_read()
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.take(lambda m: m)
+    channel.release_read()
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.opened.result()
+    assert channel.lease_lost is not None and "gone" in channel.lease_lost
+
+
+def test_explicit_close_discards_a_queued_terminal(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        s.submit("controls", 1)  # media 0, then the normal terminal, both unread
+        _wait_until(lambda: any(getattr(m, "done", False) for m in channel._results))
+        s.close()
+        with pytest.raises(SessionEnded):
+            next(s.results())
+        assert channel.owed() == 0
+
+
+def test_channel_members_are_the_eight_and_the_session_the_three(harness):
+    """The state model: one authoritative member per fact, nothing duplicated."""
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open() as s:
+            channel = h.client._sessions[s.request_id]
+            assert set(vars(channel)) == {
+                "session_id",
+                "opened",
+                "_close",
+                "_lock",
+                "_submit",
+                "_reader",
+                "_results",
+                "_owed",
+            }
+            assert set(vars(s)) == {"_client", "_channel", "_held"}
+
+
+# --------------------------------------------------------------------------- transitions on the eight members
+
+
+def _media(session_id, sequence, index):
+    return SessionResultMessage(
+        session_id, sequence, index, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {}
+    )
+
+
+def _open_channel(session_id=1, lockstep=True):
+    channel = SessionChannel(session_id)
+    caps = {
+        "inputs": [{"name": "controls", "policy": "queued", "max_bytes": 1024}],
+        "initial_result": False,
+        "lockstep": lockstep,
+    }
+    channel.open_succeeded(SessionResources(caps, ClientSlotMap([])))
+    return channel
+
+
+def test_no_lost_wakeup_between_an_empty_take_and_the_notification():
+    identity = lambda m: m  # noqa: E731
+    # delivery lands between the empty observation and the wait
+    channel = _open_channel()
+    channel.reserve_read()
+    assert channel.take(identity) is None
+    channel.deliver(_media(1, 0, 0))
+    channel.notification().result(timeout=1)  # fired: the delivery was not missed
+    assert channel.take(identity).advance_index == 0
+    channel.release_read()
+    # explicit close lands in the window
+    channel = _open_channel()
+    channel.reserve_read()
+    assert channel.take(identity) is None
+    channel.request_close()
+    channel.notification().result(timeout=1)
+    with pytest.raises(SessionEnded):
+        channel.take(identity)
+    channel.release_read()
+    # failure lands in the window
+    channel = _open_channel()
+    channel.reserve_read()
+    assert channel.take(identity) is None
+    channel.fail(RuntimeError("gone"))
+    channel.notification().result(timeout=1)
+    with pytest.raises(RuntimeError, match="gone"):
+        channel.take(identity)
+    channel.release_read()
+
+
+def test_public_read_sees_a_delivery_injected_between_observation_and_wait(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+        with h.open() as s:
+            channel = h.client._sessions[s.request_id]
+            original = channel.notification
+
+            def deliver_then_wait():
+                s.submit("controls", 1)  # the worker delivers while we are about to wait
+                _wait_until(channel.unread_media, what="media")
+                return original()
+
+            channel.notification = deliver_then_wait
+            r = next(s.results())  # returns, instead of waiting for a wakeup that already fired
+            channel.notification = original
+            assert r.advance_index == 0 and _pixels(r) == (0, 1, 0)
+
+
+def test_cancelled_admission_never_retains_the_submit_record():
+    channel = _open_channel()
+    # cancellation before the reply: the reply retires the record
+    fut = channel.reserve_submit("controls")
+    channel.release_submit(fut)  # the caller left: marks it cancelled, keeps it
+    assert channel._submit is not None and fut.cancelled()
+    channel.admitted(0, None)
+    assert channel._submit is None and channel.owed() == 1
+    # reply first, then the caller's release: the record retires on release
+    fut = channel.reserve_submit("controls")
+    channel.admitted(1, None)
+    assert channel._submit is not None and fut.result(timeout=1) == 1
+    channel.release_submit(fut)
+    assert channel._submit is None and channel.owed() == 2
+    # and a new submit is possible after both
+    fut = channel.reserve_submit("controls")
+    channel.admitted(2, None)
+    channel.release_submit(fut)
+    assert channel.owed() == 3
+
+
+def test_worker_failure_during_a_requested_close_stays_a_failure():
+    # close requested while opening, then the group dies
+    client = _aborting_client()
+    channel = client.open_session(_request(1))
+    closing = client.session_close(channel)
+    client._abort_worker_group("probe: worker exited during opening")
+    with pytest.raises(RuntimeError, match="exited"):
+        channel.opened.result(timeout=1)
+    with pytest.raises(RuntimeError, match="exited"):
+        closing.result(timeout=1)
+    assert channel.failure is not None and "exited" in channel.lease_lost
+    # the group dies first, then a close is requested: the same failed operation
+    client = _aborting_client()
+    channel = client.open_session(_request(2))
+    client._abort_worker_group("probe: worker exited")
+    closing = client.session_close(channel)
+    with pytest.raises(RuntimeError, match="exited"):
+        closing.result(timeout=1)
+    session = VisualGenSession(2, client, channel)
+    session.close()  # the public close swallows the worker failure
+    assert session.closed
+
+
+def test_cancelled_opener_keeps_its_cancellation_while_the_failure_reaches_the_rest(harness):
+    with harness(CountingPipeline(initial=False)) as h:
+
+        async def run():
+            h.hold(SessionOpened)
+            task = asyncio.ensure_future(h.client.open_session_async(_request(1)))
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: _wait_until(lambda: h.held(SessionOpened)))
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            channel = h.client._sessions[1]
+            channel.fail(RuntimeError("worker died"))
+            with pytest.raises(RuntimeError, match="worker died"):
+                channel.closing().result(timeout=1)
+            h.release()  # the late SessionOpened finds a failed channel: nothing changes
+            assert channel.failure is not None
+
+        asyncio.run(run())
+
+
+def test_known_terminal_is_returned_without_looking_at_the_advance_value(harness):
+    pipe = CountingPipeline(initial=False, length=1)
+    with harness(pipe) as h:
+        with h.open() as s:
+            assert s.advance(1).advance_index == 0
+            channel = h.client._sessions[s.request_id]
+            _wait_until(lambda: _terminal_next(channel), what="the terminal")
+            terminal = s.advance(object())  # unsupported, oversized: irrelevant, unused
+            assert terminal.done and terminal.error is None
+            with pytest.raises(SessionEnded):
+                s.advance([1] * 100)
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe, SimpleNamespace(delivery_slots=2, idle_timeout=0.15)) as h:
+        s = h.open()
+        channel = h.client._sessions[s.request_id]
+        _wait_until(lambda: _closed(channel), what="the idle close")
+        terminal = s.advance(object())  # retained timeout terminal, value unused
+        assert terminal.done and "idle timeout" in terminal.error
+
+
+def test_locally_rejected_advance_value_withdraws_its_reservation(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        with h.open() as s:
+            channel = h.client._sessions[s.request_id]
+            with pytest.raises(SessionQueueFull):
+                s.advance([1, 2, 3, 4, 5])  # over the bound: refused before anything is sent
+            with pytest.raises(ValueError):
+                s.advance(object())
+            assert channel._submit is None and channel._reader is None and channel.owed() == 0
+            r = s.advance(1)
+            assert r.advance_index == 0 and pipe.advances == [{"controls": 1, "camera": 0}]
+
+
+def test_unexpected_advance_index_leaves_the_result_for_a_normal_read():
+    channel = _open_channel()
+    channel.reserve_read()
+    channel.deliver(_media(1, 0, 5))  # the worker (misbehaving) answers with advance 5
+    with pytest.raises(SessionError, match="ordering"):
+        channel.take(lambda m: m, expected_index=0)
+    assert channel.unread_media()  # the head stayed
+    assert channel.take(lambda m: m).advance_index == 5  # a plain read gets it
+    channel.release_read()
+
+
+# --------------------------------------------------------------------------- publication against retirement
+
+
+def test_close_between_reservation_and_enqueue_leaves_no_stale_submit():
+    """The worker's close lands after the submit reserved its record and before
+    its command is queued: the command is never queued, the caller gets
+    SessionEnded, and the next session is not blocked behind a stale submit."""
+    import zmq
+
+    client = _sending_client(None)
+    client._monitor_worker_liveness = False
+    channel = _declared(client, 1)
+    client._process_requests()
+    original = channel.reserve_submit
+
+    def reserve_then_close(name, for_advance=False):
+        fut = original(name, for_advance)
+        client._route_session_reply(SessionClosed(1))  # retirement runs now: nothing queued yet
+        return fut
+
+    channel.reserve_submit = reserve_then_close
+    with pytest.raises(SessionEnded):
+        client.session_submit(channel, "x", [1.0])
+    assert client.pending_requests.empty() and client._sessions == {}
+    second = client.open_session(_request(2))
+    client.requests_ipc.exc = zmq.Again()
+    for _ in range(3):
+        client._process_requests()  # a stale submit would be retried here forever
+    client.requests_ipc.exc = None
+    client._process_requests()
+    assert isinstance(client.requests_ipc.sent[-1], SessionOpen)
+    assert all(not isinstance(m, SessionSubmit) for m in client.requests_ipc.sent)
+    assert second is client._sessions[2]
+
+
+def test_close_between_advance_reservation_and_enqueue_leaves_no_stale_submit():
+    client = _sending_client(None)
+    client._monitor_worker_liveness = False
+    channel = _declared(client, 1)
+    client._process_requests()
+    original = channel.plan_advance
+
+    def plan_then_close(name):
+        fut = original(name)
+        client._route_session_reply(SessionClosed(1))
+        return fut
+
+    channel.plan_advance = plan_then_close
+    with pytest.raises(SessionEnded):
+        client.session_submit(channel, "x", [1.0], for_advance=True)
+    assert client.pending_requests.empty() and channel._submit is None
+
+
+def test_abort_between_reservation_and_enqueue_leaves_no_stale_submit():
+    client = _sending_client(None)
+    channel = _declared(client, 1)
+    client._process_requests()
+    original = channel.reserve_submit
+
+    def reserve_then_abort(name, for_advance=False):
+        fut = original(name, for_advance)
+        client._abort_worker_group("probe: worker exited")  # drains and fails under the lock
+        return fut
+
+    channel.reserve_submit = reserve_then_abort
+    with pytest.raises(RuntimeError, match="exited"):
+        client.session_submit(channel, "x", [1.0])
+    assert client.pending_requests.empty() and client._sessions == {}
+    with pytest.raises(RuntimeError, match="exited"):
+        client.open_session(_request(2))
+
+
+def test_interrupted_advance_validation_releases_both_reservations(harness):
+    pipe = CountingPipeline(initial=False)
+    with harness(pipe) as h:
+        with h.open() as s:
+            channel = h.client._sessions[s.request_id]
+            import tensorrt_llm._torch.visual_gen.executor as executor_module
+
+            original = executor_module.check_input_size
+
+            def interrupt(spec, value):
+                raise KeyboardInterrupt
+
+            executor_module.check_input_size = interrupt
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    s.advance(1)
+            finally:
+                executor_module.check_input_size = original
+            assert channel._submit is None and channel._reader is None  # nothing leaked
+            r = s.advance(1)
+            assert r.advance_index == 0 and pipe.advances == [{"controls": 1, "camera": 0}]
+
+
+def _worker_closes_after_the_reservation(h, s):
+    """Wrap plan_advance so the idle close (terminal retained, SessionClosed
+    routed) has landed after the submit was reserved and before it is published."""
+    channel = h.client._sessions[s.request_id]
+    original = channel.plan_advance
+
+    def reserve_then_wait_for_close(name):
+        fut = original(name)
+        _wait_until(lambda: _closed(channel), what="the idle close")
+        return fut
+
+    channel.plan_advance = reserve_then_wait_for_close
+    return channel
+
+
+def test_advance_returns_the_terminal_when_the_close_lands_between_reservation_and_publication(
+    harness,
+):
+    with harness(
+        CountingPipeline(initial=False), SimpleNamespace(delivery_slots=2, idle_timeout=0.15)
+    ) as h:
+        s = h.open()
+        channel = _worker_closes_after_the_reservation(h, s)
+        terminal = s.advance(1)
+        assert terminal.done and "idle timeout" in terminal.error
+        assert channel._submit is None and channel._reader is None
+        assert h.pipeline.advances == []  # nothing was sent
+        with pytest.raises(SessionEnded):
+            s.advance(2)
+
+
+def test_advance_async_returns_the_terminal_when_the_close_lands_between_reservation_and_publication(
+    harness,
+):
+    with harness(
+        CountingPipeline(initial=False), SimpleNamespace(delivery_slots=2, idle_timeout=0.15)
+    ) as h:
+
+        async def run():
+            channel = h.client.open_session(_request(1))
+            await asyncio.wrap_future(channel.opened)
+            s = VisualGenSession(1, h.client, channel)
+            _worker_closes_after_the_reservation(h, s)
+            terminal = await s.advance_async(1)
+            assert terminal.done and "idle timeout" in terminal.error
+            assert channel._submit is None and channel._reader is None
+            assert h.pipeline.advances == []
+            with pytest.raises(SessionEnded):
+                await s.advance_async(2)
+
+        asyncio.run(run())

@@ -32,12 +32,12 @@ waits, raises :class:`SessionError` instead of blocking.
 from __future__ import annotations
 
 import asyncio
-import threading
 from concurrent.futures import Future
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.visual_gen.executor import _EOF as _END
 from tensorrt_llm._torch.visual_gen.session import (
     SessionEnded,
     SessionError,
@@ -168,17 +168,25 @@ class SessionResultsIterator:
         return self
 
     def __next__(self) -> SessionResult:
-        if self._closed or self._session._ended:
+        self._check_open()
+        result = self._session._next_result()
+        if result is None:
             raise StopIteration
-        return self._session._next_result()
+        return result
 
     def __aiter__(self) -> "SessionResultsIterator":
         return self
 
     async def __anext__(self) -> SessionResult:
-        if self._closed or self._session._ended:
+        self._check_open()
+        result = await self._session._next_result_async()
+        if result is None:
             raise StopAsyncIteration
-        return await self._session._next_result_async()
+        return result
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise SessionError("results iterator is closed")
 
     def close(self) -> None:
         if not self._closed:
@@ -211,45 +219,42 @@ class VisualGenSession:
     returns that advance's result. The session holds one result at a time: asking
     for the next one expires the previous. ``close`` ends the session and is also
     the context manager's exit.
+
+    A session is driven from one thread or one asyncio task. One submit and one
+    result request can be in progress at a time; a second raises
+    :class:`SessionError` instead of waiting.
     """
 
     def __init__(self, request_id: int, client: "DiffusionRemoteClient", channel: "SessionChannel"):
-        self.request_id = request_id
+        del request_id  # the channel knows its session
         self._client = client
         self._channel = channel
-        self._capabilities: Dict[str, Any] = dict(channel.capabilities or {})
-        # Busy flags, never waited on: a second caller while one is inside gets an error.
-        self._submitting = threading.Lock()
-        self._receiving = threading.Lock()
-        self._held: Optional[Tuple[SessionResult, Optional[int]]] = None
-        self._closed = False
-        self._ended = False
-        self._queued_names = {
-            spec["name"]
-            for spec in self._capabilities.get("inputs", [])
-            if spec["policy"] == "queued"
-        }
+        self._held: Optional[SessionResult] = None
 
     # ---- introspection
+
+    @property
+    def request_id(self) -> int:
+        return self._channel.session_id
 
     @property
     def capabilities(self) -> Dict[str, Any]:
         """What the pipeline declared for this session.
 
-        ``inputs`` (name, policy, default, queue_depth), ``streams`` (name, kind,
-        dtype, max_shape, axis, rate, placement), ``initial_result``, ``length``,
-        ``lockstep``.
+        ``inputs`` (name, policy, default, queue_depth, max_bytes), ``streams``
+        (name, kind, dtype, max_shape, axis, rate, placement), ``initial_result``,
+        ``length``, ``lockstep``.
         """
-        return self._capabilities
+        return self._channel.capabilities or {}
 
     @property
     def closed(self) -> bool:
-        """Whether the session is over.
+        """Whether the session is over or ending.
 
         Closed by ``close()``, closed by the worker (idle timeout), or lost with
         the worker group.
         """
-        return self._closed or self._channel.closed.done()
+        return self._channel.closing() is not None
 
     # ---- inputs
 
@@ -260,38 +265,26 @@ class VisualGenSession:
         for a live input it is the next advance not yet dispatched when the value
         was admitted, so every advance from that index on reads this value or a
         later one for the same input. Raises ``ValueError`` (invalid input),
-        ``SessionQueueFull`` (retry after the next advance) or ``SessionEnded``.
+        ``SessionQueueFull`` (retry after the next advance, or the value exceeds
+        the input's byte bound) or ``SessionEnded``.
         """
-        fut = self._begin_submit(name, value)
+        fut = self._client.session_submit(self._channel, name, value)
         try:
             return fut.result()
         finally:
-            self._submitting.release()
+            self._channel.release_submit(fut)
 
     async def submit_async(self, name: str, value: Any) -> int:
-        fut = self._begin_submit(name, value)
+        fut = self._client.session_submit(self._channel, name, value)
         try:
             return await asyncio.wrap_future(fut)
         finally:
-            self._submitting.release()
-
-    def _begin_submit(self, name: str, value: Any, nothing_owed: bool = False) -> Future:
-        self._check_live()
-        if not self._submitting.acquire(blocking=False):
-            raise SessionError("a submit is already in progress on this session")
-        try:
-            return self._client.session_submit(
-                self._channel, name, value, nothing_owed=nothing_owed
-            )
-        except BaseException:
-            self._submitting.release()
-            raise
+            self._channel.release_submit(fut)
 
     # ---- results
 
     def results(self) -> SessionResultsIterator:
         """An iterator over the results not yet requested, in order."""
-        self._check_live()
         return SessionResultsIterator(self)
 
     def advance(self, value: Any) -> SessionResult:
@@ -306,155 +299,119 @@ class VisualGenSession:
         it ends before the submitted advance produces media, returns the
         terminal result instead. Later calls raise ``SessionEnded``.
         """
-        name = self._begin_advance()
+        name = self._advance_input()
+        self._channel.reserve_read()
         try:
-            index = self._submit_for_advance(name, value) if name is not None else None
-            fut = self._channel.request_next_result()
-        except BaseException:
-            self._receiving.release()
-            raise
-        try:
-            message = fut.result()
-        except BaseException:
-            self._channel.abandon(fut)
-            self._receiving.release()
-            raise
-        return self._end_advance(message, index)
+            self._note_activity_unless(self._release_held())
+            fut = self._submit_for_advance(name, value)
+            index = None
+            if fut is not None:
+                try:
+                    index = fut.result()
+                except SessionEnded:
+                    index = None
+                finally:
+                    self._channel.release_submit(fut)
+            return self._advance_result(index)
+        finally:
+            self._channel.release_read()
 
     async def advance_async(self, value: Any) -> SessionResult:
-        name = self._begin_advance()
+        name = self._advance_input()
+        self._channel.reserve_read()
         try:
-            index = await self._submit_for_advance_async(name, value) if name is not None else None
-            fut = self._channel.request_next_result()
-        except BaseException:
-            self._receiving.release()
-            raise
-        try:
-            message = await asyncio.wrap_future(fut)
-        except BaseException:
-            self._channel.abandon(fut)
-            self._receiving.release()
-            raise
-        return self._end_advance(message, index)
+            self._note_activity_unless(self._release_held())
+            fut = self._submit_for_advance(name, value)
+            index = None
+            if fut is not None:
+                try:
+                    index = await asyncio.wrap_future(fut)
+                except SessionEnded:
+                    index = None
+                finally:
+                    self._channel.release_submit(fut)
+            return await self._advance_result_async(index)
+        finally:
+            self._channel.release_read()
 
-    def _begin_advance(self) -> Optional[str]:
-        """Reserve the result request for one advance.
+    def _submit_for_advance(self, name: str, value: Any) -> Optional[Future]:
+        """Submit for an advance.
 
-        Checks that nothing older is owed and expires the previous lease. Returns
-        the queued input's name, or ``None`` when the next result is already a
-        terminal: then nothing is submitted and the terminal is what comes back.
+        Returns the admission future, or ``None`` when nothing was submitted: a
+        terminal is already next, or the session ended between the reservation
+        and the publication (the reservation was withdrawn). Either way the
+        result read that follows settles the call: the retained terminal once, or
+        ``SessionEnded`` after an explicit close.
         """
-        self._check_live()
-        if not self._capabilities.get("lockstep"):
+        try:
+            return self._client.session_submit(self._channel, name, value, for_advance=True)
+        except SessionEnded:
+            return None
+
+    def _advance_input(self) -> str:
+        caps = self.capabilities
+        if not caps.get("lockstep"):
             raise SessionError(
                 "advance() needs an interactive pipeline; use submit() and results()"
             )
-        if self._ended:
+        for spec in caps["inputs"]:
+            if spec["policy"] == "queued":
+                return spec["name"]
+        raise SessionError("interactive session without a queued input")
+
+    def _advance_result(self, index: Optional[int]) -> SessionResult:
+        result = self._take_result(expected_index=index)
+        if result is None:
             raise SessionEnded(f"session {self.request_id} has ended")
-        if not self._receiving.acquire(blocking=False):
-            raise SessionError("a result request is already in progress on this session")
-        try:
-            # A session that is gone answers with why, not with what it still owed.
-            if self._channel.failure is not None:
-                raise self._channel.failure
-            if self._channel.terminal_next():
-                self._release_held()
-                return None
-            if self._channel.closed_reason is not None:
-                raise SessionEnded(self._channel.closed_reason)
-            owed = self._channel.owed_media()
-            if owed is not None:
-                raise SessionError(f"{owed}; take it through results() before calling advance()")
-            self._release_held()
-            return next(iter(self._queued_names))
-        except BaseException:
-            self._receiving.release()
-            raise
-
-    def _submit_for_advance(self, name: str, value: Any) -> Optional[int]:
-        """Submit for ``advance``.
-
-        Returns the admission index, or ``None`` when the worker reports the
-        session ended: the next result is then the terminal and nothing was
-        submitted.
-        """
-        try:
-            fut = self._begin_submit(name, value, nothing_owed=True)
-        except SessionEnded:
-            return None  # the session ended before the submit was even sent
-        try:
-            return fut.result()
-        except SessionEnded:
-            return None
-        finally:
-            self._submitting.release()
-
-    async def _submit_for_advance_async(self, name: str, value: Any) -> Optional[int]:
-        try:
-            fut = self._begin_submit(name, value, nothing_owed=True)
-        except SessionEnded:
-            return None
-        try:
-            return await asyncio.wrap_future(fut)
-        except SessionEnded:
-            return None
-        finally:
-            self._submitting.release()
-
-    def _end_advance(self, message: SessionResultMessage, index: Optional[int]) -> SessionResult:
-        result = self._end_receive(message)
-        if not result.done and result.advance_index != index:
-            raise SessionError(
-                f"advance() admitted index {index} but the next result is advance "
-                f"{result.advance_index}; the worker broke result ordering"
-            )
         return result
 
-    def _next_result(self) -> SessionResult:
-        fut = self._begin_receive()
-        try:
-            message = fut.result()
-        except BaseException:
-            self._channel.abandon(fut)
-            self._receiving.release()
-            raise
-        return self._end_receive(message)
-
-    async def _next_result_async(self) -> SessionResult:
-        fut = self._begin_receive()
-        try:
-            message = await asyncio.wrap_future(fut)
-        except BaseException:
-            self._channel.abandon(fut)
-            self._receiving.release()
-            raise
-        return self._end_receive(message)
-
-    def _begin_receive(self) -> Future:
-        self._check_live()
-        if self._ended:
+    async def _advance_result_async(self, index: Optional[int]) -> SessionResult:
+        result = await self._take_result_async(expected_index=index)
+        if result is None:
             raise SessionEnded(f"session {self.request_id} has ended")
-        if not self._receiving.acquire(blocking=False):
-            raise SessionError("a result request is already in progress on this session")
-        try:
-            if not self._release_held():
-                # No slot goes back with this request, so nothing else tells the
-                # worker the client is active.
-                self._client.session_activity(self._channel)
-            return self._channel.request_next_result()
-        except BaseException:
-            self._receiving.release()
-            raise
+        return result
 
-    def _end_receive(self, message: SessionResultMessage) -> SessionResult:
+    def _next_result(self) -> Optional[SessionResult]:
+        """One read under the reservation.
+
+        Returns the next result, or ``None`` at the end of the stream.
+        """
+        self._channel.reserve_read()
         try:
-            result = self._channel.settle(message, self._build_result)
-            self._held = (result, result._slot_id)
-            if result.done:
-                self._ended = True
-            return result
+            self._note_activity_unless(self._release_held())
+            return self._take_result()
         finally:
-            self._receiving.release()
+            self._channel.release_read()
+
+    async def _next_result_async(self) -> Optional[SessionResult]:
+        self._channel.reserve_read()
+        try:
+            self._note_activity_unless(self._release_held())
+            return await self._take_result_async()
+        finally:
+            self._channel.release_read()
+
+    def _take_result(self, expected_index: Optional[int] = None) -> Optional[SessionResult]:
+        while True:
+            taken = self._channel.take(self._build_result, expected_index)
+            if taken is _END:
+                return None
+            if taken is not None:
+                self._held = taken
+                return taken
+            self._channel.notification().result()
+
+    async def _take_result_async(
+        self, expected_index: Optional[int] = None
+    ) -> Optional[SessionResult]:
+        while True:
+            taken = self._channel.take(self._build_result, expected_index)
+            if taken is _END:
+                return None
+            if taken is not None:
+                self._held = taken
+                return taken
+            await asyncio.wrap_future(self._channel.notification())
 
     # ---- close
 
@@ -464,11 +421,8 @@ class VisualGenSession:
         Queued inputs and undelivered results are discarded, in-flight work runs to
         its boundary, state is released. Idempotent.
         """
-        if self._closed:
-            return
-        self._closed = True
-        self._release_held()
         fut = self._client.session_close(self._channel)
+        self._release_held()
         try:
             fut.result()
         except RuntimeError:
@@ -476,14 +430,16 @@ class VisualGenSession:
             pass
 
     async def close_async(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        fut = self._client.session_close(self._channel)
         self._release_held()
+        closing = asyncio.wrap_future(fut)
         try:
-            await asyncio.wrap_future(self._client.session_close(self._channel))
+            await asyncio.shield(closing)
         except RuntimeError:
             pass
+        except asyncio.CancelledError:
+            closing.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
+            raise
 
     def __enter__(self) -> "VisualGenSession":
         return self
@@ -501,30 +457,35 @@ class VisualGenSession:
 
     # ---- internals
 
-    def _check_live(self) -> None:
-        if self._closed:
-            raise SessionError(f"session {self.request_id} is closed")
+    def _note_activity_unless(self, slot_returned: bool) -> None:
+        """Count a result request as activity for the worker's idle clock.
+
+        When no slot goes back with the request, nothing else would tell the
+        worker the client is still there.
+        """
+        if not slot_returned:
+            self._client.session_activity(self._channel)
 
     def _release_held(self) -> bool:
         """Expire the held result and give its slot back to the worker.
 
         Returns whether a slot was returned.
         """
-        if self._held is None:
+        held, self._held = self._held, None
+        if held is None:
             return False
-        result, slot_id = self._held
-        self._held = None
-        result._expire()
-        if slot_id is None or self.closed:
+        held._expire()
+        if held._slot_id is None or self._channel.lease_lost is not None:
             return False
-        self._client.session_return_slot(self._channel, slot_id)
+        self._client.session_return_slot(self._channel, held._slot_id)
         return True
 
     def _build_result(self, message: SessionResultMessage) -> SessionResult:
         outputs: Dict[str, torch.Tensor] = {}
-        if message.slot_id is not None and self._channel.delivery_slots is not None:
+        slots = self._channel.opened.result().slots
+        if message.slot_id is not None:
             for name, (shape, dtype_name) in message.streams.items():
-                outputs[name] = self._channel.delivery_slots.view(
+                outputs[name] = slots.view(
                     message.slot_id, name, tuple(shape), torch_dtype_from_str(dtype_name)
                 )
         result = SessionResult(
