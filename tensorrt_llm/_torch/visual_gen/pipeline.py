@@ -6,7 +6,7 @@ import itertools
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -273,9 +273,14 @@ class AdvanceOutcome:
     """The return type of ``advance`` and ``open_session``.
 
     The pipeline ran one unit of work on the session's state and wrote its
-    streams into the slot it was given; this reports when that work is complete
-    and whether the session is over. The slot itself records what was written.
+    streams into the slot it was given; this reports what it wrote, when that
+    work is complete, and whether the session is over.
     """
+
+    # The views written, by stream name: each one obtained from the slot's
+    # ``view`` and filled. Their shapes and dtypes become the result's. Empty
+    # when nothing was written (a rank with no slot, or a final empty advance).
+    written: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     # Recorded behind this rank's work for the call, its state updates and every
     # write into the slot. None only when all of it had completed on return.
@@ -661,10 +666,10 @@ class BasePipeline(nn.Module):
         model. Returns the session state, an object of the pipeline's choosing that
         the executor only holds and hands back, and the initial outcome.
         ``initial_slot`` is the executor's reserved slot when the capabilities
-        declare an initial result, else ``None``; the slot records what was put
-        into it and the outcome's ``event`` covers this rank's work, state and slot
-        alike, so a rank given no slot still returns one. If opening fails, release
-        partial allocations and raise.
+        declare an initial result, else ``None``; the outcome's ``written`` holds
+        the views put into it and its ``event`` covers this rank's work, state and
+        slot alike, so a rank given no slot still returns one. If opening fails,
+        release partial allocations and raise.
         """
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
@@ -682,7 +687,7 @@ class BasePipeline(nn.Module):
     ) -> AdvanceOutcome:
         """One unit of work. ``inputs`` holds one value per queued input and the
         current value of every live input. Write each produced stream into
-        ``slot.buffer(name, shape, dtype)``; the slot records what was written.
+        ``slot[name].view(shape, dtype)`` and return those views in ``written``.
         Return a CUDA event recorded behind this rank's state updates and its
         last write (``None`` when all of it has completed on return) and ``done``;
         a rank given no slot still returns the event for its state work. Advances

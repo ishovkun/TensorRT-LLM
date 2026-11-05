@@ -211,13 +211,13 @@ def test_slot_pool_reserve_release_and_views():
     b_id, b = pool.reserve()
     assert (a_id, b_id) == (0, 1)
     assert pool.reserve() is None
-    view = a.buffer("video", (1, 8, 4, 6, 3), torch.uint8)
+    view = a["video"].view((1, 8, 4, 6, 3), torch.uint8)
     view.fill_(7)
-    assert a.written()["video"] == ((1, 8, 4, 6, 3), torch.uint8)
+    assert a["video"].is_view_of(view) and not b["video"].is_view_of(view)
     with pytest.raises(ValueError):
-        a.buffer("video", (1, 9, 4, 6, 3), torch.uint8)
+        a["video"].view((1, 9, 4, 6, 3), torch.uint8)
     with pytest.raises(ValueError):
-        a.buffer("video", (1, 8, 4, 6, 3), torch.float32)
+        a["video"].view((1, 8, 4, 6, 3), torch.float32)
     pool.release(0)
     with pytest.raises(ValueError):
         pool.release(0)
@@ -231,11 +231,10 @@ def test_client_map_sees_the_worker_write_without_a_copy():
     handles = pool.export_handles()
     client = ClientSlotMap(handles)
     _, slot = pool.reserve()
-    worker_view = slot.buffer("video", (1, 2, 4, 6, 3), torch.uint8)
+    worker_view = slot["video"].view((1, 2, 4, 6, 3), torch.uint8)
     worker_view.fill_(0)
     worker_view[0, 1] = 9
-    shape, dtype = slot.written()["video"]
-    client_view = client.view(0, "video", shape, dtype)
+    client_view = client.view(0, "video", tuple(worker_view.shape), worker_view.dtype)
     assert client_view.shape == (1, 2, 4, 6, 3)
     assert int(client_view[0, 1, 0, 0, 0]) == 9 and int(client_view[0, 0, 0, 0, 0]) == 0
     assert client_view.data_ptr() == worker_view.data_ptr()  # same process, same bytes
@@ -349,22 +348,22 @@ def _two_stream_caps(n=4):
     )
 
 
-def test_slot_rejects_invalid_extents_before_recording_anything():
+def test_slot_rejects_invalid_extents():
     pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"), local=True)
     _, slot = pool.reserve()
     import numpy as np
 
+    video = slot["video"]
     for bad in ((-1,), (0,), (5,), (2, 2), (1.5,), (torch.tensor(1.5),), (True,), ("2",)):
         with pytest.raises(ValueError):
-            slot.buffer("video", bad, torch.float32)
+            video.view(bad, torch.float32)
     with pytest.raises(ValueError, match="declared"):
-        slot.buffer("video", (2,), torch.float16)
-    assert slot.written() == {}  # a refused request left nothing written
-    view = slot.buffer("video", (3,), torch.float32)
-    assert view.shape == (3,) and slot.written() == {"video": ((3,), torch.float32)}
-    slot.reset()
+        video.view((2,), torch.float16)
+    view = video.view((3,), torch.float32)
+    assert view.shape == (3,) and video.is_view_of(view)
+    assert not video.is_view_of(torch.zeros(3))  # someone else's memory
     for ok in ((np.int64(2),), (torch.tensor(2),)):  # integer-like scalars index fine
-        assert slot.buffer("video", ok, torch.float32).shape == (2,)
+        assert video.view(ok, torch.float32).shape == (2,)
     pool.close()
 
 
@@ -446,7 +445,7 @@ def test_registered_pointer_is_the_exported_storage_pointer(monkeypatch):
     assert sorted(registered) == sorted(exported)
     client = ClientSlotMap(pool.export_handles())
     view = client.view(0, "video", (4,), torch.float32)
-    assert view.data_ptr() == pool._slots[0]._buffers["video"].storage.data_ptr()
+    assert view.data_ptr() == pool._slots[0]["video"].storage.data_ptr()
     client.close()
     pool.close()
     pool.close()  # repeated close is harmless

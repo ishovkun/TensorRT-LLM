@@ -54,7 +54,7 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionSubmit,
 )
 from tensorrt_llm._torch.visual_gen.session_state import SessionState
-from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, SlotPool
+from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, DeliverySlot, SlotPool
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -971,9 +971,15 @@ class DiffusionExecutor:
             SessionOpened(session_id, capabilities=caps.public(), slots=pool.export_handles())
         )
         if initial_slot is not None:
-            written = initial_slot.written()
-            if written:
-                self.response_queue.put(state.media_result(None, initial_index, written))
+            if outcome.written:
+                try:
+                    shapes = self._written_shapes(initial_slot, outcome.written)
+                    message = state.media_result(None, initial_index, shapes)
+                except ValueError as e:
+                    pool.release(initial_index)
+                    self.response_queue.put(state.terminal_result(error=str(e)))
+                    return
+                self.response_queue.put(message)
             else:
                 pool.release(initial_index)
         if outcome.done:
@@ -1068,10 +1074,10 @@ class DiffusionExecutor:
                 state.terminal_result(error=error or f"advance {index} failed on another rank")
             )
             return
-        written = slot.written()
-        if written:
+        if outcome.written:
             try:
-                message = state.media_result(index, slot_id, written)
+                shapes = self._written_shapes(slot, outcome.written)
+                message = state.media_result(index, slot_id, shapes)
             except ValueError as e:
                 pool.release(slot_id)
                 self.response_queue.put(state.terminal_result(error=str(e)))
@@ -1088,6 +1094,21 @@ class DiffusionExecutor:
                 return
         if outcome.done or state.exhausted():
             self.response_queue.put(state.terminal_result())
+
+    @staticmethod
+    def _written_shapes(
+        slot: DeliverySlot, written: Dict[str, torch.Tensor]
+    ) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype]]:
+        """The shape and dtype of each view a pipeline reports as written, after
+        checking that each one is a view into the slot it was given."""
+        shapes = {}
+        for name, tensor in written.items():
+            if name not in slot:
+                raise ValueError(f"stream {name!r} was not declared")
+            if not slot[name].is_view_of(tensor):
+                raise ValueError(f"stream {name!r}: the reported tensor is not a view of the slot")
+            shapes[name] = (tuple(tensor.shape), tensor.dtype)
+        return shapes
 
     def _service_session_commands(
         self,

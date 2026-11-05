@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import math
 import operator
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -37,23 +36,13 @@ from tensorrt_llm._torch.visual_gen.session_protocol import SlotHandles
 from tensorrt_llm.logger import logger
 
 
-@dataclass
-class _StreamBuffer:
-    spec: SessionStreamSpec
-    storage: torch.Tensor  # flat uint8 of spec.max_bytes
-    handle: Dict[str, Any]  # what the client maps it from; made once, at allocation
-    shape: Optional[Tuple[int, ...]] = None
-    dtype: Optional[torch.dtype] = None
-    nbytes: int = 0
-
-
 def check_extent(
     spec: SessionStreamSpec, shape: Tuple[int, ...], dtype: torch.dtype
 ) -> Tuple[int, ...]:
     """The shape a stream may carry in one result, or ``ValueError``: the declared
     dtype, the declared rank, every extent a positive integer no larger than the
-    declared maximum. Shared by the slot (before a view is made) and by the
-    worker's state (before a result is published)."""
+    declared maximum. Shared by the slot (before a view is handed out) and by
+    the worker's state (before a result is published)."""
     if dtype != spec.dtype:
         raise ValueError(f"stream {spec.name!r}: {dtype} written, {spec.dtype} declared")
     if len(shape) != len(spec.max_shape):
@@ -80,47 +69,49 @@ def check_extent(
     return tuple(extents)
 
 
+class StreamBuffer:
+    """Fixed storage for one stream in one slot, sized for the stream's largest
+    result. Hands out views of a prefix in the shape of one result; a view is the
+    storage, no copy."""
+
+    def __init__(self, spec: SessionStreamSpec, storage: torch.Tensor, handle: Dict[str, Any]):
+        self.spec = spec
+        self.storage = storage  # flat uint8 of spec.max_bytes
+        self.handle = handle  # what the client maps it from; made once, at allocation
+
+    @property
+    def device(self) -> torch.device:
+        return self.storage.device
+
+    def view(self, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        """A tensor of ``shape`` and ``dtype`` over the start of the storage. Raises
+        ``ValueError`` when the request exceeds what the stream declared."""
+        shape = check_extent(self.spec, shape, dtype)
+        nbytes = math.prod(shape) * dtype.itemsize
+        return self.storage[:nbytes].view(dtype).view(shape)
+
+    def is_view_of(self, tensor: torch.Tensor) -> bool:
+        """Whether ``tensor`` views this storage: what a pipeline may report as written."""
+        return tensor.untyped_storage().data_ptr() == self.storage.untyped_storage().data_ptr()
+
+
 class DeliverySlot:
-    """One slot: a buffer per declared stream plus the shapes written into them.
+    """One slot: a ``StreamBuffer`` per declared stream, by name. ``slot["video"]``
+    is the buffer; the pipeline writes into a view of it and reports that view in
+    its outcome. The slot keeps no record of writes."""
 
-    The pipeline asks for ``buffer(name, shape, dtype)`` and copies into the view it
-    gets back. The executor reads ``written()`` after the advance to build the result
-    message and ``reset()`` when the slot is reserved again.
-    """
-
-    def __init__(self, buffers: Dict[str, _StreamBuffer]) -> None:
+    def __init__(self, buffers: Dict[str, StreamBuffer]) -> None:
         self._buffers = buffers
+
+    def __getitem__(self, name: str) -> StreamBuffer:
+        return self._buffers[name]
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._buffers
 
     @property
     def stream_names(self) -> Tuple[str, ...]:
         return tuple(self._buffers)
-
-    def device_of(self, name: str) -> torch.device:
-        return self._buffers[name].storage.device
-
-    def buffer(self, name: str, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        """A tensor view of ``shape`` and ``dtype`` over this slot's storage for
-        stream ``name``. Raises ``ValueError`` when the request exceeds what the
-        stream declared."""
-        buf = self._buffers[name]
-        shape = check_extent(buf.spec, shape, dtype)
-        nbytes = math.prod(shape) * dtype.itemsize
-        view = buf.storage[:nbytes].view(dtype).view(shape)
-        # Recorded only once the view exists: a refused request leaves nothing written.
-        buf.shape, buf.dtype, buf.nbytes = shape, dtype, nbytes
-        return view
-
-    def written(self) -> Dict[str, Tuple[Tuple[int, ...], torch.dtype]]:
-        """Stream name to the shape and dtype written since the last reset."""
-        return {
-            name: (buf.shape, buf.dtype)
-            for name, buf in self._buffers.items()
-            if buf.shape is not None
-        }
-
-    def reset(self) -> None:
-        for buf in self._buffers.values():
-            buf.shape, buf.dtype, buf.nbytes = None, None, 0
 
 
 class SlotPool:
@@ -163,7 +154,7 @@ class SlotPool:
             raise
         self._free.reverse()  # reserve() pops from the end: slot 0 first
 
-    def _allocate(self, spec: SessionStreamSpec) -> _StreamBuffer:
+    def _allocate(self, spec: SessionStreamSpec) -> StreamBuffer:
         if spec.placement == "device":
             storage = torch.empty(spec.max_bytes, dtype=torch.uint8, device=self.device)
             handle = SharedTensorContainer.from_tensor(storage, local=self.local).dump_to_dict()
@@ -173,7 +164,7 @@ class SlotPool:
             # address, so the handle is made before the address is page-locked.
             handle = SharedTensorContainer.from_tensor(storage, local=self.local).dump_to_dict()
             _page_lock(storage, self._registered)
-        return _StreamBuffer(spec=spec, storage=storage, handle=handle)
+        return StreamBuffer(spec, storage, handle)
 
     @property
     def free_count(self) -> int:
@@ -187,13 +178,11 @@ class SlotPool:
         return self._slots[slot_id]
 
     def reserve(self) -> Optional[Tuple[int, DeliverySlot]]:
-        """A free slot, reset, with its index; ``None`` when every slot is out."""
+        """A free slot with its index; ``None`` when every slot is out."""
         if not self._free:
             return None
         slot_id = self._free.pop()
-        slot = self._slots[slot_id]
-        slot.reset()
-        return slot_id, slot
+        return slot_id, self._slots[slot_id]
 
     def release(self, slot_id: int) -> None:
         if slot_id in self._free:
@@ -208,9 +197,7 @@ class SlotPool:
     def export_handles(self) -> List[SlotHandles]:
         """One handle dict per slot per stream, for ``SessionOpened``. Each handle is
         consumed exactly once by the client's mapping."""
-        return [
-            {name: slot._buffers[name].handle for name in slot.stream_names} for slot in self._slots
-        ]
+        return [{name: slot[name].handle for name in slot.stream_names} for slot in self._slots]
 
     def close(self) -> None:
         for storage in self._registered:
@@ -283,4 +270,6 @@ __all__ = [
     "ClientSlotMap",
     "DeliverySlot",
     "SlotPool",
+    "StreamBuffer",
+    "check_extent",
 ]

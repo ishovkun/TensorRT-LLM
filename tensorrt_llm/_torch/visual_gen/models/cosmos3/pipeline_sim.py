@@ -1141,9 +1141,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
             frames = check_video_safety(frames, self.safety_checker)
             if frames is None:
                 raise ValueError("Cosmos3 Sim session: the video was blocked by the guardrails")
-        view = slot.buffer("video", tuple(frames.shape), torch.uint8)
+        view = slot["video"].view(tuple(frames.shape), torch.uint8)
         view.copy_(frames, non_blocking=True)
-        return AdvanceOutcome(event=self._completion_event())
+        return AdvanceOutcome(event=self._completion_event(), written={"video": view})
 
     def _completion_event(self) -> Optional[torch.cuda.Event]:
         """An event recorded behind everything this rank queued on the current
