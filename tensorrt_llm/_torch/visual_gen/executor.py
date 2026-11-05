@@ -939,7 +939,7 @@ class DiffusionExecutor:
             return
 
         self._broadcast_session_tag(("open_go",))
-        initial_slot = pool.reserve() if caps.initial_result else None
+        initial_index, initial_slot = pool.reserve() if caps.initial_result else (None, None)
         outcome = None
         open_error: Optional[Exception] = None
         try:
@@ -973,9 +973,9 @@ class DiffusionExecutor:
         if initial_slot is not None:
             written = initial_slot.written()
             if written:
-                self.response_queue.put(state.media_result(None, initial_slot.slot_id, written))
+                self.response_queue.put(state.media_result(None, initial_index, written))
             else:
-                pool.release(initial_slot.slot_id)
+                pool.release(initial_index)
         if outcome.done:
             self.response_queue.put(state.terminal_result())
 
@@ -1045,7 +1045,7 @@ class DiffusionExecutor:
                 logger.info(f"Worker {self.device_id}: session {session_id} closed")
 
     def _advance_once(self, state: SessionState, pool: SlotPool, pipeline_state: Any) -> None:
-        slot = pool.reserve()
+        slot_id, slot = pool.reserve()
         index, inputs = state.dispatch()
         self._broadcast_session_tag(("advance", inputs))
         outcome = None
@@ -1063,7 +1063,7 @@ class DiffusionExecutor:
             error = str(e)
         all_ok = self._finish_advance(outcome, failed=error is not None)
         if not all_ok:
-            pool.release(slot.slot_id)
+            pool.release(slot_id)
             self.response_queue.put(
                 state.terminal_result(error=error or f"advance {index} failed on another rank")
             )
@@ -1071,14 +1071,14 @@ class DiffusionExecutor:
         written = slot.written()
         if written:
             try:
-                message = state.media_result(index, slot.slot_id, written)
+                message = state.media_result(index, slot_id, written)
             except ValueError as e:
-                pool.release(slot.slot_id)
+                pool.release(slot_id)
                 self.response_queue.put(state.terminal_result(error=str(e)))
                 return
             self.response_queue.put(message)
         else:
-            pool.release(slot.slot_id)
+            pool.release(slot_id)
             if not outcome.done:
                 self.response_queue.put(
                     state.terminal_result(

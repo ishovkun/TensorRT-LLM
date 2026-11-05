@@ -88,8 +88,7 @@ class DeliverySlot:
     message and ``reset()`` when the slot is reserved again.
     """
 
-    def __init__(self, slot_id: int, buffers: Dict[str, _StreamBuffer]) -> None:
-        self.slot_id = slot_id
+    def __init__(self, buffers: Dict[str, _StreamBuffer]) -> None:
         self._buffers = buffers
 
     @property
@@ -129,8 +128,10 @@ class SlotPool:
 
     ``export_handles()`` hands the client one shared-tensor handle per slot per
     stream; the client maps them once for the session. ``reserve()`` returns a free
-    slot or ``None``; ``release(slot_id)`` returns it when the client has moved past
-    its result. ``close()`` drops the storage.
+    slot with its index, the name the client knows it by, or ``None``;
+    ``release(slot_id)`` returns it when the client has moved past its result.
+    ``close()`` drops the storage. A slot does not know its index: the pool is the
+    only owner of positions.
     """
 
     def __init__(
@@ -153,7 +154,7 @@ class SlotPool:
         try:
             for slot_id in range(num_slots):
                 buffers = {spec.name: self._allocate(spec) for spec in capabilities.streams}
-                self._slots.append(DeliverySlot(slot_id, buffers))
+                self._slots.append(DeliverySlot(buffers))
                 self._free.append(slot_id)
         except BaseException:
             # A later allocation failed: every page-lock taken so far is undone
@@ -185,12 +186,14 @@ class SlotPool:
     def slot(self, slot_id: int) -> DeliverySlot:
         return self._slots[slot_id]
 
-    def reserve(self) -> Optional[DeliverySlot]:
+    def reserve(self) -> Optional[Tuple[int, DeliverySlot]]:
+        """A free slot, reset, with its index; ``None`` when every slot is out."""
         if not self._free:
             return None
-        slot = self._slots[self._free.pop()]
+        slot_id = self._free.pop()
+        slot = self._slots[slot_id]
         slot.reset()
-        return slot
+        return slot_id, slot
 
     def release(self, slot_id: int) -> None:
         if slot_id in self._free:

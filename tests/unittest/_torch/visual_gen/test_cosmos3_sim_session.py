@@ -150,7 +150,7 @@ def _session_video(model, prepared, seed, num_latent_frames):  # noqa: F811
         ro = pipe._rollout_begin(
             _request(), prepared, cond_ids=text_ids, cond_mask=text_mask, seed=seed
         )
-        slot = pool.reserve()
+        slot_id, slot = pool.reserve()
         session, outcome = pipe._session_start(
             ro, prepared, slot, domain_id=2, use_guardrails=False, remaining=None
         )
@@ -158,21 +158,21 @@ def _session_video(model, prepared, seed, num_latent_frames):  # noqa: F811
             outcome.event.synchronize()
         shape, dtype = slot.written()["video"]
         frames.append(slot.buffer("video", shape, dtype).clone())
-        pool.release(slot.slot_id)
+        pool.release(slot_id)
         rows = prepared.action_latents
         f = 1
         while f < num_latent_frames:
             f0, f1 = session.peek_range()
             assert f0 == f
             chunk_rows = rows[0, (f0 - 1) * A : (f1 - 1) * A]
-            slot = pool.reserve()
+            slot_id, slot = pool.reserve()
             outcome = pipe.advance(session, {"actions": chunk_rows}, slot)
             if outcome.event is not None:
                 outcome.event.synchronize()
             shape, dtype = slot.written()["video"]
             assert shape[1] == 4 * (f1 - f0)
             frames.append(slot.buffer("video", shape, dtype).clone())
-            pool.release(slot.slot_id)
+            pool.release(slot_id)
             f = f1
         pipe.close_session(session)
     pool.close()

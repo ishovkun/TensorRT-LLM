@@ -207,9 +207,9 @@ def test_slot_pool_reserve_release_and_views():
     caps = steered_caps()
     pool = SlotPool(caps, num_slots=2, device=torch.device("cpu"))
     assert pool.free_count == 2
-    a = pool.reserve()
-    b = pool.reserve()
-    assert (a.slot_id, b.slot_id) == (0, 1)
+    a_id, a = pool.reserve()
+    b_id, b = pool.reserve()
+    assert (a_id, b_id) == (0, 1)
     assert pool.reserve() is None
     view = a.buffer("video", (1, 8, 4, 6, 3), torch.uint8)
     view.fill_(7)
@@ -221,7 +221,7 @@ def test_slot_pool_reserve_release_and_views():
     pool.release(0)
     with pytest.raises(ValueError):
         pool.release(0)
-    assert pool.reserve().slot_id == 0
+    assert pool.reserve()[0] == 0
     pool.close()
 
 
@@ -230,7 +230,7 @@ def test_client_map_sees_the_worker_write_without_a_copy():
     pool = SlotPool(caps, num_slots=1, device=torch.device("cpu"))
     handles = pool.export_handles()
     client = ClientSlotMap(handles)
-    slot = pool.reserve()
+    _, slot = pool.reserve()
     worker_view = slot.buffer("video", (1, 2, 4, 6, 3), torch.uint8)
     worker_view.fill_(0)
     worker_view[0, 1] = 9
@@ -351,7 +351,7 @@ def _two_stream_caps(n=4):
 
 def test_slot_rejects_invalid_extents_before_recording_anything():
     pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"), local=True)
-    slot = pool.reserve()
+    _, slot = pool.reserve()
     import numpy as np
 
     for bad in ((-1,), (0,), (5,), (2, 2), (1.5,), (torch.tensor(1.5),), (True,), ("2",)):
