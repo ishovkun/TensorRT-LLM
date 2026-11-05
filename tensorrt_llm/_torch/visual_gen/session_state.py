@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Session state owned by the executor's worker loop on rank 0: the input queues
-and live values, the advance condition, the stream cursors and the terminal
+and live values, the advance condition, the stream positions and the terminal
 result. Built from the pipeline's ``SessionCapabilities``; speaks to the client
 only through the messages of ``session_protocol.py``.
 """
@@ -32,7 +32,7 @@ from .session_protocol import ResultType, SessionEnded, SessionQueueFull, Sessio
 class SessionState:
     """Executor-side bookkeeping for one open session on rank 0.
 
-    Holds the queues, the live values, the counters and the terminal result, and
+    Holds the input buffers, the counters, the stream positions and whether it has ended, and
     answers the advance condition. The worker loop runs one advance at a time on
     one thread, so "in flight" and "initialized" are positions in that loop, not
     state kept here. It does not touch slots: the caller passes the
@@ -55,12 +55,11 @@ class SessionState:
         self.next_advance = 0
         # Results published so far, the terminal included; the next one gets this number.
         self.next_sequence = 0
-        # Per stream: units (frames, samples) published so far along its axis.
-        self.cursors: Dict[str, int] = {s.name: 0 for s in capabilities.streams}
-        # The terminal result once the session is done or failed; built once.
-        self.terminal: Optional[SessionResultMessage] = None
-        # Set by the close command or the idle timeout; the loop ends at the next check.
-        self.closing = False
+        # Per stream: where its next result starts, in that stream's units (frames, samples).
+        self.stream_positions: Dict[str, int] = {s.name: 0 for s in capabilities.streams}
+        # True once the terminal result is published: no more input or advances;
+        # slot returns are still served until the client closes.
+        self.ended = False
 
     # ---- admission
 
@@ -69,11 +68,8 @@ class SessionState:
         the advance that will consume the value; for a live input the next advance to
         be dispatched. Raises ``ValueError`` (the validator),
         ``SessionQueueFull`` or ``SessionEnded``; a rejection changes nothing."""
-        if self.terminal is not None or self.closing:
-            raise SessionEnded(
-                f"session {self.session_id}: "
-                + ("closing" if self.closing else "a terminal result exists")
-            )
+        if self.ended:
+            raise SessionEnded(f"session {self.session_id}: a terminal result exists")
         spec = self.capabilities.input(name)
         if spec.validator is not None:
             spec.validator(value)
@@ -102,7 +98,9 @@ class SessionState:
     # ---- advance
 
     def can_advance(self, free_slots: int) -> bool:
-        if self.closing or self.terminal is not None:
+        """The advance condition: the session has not ended and is not past a
+        declared length, a delivery slot is free, and every queue input has a value."""
+        if self.ended:
             return False
         if free_slots <= 0:
             return False
@@ -154,9 +152,9 @@ class SessionState:
         position: Dict[str, Tuple[int, int]] = {}
         for name, (extents, dtype, count) in checked.items():
             streams[name] = (extents, dtype)
-            start = self.cursors[name]
+            start = self.stream_positions[name]
             position[name] = (start, count)
-            self.cursors[name] = start + count
+            self.stream_positions[name] = start + count
         message = SessionResultMessage(
             session_id=self.session_id,
             sequence=self.next_sequence,
@@ -169,9 +167,12 @@ class SessionState:
         return message
 
     def terminal_result(self, error: Optional[str] = None) -> SessionResultMessage:
-        if self.terminal is not None:
-            return self.terminal
-        self.terminal = SessionResultMessage(
+        """End the session: the one terminal result, ``error`` saying why if it did
+        not complete normally. Published once; a second call is a bug."""
+        if self.ended:
+            raise RuntimeError(f"session {self.session_id}: the terminal result was already built")
+        self.ended = True
+        message = SessionResultMessage(
             session_id=self.session_id,
             sequence=self.next_sequence,
             advance_index=None,
@@ -182,8 +183,9 @@ class SessionState:
             error=error,
         )
         self.next_sequence += 1
-        return self.terminal
+        return message
 
     def discard_inputs(self) -> None:
+        """Drop every queued value; the close path, nothing will consume them."""
         for spec in self.capabilities.queue_inputs:
             self.inputs[spec.name].clear()

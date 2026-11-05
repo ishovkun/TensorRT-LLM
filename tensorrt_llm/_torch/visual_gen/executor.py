@@ -982,34 +982,40 @@ class DiffusionExecutor:
         idle_timeout = self._session_idle_timeout()
         fatal = False
         try:
-            while not state.closing:
+            while True:
                 if state.can_advance(pool.free_count):
                     # Admissions that arrived during the last advance go first, so a
                     # live value submitted before this dispatch is seen by it.
-                    self._service_session_commands(state, pool, pipeline_state, block=False)
+                    _, close = self._service_session_commands(
+                        state, pool, pipeline_state, block=False
+                    )
+                    if close:
+                        break
                     if not state.can_advance(pool.free_count):
                         continue
                     self._advance_once(state, pool, pipeline_state)
                     continue
-                if state.terminal is None and state.exhausted():
+                if not state.ended and state.exhausted():
                     self.response_queue.put(state.terminal_result())
                     continue
                 # Only the client can make progress now; wait for it.
-                received = self._service_session_commands(
+                received, close = self._service_session_commands(
                     state, pool, pipeline_state, block=True, timeout=idle_timeout
                 )
+                if close:
+                    break
                 if not received:
                     logger.warning(
                         f"Worker {self.device_id}: session {session_id} idle for "
                         f"{idle_timeout:.0f}s; closing it"
                     )
-                    if state.terminal is None:
+                    if not state.ended:
                         self.response_queue.put(
                             state.terminal_result(
                                 error=f"session idle timeout ({idle_timeout:.0f}s) expired"
                             )
                         )
-                    state.closing = True
+                    break
         except FatalRankError:
             fatal = True
             raise
@@ -1091,43 +1097,54 @@ class DiffusionExecutor:
         *,
         block: bool,
         timeout: Optional[float] = None,
-    ) -> bool:
+    ) -> Tuple[bool, bool]:
         """Handle every command currently on either socket, controls first. With
         ``block`` wait for the first one up to ``timeout`` seconds (``None``: no
-        limit); returns False when that wait expired. Both sockets are watched
-        while waiting, in slices of ``POLL_TIMEOUT``, so a slot return or a close
-        is seen whatever sits unread on the request socket."""
+        limit). Returns (received, close): whether the wait produced anything, and
+        whether a close (or shutdown) arrived, in which case the session is to be
+        torn down now and the commands behind it were answered as strays. Both
+        sockets are watched while waiting, in slices of ``POLL_TIMEOUT``, so a slot
+        return or a close is seen whatever sits unread on the request socket."""
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             commands = self._drain_controls() + self.requests_ipc.drain()
             if commands:
-                for message in commands:
-                    self._handle_session_command(message, state, pool, pipeline_state)
-                return True
+                return True, self._handle_session_commands(commands, state, pool, pipeline_state)
             if not block:
-                return True
+                return True, False
             if deadline is not None and time.monotonic() >= deadline:
-                return False
+                return False, False
             try:
                 message = self.requests_ipc.get(timeout=POLL_TIMEOUT)
             except queue.Empty:
                 continue
-            self._handle_session_command(message, state, pool, pipeline_state)
-            for message in self._drain_controls() + self.requests_ipc.drain():
-                self._handle_session_command(message, state, pool, pipeline_state)
-            return True
+            commands = [message] + self._drain_controls() + self.requests_ipc.drain()
+            return True, self._handle_session_commands(commands, state, pool, pipeline_state)
+
+    def _handle_session_commands(
+        self, commands: List[Any], state: SessionState, pool: SlotPool, pipeline_state: Any
+    ) -> bool:
+        """Handle commands in order until one closes the session; the rest are
+        answered as strays. Returns whether the session is to be closed."""
+        for i, message in enumerate(commands):
+            if self._handle_session_command(message, state, pool, pipeline_state):
+                for stray in commands[i + 1 :]:
+                    self._answer_stray_command(stray)
+                return True
+        return False
 
     def _handle_session_command(
         self, message: Any, state: SessionState, pool: SlotPool, pipeline_state: Any
-    ) -> None:
+    ) -> bool:
+        """Handle one command. Returns True when it closes the session: the close
+        command, or a shutdown."""
         if message is None:
             self._shutdown_requested = True
-            state.closing = True
-            return
+            return True
         if isinstance(message, SessionSubmit):
             if message.session_id != state.session_id:
                 self._answer_stray_command(message)
-                return
+                return False
             reply = SessionAdmitted(state.session_id)
             try:
                 # The pipeline's schema check first; ``admit`` mutates nothing
@@ -1141,21 +1158,21 @@ class DiffusionExecutor:
             except (ValueError, TypeError) as e:
                 reply.error, reply.failure = str(e), AdmissionFailure.INVALID
             self.response_queue.put(reply)
-            return
+            return False
         if isinstance(message, SessionControl):
             if message.type is ControlType.ACTIVITY:
-                return  # its arrival already restarted the idle wait
+                return False  # its arrival already restarted the idle wait
             if message.session_id != state.session_id:
                 self._answer_stray_command(message)
-                return
+                return False
+            if message.type is ControlType.CLOSE:
+                return True
             if message.type is ControlType.SLOT_RETURN:
                 try:
                     pool.release(message.slot_id)
                 except ValueError as e:
                     logger.warning(f"Worker {self.device_id}: {e}")
-            elif message.type is ControlType.CLOSE:
-                state.closing = True
-            return
+            return False
         if isinstance(message, SessionOpen):
             # The client refuses a second open itself; one that was already in
             # flight is refused here rather than queued behind an open-ended session.
@@ -1167,11 +1184,12 @@ class DiffusionExecutor:
                     error_type="capacity",
                 )
             )
-            return
+            return False
         # A generate() arriving behind this session waits for it.
         if isinstance(message, DiffusionRequest):
             message.refs_from_shm()
         self._deferred.append(message)
+        return False
 
     def _session_follower(self, req: DiffusionRequest) -> None:
         """Ranks other than 0: run the same pipeline calls as rank 0, in the order

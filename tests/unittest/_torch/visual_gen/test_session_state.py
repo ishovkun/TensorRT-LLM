@@ -147,8 +147,8 @@ def test_advance_condition():
     state.dispatch()
     state.admit("controls", "b")
     assert state.can_advance(free_slots=1)
-    state.closing = True
-    assert not state.can_advance(free_slots=1)
+    state.terminal_result()
+    assert not state.can_advance(free_slots=1)  # ended
 
 
 def test_finite_session_exhausts_and_refuses_extra_values():
@@ -164,13 +164,9 @@ def test_finite_session_exhausts_and_refuses_extra_values():
     assert state.exhausted()
 
 
-def test_admission_refused_after_terminal_and_while_closing():
+def test_admission_refused_after_the_terminal():
     state = SessionState(1, lockstep_caps())
     state.terminal_result()
-    with pytest.raises(SessionEnded):
-        state.admit("controls", 1)
-    state = SessionState(2, lockstep_caps())
-    state.closing = True
     with pytest.raises(SessionEnded):
         state.admit("controls", 1)
 
@@ -200,7 +196,8 @@ def test_media_result_validates_and_advances_cursors():
     terminal = state.terminal_result()
     assert terminal.type is ResultType.TERMINAL and terminal.error is None
     assert terminal.sequence == 2
-    assert state.terminal_result() is terminal  # exactly one
+    with pytest.raises(RuntimeError):
+        state.terminal_result()  # exactly one
 
 
 # --------------------------------------------------------------------------- slot pool
@@ -375,17 +372,17 @@ def test_media_result_validates_everything_before_moving_any_cursor():
     state = SessionState(1, _two_stream_caps())
     with pytest.raises(ValueError, match="audio"):
         state.media_result(0, 0, {"video": ((2,), torch.float32), "audio": ((5,), torch.float32)})
-    assert state.cursors == {"video": 0, "audio": 0} and state.next_sequence == 0
+    assert state.stream_positions == {"video": 0, "audio": 0} and state.next_sequence == 0
     for bad in ((-1,), (0,), (1, 1), (torch.tensor(1.5),), (True,), (1.5,)):
         with pytest.raises(ValueError):
             state.media_result(0, 0, {"video": (bad, torch.float32)})
-    assert state.cursors == {"video": 0, "audio": 0} and state.next_sequence == 0
+    assert state.stream_positions == {"video": 0, "audio": 0} and state.next_sequence == 0
     first = state.media_result(
         0, 0, {"video": ((1,), torch.float32), "audio": ((4,), torch.float32)}
     )
     assert first.position == {"video": (0, 1), "audio": (0, 4)} and first.sequence == 0
     last = state.media_result(1, 1, {"video": ((4,), torch.float32)})
-    assert last.position == {"video": (1, 4)} and state.cursors == {"video": 5, "audio": 4}
+    assert last.position == {"video": (1, 4)} and state.stream_positions == {"video": 5, "audio": 4}
 
 
 def test_partial_pool_construction_undoes_every_registration(monkeypatch):
