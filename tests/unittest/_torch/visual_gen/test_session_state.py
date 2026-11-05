@@ -25,7 +25,7 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     StreamSpec,
 )
 from tensorrt_llm._torch.visual_gen.session_protocol import (
-    ResultKind,
+    ResultType,
     SessionEnded,
     SessionQueueFull,
 )
@@ -197,7 +197,7 @@ def test_media_result_validates_and_advances_cursors():
     first = state.media_result(0, 0, written)
     assert first.sequence == 0 and first.advance_index == 0 and first.slot_id == 0
     assert first.position == {"video": (0, 8), "audio": (0, 1000)}
-    assert first.streams["video"] == ((1, 8, 4, 6, 3), "torch.uint8")
+    assert first.streams["video"] == ((1, 8, 4, 6, 3), torch.uint8)
     second = state.media_result(1, 1, {"video": written["video"]})
     assert second.sequence == 1
     assert second.position == {"video": (8, 8)}  # audio omitted: its cursor stays
@@ -208,7 +208,7 @@ def test_media_result_validates_and_advances_cursors():
     with pytest.raises(ValueError):
         state.media_result(2, 0, {})
     terminal = state.terminal_result()
-    assert terminal.kind is ResultKind.TERMINAL and terminal.error is None
+    assert terminal.type is ResultType.TERMINAL and terminal.error is None
     assert terminal.sequence == 2
     assert state.terminal_result() is terminal  # exactly one
 

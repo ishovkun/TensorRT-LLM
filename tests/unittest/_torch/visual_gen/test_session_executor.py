@@ -50,11 +50,11 @@ from tensorrt_llm._torch.visual_gen.pipeline import (
     StreamSpec,
 )
 from tensorrt_llm._torch.visual_gen.session_protocol import (
-    ResultKind,
-    SessionActivity,
+    ControlType,
+    ResultType,
     SessionAdmitted,
-    SessionClose,
     SessionClosed,
+    SessionControl,
     SessionEnded,
     SessionError,
     SessionLeaseExpired,
@@ -1070,7 +1070,7 @@ def test_rank_local_exception_is_fatal_not_a_hung_collective(tmp_path, fail_rank
     published = _published(outcome["executor"])
     assert not any(isinstance(m, SessionClosed) for m in published)
     assert not any(
-        isinstance(m, SessionResultMessage) and m.kind is ResultKind.TERMINAL for m in published
+        isinstance(m, SessionResultMessage) and m.type is ResultType.TERMINAL for m in published
     )
     if fail_phase.startswith("advance"):
         assert any(isinstance(m, SessionOpened) for m in published)
@@ -1165,7 +1165,7 @@ def _closed(channel) -> bool:
 
 def _terminal_next(channel) -> bool:
     head = channel._results[0] if channel._results else None
-    return head is not None and head.kind is ResultKind.TERMINAL
+    return head is not None and head.type is ResultType.TERMINAL
 
 
 def _wait_until(predicate, timeout=10.0, what="condition"):
@@ -1294,7 +1294,7 @@ def _timeout_terminal(session_id, sequence):
         None,
         {},
         {},
-        kind=ResultKind.TERMINAL,
+        type=ResultType.TERMINAL,
         error="session idle timeout (0s) expired",
     )
 
@@ -1320,7 +1320,7 @@ def test_terminals_keep_empty_outputs_after_the_close(harness):
 def _wait_for_terminal(channel):
     """The worker publishes media then the normal terminal; wait for the latter."""
     _wait_until(
-        lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results),
+        lambda: any(m.type is ResultType.TERMINAL for m in channel._results),
         what="the queued terminal",
     )
 
@@ -1344,7 +1344,7 @@ def test_explicit_close_after_a_timeout_close_discards_the_retained_terminal(har
         s = h.open()
         channel = h.client._sessions[s.request_id]
         _wait_until(lambda: _closed(channel), what="the idle close")
-        assert any(m.kind is ResultKind.TERMINAL for m in channel._results)  # terminal retained
+        assert any(m.type is ResultType.TERMINAL for m in channel._results)  # terminal retained
         s.close()  # explicit cancellation after the worker close: discard everything
         with pytest.raises(SessionEnded):
             next(s.results())
@@ -1493,7 +1493,7 @@ def test_advance_after_the_session_ended_returns_the_terminal_once_without_submi
             assert r.advance_index == 0
             channel = h.client._sessions[s.request_id]
             _wait_until(
-                lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results),
+                lambda: any(m.type is ResultType.TERMINAL for m in channel._results),
                 what="the terminal",
             )
             sent = []
@@ -1625,7 +1625,7 @@ def test_advance_still_refuses_while_real_media_precedes_the_terminal(harness):
             s.submit("controls", 1)  # media 0, then the normal terminal
             channel = h.client._sessions[s.request_id]
             _wait_until(
-                lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results),
+                lambda: any(m.type is ResultType.TERMINAL for m in channel._results),
                 what="terminal",
             )
             assert channel.unread_media()
@@ -2441,7 +2441,7 @@ def test_closed_session_retires_its_unsent_submits_in_the_dispatcher():
     assert isinstance(client._request_to_send, SessionSubmit)
     waiting = client.session_close(channel)  # control path: goes out at once
     client._process_controls()
-    assert isinstance(client.controls_ipc.sent[-1], SessionClose)
+    assert client.controls_ipc.sent[-1].type is ControlType.CLOSE
     client._route_session_reply(SessionClosed(1))  # the worker confirmed
     assert waiting.result(timeout=1) is None
     with pytest.raises(SessionEnded):
@@ -2463,7 +2463,7 @@ def test_activity_notes_are_coalesced_and_close_is_sent_once():
         client.session_activity(channel)
     assert len(client._controls) == 1  # one pending note per session
     client._process_controls()
-    assert sum(isinstance(m, SessionActivity) for m in client.controls_ipc.sent) == 1
+    assert sum(m.type is ControlType.ACTIVITY for m in client.controls_ipc.sent) == 1
     client.session_activity(channel)  # after it was sent, a new one is accepted
     assert len(client._controls) == 1
     client._process_controls()
@@ -2472,7 +2472,7 @@ def test_activity_notes_are_coalesced_and_close_is_sent_once():
     client.session_close(channel)
     assert len(client._controls) == 1
     client._process_controls()
-    assert sum(isinstance(m, SessionClose) for m in client.controls_ipc.sent) == 1
+    assert sum(m.type is ControlType.CLOSE for m in client.controls_ipc.sent) == 1
 
 
 def test_close_before_the_open_is_acknowledged_waits_for_the_acknowledgement():
@@ -2486,14 +2486,16 @@ def test_close_before_the_open_is_acknowledged_waits_for_the_acknowledgement():
         SessionOpened(1, capabilities={"inputs": [], "streams": []}, slots=[])
     )
     client._process_controls()
-    assert isinstance(client.controls_ipc.sent[-1], SessionClose)  # now, after the ack
+    assert client.controls_ipc.sent[-1].type is ControlType.CLOSE  # now, after the ack
     client._route_session_reply(SessionClosed(1))
     assert closed.result(timeout=1) is None and client._sessions == {}
 
 
 def test_stray_close_on_the_control_socket_does_not_touch_a_later_session(harness):
     with harness(CountingPipeline(initial=False)) as h:
-        h.executor.controls_ipc.put_nowait(SessionClose(41))  # a close for no session
+        h.executor.controls_ipc.put_nowait(
+            SessionControl(41, ControlType.CLOSE)
+        )  # a close for no session
         with h.open() as s:
             assert s.advance(1).advance_index == 0  # the stray did not close this one
         assert h.pipeline.closed == 1
@@ -2633,7 +2635,7 @@ def test_explicit_close_discards_a_queued_terminal(harness):
         s = h.open()
         channel = h.client._sessions[s.request_id]
         s.submit("controls", 1)  # media 0, then the normal terminal, both unread
-        _wait_until(lambda: any(m.kind is ResultKind.TERMINAL for m in channel._results))
+        _wait_until(lambda: any(m.type is ResultType.TERMINAL for m in channel._results))
         s.close()
         with pytest.raises(SessionEnded):
             next(s.results())
@@ -2663,7 +2665,7 @@ def test_channel_members_are_the_eight_and_the_session_the_three(harness):
 
 def _media(session_id, sequence, index):
     return SessionResultMessage(
-        session_id, sequence, index, 0, {"video": ((1, 1, 2, 3, 3), "torch.uint8")}, {}
+        session_id, sequence, index, 0, {"video": ((1, 1, 2, 3, 3), torch.uint8)}, {}
     )
 
 

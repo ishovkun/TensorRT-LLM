@@ -37,11 +37,13 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.session_protocol import (
-    ResultKind,
-    SessionActivity,
+    AdmissionFailure,
+    ControlType,
+    ResultType,
     SessionAdmitted,
-    SessionClose,
     SessionClosed,
+    SessionCommand,
+    SessionControl,
     SessionEnded,
     SessionError,
     SessionOpen,
@@ -49,7 +51,6 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionQueueFull,
     SessionReply,
     SessionResultMessage,
-    SessionSlotReturn,
     SessionSubmit,
 )
 from tensorrt_llm._torch.visual_gen.session_state import SessionState
@@ -712,10 +713,10 @@ class DiffusionExecutor:
                 SessionAdmitted(
                     command.session_id,
                     error=f"session {command.session_id} is not open",
-                    error_kind="ended",
+                    failure=AdmissionFailure.ENDED,
                 )
             )
-        elif isinstance(command, SessionClose):
+        elif isinstance(command, SessionControl) and command.type is ControlType.CLOSE:
             self.response_queue.put(SessionClosed(command.session_id))
 
     def _merge_defaults(self, req: DiffusionRequest):
@@ -1137,27 +1138,26 @@ class DiffusionExecutor:
                 self.pipeline.validate_input(pipeline_state, message.name, message.value)
                 reply.advance_index = state.admit(message.name, message.value)
             except SessionQueueFull as e:
-                reply.error, reply.error_kind = str(e), "queue_full"
+                reply.error, reply.failure = str(e), AdmissionFailure.QUEUE_FULL
             except SessionEnded as e:
-                reply.error, reply.error_kind = str(e), "ended"
+                reply.error, reply.failure = str(e), AdmissionFailure.ENDED
             except (ValueError, TypeError) as e:
-                reply.error, reply.error_kind = str(e), "invalid"
+                reply.error, reply.failure = str(e), AdmissionFailure.INVALID
             self.response_queue.put(reply)
             return
-        if isinstance(message, SessionSlotReturn):
-            if message.session_id == state.session_id:
+        if isinstance(message, SessionControl):
+            if message.type is ControlType.ACTIVITY:
+                return  # its arrival already restarted the idle wait
+            if message.session_id != state.session_id:
+                self._answer_stray_command(message)
+                return
+            if message.type is ControlType.SLOT_RETURN:
                 try:
                     pool.release(message.slot_id)
                 except ValueError as e:
                     logger.warning(f"Worker {self.device_id}: {e}")
-            return
-        if isinstance(message, SessionActivity):
-            return  # its arrival already restarted the idle wait
-        if isinstance(message, SessionClose):
-            if message.session_id == state.session_id:
+            elif message.type is ControlType.CLOSE:
                 state.closing = True
-            else:
-                self._answer_stray_command(message)
             return
         if isinstance(message, SessionOpen):
             # The client refuses a second open itself; one that was already in
@@ -1452,7 +1452,7 @@ class SessionChannel:
 
     def unread_media(self) -> bool:
         with self._lock:
-            return any(m.kind is ResultKind.MEDIA for m in self._results)
+            return any(m.type is ResultType.MEDIA for m in self._results)
 
     def lockstep_due(self) -> int:
         with self._lock:
@@ -1489,7 +1489,7 @@ class SessionChannel:
         with self._lock:
             close = self._closed
             if (close is not None and close.done()) or (
-                self._results and self._results[-1].kind is ResultKind.CLOSED
+                self._results and self._results[-1].type is ResultType.CLOSED
             ):
                 return  # after the end: a stray
             self._results.append(message)
@@ -1512,7 +1512,7 @@ class SessionChannel:
         expected_index: Any = None,
     ) -> Any:
         """One step of a reserved read. Returns the built result,
-        ``ResultKind.ENDED`` when the stream has ended, or ``None`` when nothing
+        ``ResultType.ENDED`` when the stream has ended, or ``None`` when nothing
         is readable yet; in that
         case the wakeup is armed in the same critical section, so a delivery,
         close or failure landing afterwards is never missed by the following
@@ -1532,13 +1532,13 @@ class SessionChannel:
                     self._reader = Future()  # re-armed with the predicate still false
                 return None
             head = self._results[0]
-            if head.kind is ResultKind.CLOSED:
+            if head.type is ResultType.CLOSED:
                 raise SessionEnded(f"session {self.session_id} is closed")
-            if head.kind is ResultKind.ENDED:
-                return ResultKind.ENDED
+            if head.type is ResultType.ENDED:
+                return ResultType.ENDED
             if (
                 expected_index is not None
-                and head.kind is ResultKind.MEDIA
+                and head.type is ResultType.MEDIA
                 and head.advance_index != expected_index
             ):
                 raise SessionError(
@@ -1547,11 +1547,11 @@ class SessionChannel:
                 )
             result = build(head)
             self._results.popleft()
-            if head.kind is ResultKind.TERMINAL:
+            if head.type is ResultType.TERMINAL:
                 self._results.appendleft(
-                    SessionResultMessage.end(self.session_id, ResultKind.ENDED)
+                    SessionResultMessage.end(self.session_id, ResultType.ENDED)
                 )
-            elif head.kind is ResultKind.MEDIA and self._lockstep_due > 0:
+            elif head.type is ResultType.MEDIA and self._lockstep_due > 0:
                 self._lockstep_due -= 1
             return result
 
@@ -1603,9 +1603,9 @@ class SessionChannel:
             if failure is not None:
                 raise failure
             head = self._results[0] if self._results else None
-            if head is not None and head.kind in (ResultKind.CLOSED, ResultKind.ENDED):
+            if head is not None and head.type in (ResultType.CLOSED, ResultType.ENDED):
                 raise SessionEnded(f"session {self.session_id} has ended")
-            if head is not None and head.kind is ResultKind.TERMINAL:
+            if head is not None and head.type is ResultType.TERMINAL:
                 return None
             if self._closed is not None:
                 raise SessionEnded(f"session {self.session_id} is closed")
@@ -1669,16 +1669,16 @@ class SessionChannel:
                 # Already closing or closed (a worker-initiated close may have
                 # retained a terminal): the client's close still discards the stream.
                 if self.failure is None and not (
-                    self._results and self._results[-1].kind is ResultKind.CLOSED
+                    self._results and self._results[-1].type is ResultType.CLOSED
                 ):
                     self._results.clear()
                     self._results.append(
-                        SessionResultMessage.end(self.session_id, ResultKind.CLOSED)
+                        SessionResultMessage.end(self.session_id, ResultType.CLOSED)
                     )
                 return self._closed, False
             self._closed = Future()
             self._results.clear()
-            self._results.append(SessionResultMessage.end(self.session_id, ResultKind.CLOSED))
+            self._results.append(SessionResultMessage.end(self.session_id, ResultType.CLOSED))
             self._lockstep_due = 0
             pending, self._submit = self._submit, None
             reader = self._reader
@@ -1695,7 +1695,7 @@ class SessionChannel:
             if self._closed is None:
                 self._closed = Future()
                 kept = [
-                    m for m in self._results if m.kind in (ResultKind.ENDED, ResultKind.TERMINAL)
+                    m for m in self._results if m.type in (ResultType.ENDED, ResultType.TERMINAL)
                 ]
                 self._results.clear()
                 self._results.extend(kept)
@@ -2237,15 +2237,12 @@ class DiffusionRemoteClient:
         references are released. Any other failure means control messages may be
         lost on a transport we can no longer trust, so the worker group is
         aborted and every session call raises that failure."""
-        if not isinstance(
-            req, (SessionOpen, SessionSubmit, SessionSlotReturn, SessionClose, SessionActivity)
-        ):
+        if not isinstance(req, SessionCommand):
             return
         payload_error = isinstance(exc, self._PAYLOAD_ERRORS) and not isinstance(exc, OSError)
-        session_id = req.request.request_id if isinstance(req, SessionOpen) else req.session_id
         with self._sessions_lock:
-            channel = self._sessions.get(session_id)
-        if not payload_error or isinstance(req, (SessionSlotReturn, SessionClose, SessionActivity)):
+            channel = self._sessions.get(req.session_id)
+        if not payload_error or isinstance(req, SessionControl):
             # A failing data request goes back into the send slot so the abort
             # releases its references with everything else, once; a control
             # command owns nothing and must not displace a parked request.
@@ -2260,7 +2257,7 @@ class DiffusionRemoteClient:
                 )
             return
         with self._sessions_lock:
-            self._sessions.pop(session_id, None)
+            self._sessions.pop(req.session_id, None)
         self._discard_unsent_request(req)
         if channel is not None:
             channel.open_failed(
@@ -2405,8 +2402,8 @@ class DiffusionRemoteClient:
     def session_return_slot(self, channel: SessionChannel, slot_id: int) -> None:
         if self._worker_failure is None:
             self._enqueue_control(
-                (channel.session_id, "slot", slot_id),
-                SessionSlotReturn(channel.session_id, slot_id),
+                (channel.session_id, ControlType.SLOT_RETURN, slot_id),
+                SessionControl(channel.session_id, ControlType.SLOT_RETURN, slot_id),
             )
 
     def session_activity(self, channel: SessionChannel) -> None:
@@ -2414,7 +2411,8 @@ class DiffusionRemoteClient:
         repeats coalesce in the outbox while one is pending."""
         if self._worker_failure is None and channel.lease_lost is None:
             self._enqueue_control(
-                (channel.session_id, "activity"), SessionActivity(channel.session_id)
+                (channel.session_id, ControlType.ACTIVITY),
+                SessionControl(channel.session_id, ControlType.ACTIVITY),
             )
 
     def session_close(self, channel: SessionChannel) -> Future:
@@ -2432,7 +2430,8 @@ class DiffusionRemoteClient:
                     return
                 if self._worker_failure is None:
                     self._enqueue_control(
-                        (channel.session_id, "close"), SessionClose(channel.session_id)
+                        (channel.session_id, ControlType.CLOSE),
+                        SessionControl(channel.session_id, ControlType.CLOSE),
                     )
 
             channel.on_open(after_open)
@@ -2467,9 +2466,9 @@ class DiffusionRemoteClient:
             error: Optional[Exception] = None
             if reply.error is not None:
                 error = {
-                    "queue_full": SessionQueueFull,
-                    "ended": SessionEnded,
-                }.get(reply.error_kind, ValueError)(reply.error)
+                    AdmissionFailure.QUEUE_FULL: SessionQueueFull,
+                    AdmissionFailure.ENDED: SessionEnded,
+                }.get(reply.failure, ValueError)(reply.error)
             channel.admitted(reply.advance_index, error)
         elif isinstance(reply, SessionResultMessage):
             channel.deliver(reply)

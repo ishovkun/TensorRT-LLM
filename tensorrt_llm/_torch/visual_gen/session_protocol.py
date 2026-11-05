@@ -17,10 +17,9 @@
 A session is one generation whose model state stays alive on the worker while it
 produces results one advance at a time. This module holds what both sides share:
 the commands and replies that cross the sockets and the errors a caller can see.
-The worker's own
-bookkeeping is ``session_state.py``; the pipeline declares what it accepts and
-produces through ``SessionCapabilities`` in ``pipeline.py`` and never sees any of
-this.
+The worker's own bookkeeping is ``session_state.py``; the pipeline declares what
+it accepts and produces through ``SessionCapabilities`` in ``pipeline.py`` and
+never sees any of this.
 """
 
 from __future__ import annotations
@@ -54,59 +53,102 @@ class SessionLeaseExpired(SessionError):
 
 
 # --------------------------------------------------------------------------- wire messages
+#
+# A delivery slot buffer crosses to the client as the handle SharedTensorContainer
+# produces (``dump_to_dict``); the client maps it back with ``from_dict``.
+SharedTensorHandle = Dict[str, Any]
+SlotHandles = Dict[str, SharedTensorHandle]  # one buffer per stream name
+#
+# Commands travel from the coordinator to rank 0: SessionOpen and SessionSubmit on
+# the request socket (they carry payloads), SessionControl on the control socket.
+# Replies travel back on the response socket. Every message names its session.
 
 
 @dataclass
-class SessionOpen:
-    request: "DiffusionRequest"
+class SessionCommand:
+    """A message from the coordinator to rank 0 about one session; every subclass
+    answers ``session_id``."""
 
 
 @dataclass
-class SessionSubmit:
+class SessionOpen(SessionCommand):
+    """Open a session; ``request.request_id`` is the session id."""
+
+    request: DiffusionRequest
+
+    @property
+    def session_id(self) -> int:
+        return self.request.request_id
+
+
+@dataclass
+class SessionSubmit(SessionCommand):
+    """One value for the named input. A session has at most one unanswered submit."""
+
     session_id: int
     name: str
     value: Any
 
 
-@dataclass
-class SessionSlotReturn:
-    session_id: int
-    slot_id: int
+class ControlType(Enum):
+    """The three verbs of the control socket."""
+
+    SLOT_RETURN = "slot_return"  # the client is done with slot_id; the worker may reuse it
+    ACTIVITY = "activity"  # a result was requested; its arrival restarts the idle clock
+    CLOSE = "close"  # close the session; answered by SessionClosed
 
 
 @dataclass
-class SessionClose:
+class SessionControl(SessionCommand):
+    """A control-socket command: small, payload-free, serviced ahead of input."""
+
+    session_id: int
+    type: ControlType
+    slot_id: Optional[int] = None  # SLOT_RETURN only
+
+
+# ---- replies
+
+
+@dataclass
+class SessionReply:
+    """A message from rank 0 about one session; the client's router hands it to
+    that session's channel."""
+
     session_id: int
 
 
 @dataclass
-class SessionActivity:
-    """The client asked for a result without returning a slot. Carries nothing;
-    receiving it is what restarts the worker's idle clock."""
+class SessionOpened(SessionReply):
+    """The answer to ``SessionOpen``: the declared capabilities and one shared-memory
+    handle per slot per stream, or ``error`` with the executor-wide failure class
+    (``"client"``, ``"capacity"`` or ``None``, as on ``DiffusionResponse``)."""
 
-    session_id: int
-
-
-@dataclass
-class SessionOpened:
-    session_id: int
     capabilities: Optional[Dict[str, Any]] = None
-    slots: Optional[List[Dict[str, Dict[str, Any]]]] = None
+    slots: Optional[List[SlotHandles]] = None  # indexed by slot id
     error: Optional[str] = None
     error_type: Optional[str] = None
 
 
-@dataclass
-class SessionAdmitted:
-    """The answer to the one submit a session has in flight."""
+class AdmissionFailure(Enum):
+    """Why a submit was refused; each maps to one exception on the client."""
 
-    session_id: int
+    INVALID = "invalid"  # the value failed the input's schema: ValueError
+    QUEUE_FULL = "queue_full"  # no room until the next advance: SessionQueueFull
+    ENDED = "ended"  # terminal reached, closing, or no such session: SessionEnded
+
+
+@dataclass
+class SessionAdmitted(SessionReply):
+    """The answer to the one submit a session has in flight: the advance index the
+    value was assigned, or ``error`` with its ``failure``."""
+
     advance_index: Optional[int] = None
     error: Optional[str] = None
-    error_kind: Optional[str] = None  # "invalid" | "queue_full" | "ended"
+    failure: Optional[AdmissionFailure] = None
 
 
-class ResultKind(Enum):
+class ResultType(Enum):
     """What an entry of a session's result stream is. The worker publishes
     ``MEDIA`` and ``TERMINAL``; ``ENDED`` and ``CLOSED`` exist only on the client,
     as the entry left at the head of its queue once the stream is over."""
@@ -118,41 +160,29 @@ class ResultKind(Enum):
 
 
 @dataclass
-class SessionResultMessage:
+class SessionResultMessage(SessionReply):
     """One entry of the result stream. For ``MEDIA``, ``streams`` maps a stream
     name to the ``(shape, dtype)`` written in ``slots[slot_id][name]`` and
     ``position`` maps it to ``(start, count)``. ``TERMINAL`` has ``slot_id=None``
     and no streams. The client-local kinds carry no sequence."""
 
-    session_id: int
     sequence: Optional[int]
     advance_index: Optional[int]
     slot_id: Optional[int]
-    streams: Dict[str, Tuple[Tuple[int, ...], str]]
+    streams: Dict[str, Tuple[Tuple[int, ...], torch.dtype]]
     position: Dict[str, Tuple[int, int]]
-    kind: ResultKind = ResultKind.MEDIA
+    type: ResultType = ResultType.MEDIA
     error: Optional[str] = None
 
     @classmethod
-    def end(cls, session_id: int, kind: ResultKind) -> "SessionResultMessage":
+    def end(cls, session_id: int, end_type: ResultType) -> SessionResultMessage:
         """The client-local entry that ends a stream: ``ENDED`` or ``CLOSED``."""
-        if kind not in (ResultKind.ENDED, ResultKind.CLOSED):
-            raise ValueError(f"{kind} is published by the worker, not an end of stream")
-        return cls(session_id, None, None, None, {}, {}, kind=kind)
+        if end_type not in (ResultType.ENDED, ResultType.CLOSED):
+            raise ValueError(f"{end_type} is published by the worker, not an end of stream")
+        return cls(session_id, None, None, None, {}, {}, type=end_type)
 
 
 @dataclass
-class SessionClosed:
-    session_id: int
-
-
-SessionReply = (SessionOpened, SessionAdmitted, SessionResultMessage, SessionClosed)
-
-
-def torch_dtype_from_str(name: str) -> torch.dtype:
-    """``str(torch.uint8)`` is ``"torch.uint8"``; this is its inverse."""
-    attr = name.split(".", 1)[1] if name.startswith("torch.") else name
-    dtype = getattr(torch, attr, None)
-    if not isinstance(dtype, torch.dtype):
-        raise ValueError(f"not a torch dtype: {name!r}")
-    return dtype
+class SessionClosed(SessionReply):
+    """The worker released the session: on the client's close, on the idle
+    timeout, or after a terminal result."""

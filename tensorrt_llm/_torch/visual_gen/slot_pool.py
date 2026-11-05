@@ -33,6 +33,7 @@ import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.pipeline import SessionCapabilities, StreamSpec
+from tensorrt_llm._torch.visual_gen.session_protocol import SlotHandles
 from tensorrt_llm.logger import logger
 
 
@@ -199,7 +200,7 @@ class SlotPool:
     def release_all(self) -> None:
         self._free = list(range(self.num_slots))[::-1]
 
-    def export_handles(self) -> List[Dict[str, Dict[str, Any]]]:
+    def export_handles(self) -> List[SlotHandles]:
         """One handle dict per slot per stream, for ``SessionOpened``. Each handle is
         consumed exactly once by the client's mapping."""
         return [
@@ -250,7 +251,7 @@ class ClientSlotMap:
     """The client's mapping of a session's slot pool: one tensor per slot per stream,
     mapped once from the handles in ``SessionOpened`` and kept for the session."""
 
-    def __init__(self, handles: List[Dict[str, Dict[str, Any]]]) -> None:
+    def __init__(self, handles: List[SlotHandles]) -> None:
         self._views: List[Dict[str, torch.Tensor]] = []
         for per_stream in handles:
             mapped = {}

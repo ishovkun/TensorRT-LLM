@@ -38,13 +38,12 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.visual_gen.session_protocol import (
-    ResultKind,
+    ResultType,
     SessionEnded,
     SessionError,
     SessionLeaseExpired,
     SessionQueueFull,
     SessionResultMessage,
-    torch_dtype_from_str,
 )
 from tensorrt_llm.llmapi.utils import set_api_status
 
@@ -411,7 +410,7 @@ class VisualGenSession:
     def _take_result(self, expected_index: Optional[int] = None) -> Optional[SessionResult]:
         while True:
             taken = self._channel.take(self._build_result, expected_index)
-            if taken is ResultKind.ENDED:
+            if taken is ResultType.ENDED:
                 return None
             if taken is not None:
                 self._held = taken
@@ -423,7 +422,7 @@ class VisualGenSession:
     ) -> Optional[SessionResult]:
         while True:
             taken = self._channel.take(self._build_result, expected_index)
-            if taken is ResultKind.ENDED:
+            if taken is ResultType.ENDED:
                 return None
             if taken is not None:
                 self._held = taken
@@ -501,10 +500,8 @@ class VisualGenSession:
         outputs: Dict[str, torch.Tensor] = {}
         slots = self._channel.slots
         if message.slot_id is not None:
-            for name, (shape, dtype_name) in message.streams.items():
-                outputs[name] = slots.view(
-                    message.slot_id, name, tuple(shape), torch_dtype_from_str(dtype_name)
-                )
+            for name, (shape, dtype) in message.streams.items():
+                outputs[name] = slots.view(message.slot_id, name, tuple(shape), dtype)
         lease = None if message.slot_id is None else (self._channel, message.slot_id)
         return SessionResult(
             self.request_id,
@@ -512,7 +509,7 @@ class VisualGenSession:
             message.advance_index,
             outputs,
             message.position,
-            message.kind is ResultKind.TERMINAL,
+            message.type is ResultType.TERMINAL,
             message.error,
             lease=lease,
         )

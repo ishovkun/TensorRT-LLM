@@ -26,7 +26,7 @@ from typing import Any, Deque, Dict, Optional, Tuple
 import torch
 
 from .pipeline import SessionCapabilities
-from .session_protocol import ResultKind, SessionEnded, SessionQueueFull, SessionResultMessage
+from .session_protocol import ResultType, SessionEnded, SessionQueueFull, SessionResultMessage
 
 
 class SessionState:
@@ -131,15 +131,15 @@ class SessionState:
         caps = self.capabilities
         if not written:
             raise ValueError("a media result must carry at least one stream")
-        checked: Dict[str, Tuple[Tuple[int, ...], str, int]] = {}
+        checked: Dict[str, Tuple[Tuple[int, ...], torch.dtype, int]] = {}
         for name, (shape, dtype) in written.items():
             spec = caps.stream(name)
             extents = check_extent(spec, shape, dtype)
-            checked[name] = (extents, str(dtype), extents[spec.axis])
-        streams: Dict[str, Tuple[Tuple[int, ...], str]] = {}
+            checked[name] = (extents, dtype, extents[spec.axis])
+        streams: Dict[str, Tuple[Tuple[int, ...], torch.dtype]] = {}
         position: Dict[str, Tuple[int, int]] = {}
-        for name, (extents, dtype_name, count) in checked.items():
-            streams[name] = (extents, dtype_name)
+        for name, (extents, dtype, count) in checked.items():
+            streams[name] = (extents, dtype)
             start = self.cursors[name]
             position[name] = (start, count)
             self.cursors[name] = start + count
@@ -164,7 +164,7 @@ class SessionState:
             slot_id=None,
             streams={},
             position={},
-            kind=ResultKind.TERMINAL,
+            type=ResultType.TERMINAL,
             error=error,
         )
         self.next_sequence += 1
