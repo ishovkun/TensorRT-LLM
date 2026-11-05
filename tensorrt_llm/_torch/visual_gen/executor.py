@@ -895,11 +895,11 @@ class DiffusionExecutor:
 
     def _run_session(self, req: DiffusionRequest) -> None:
         if self.rank == 0:
-            self._session_rank0(req)
+            self._session_leader(req)
         else:
             self._session_follower(req)
 
-    def _session_rank0(self, req: DiffusionRequest) -> None:
+    def _session_leader(self, req: DiffusionRequest) -> None:
         session_id = req.request_id
         pipeline = self.pipeline
         pool = None
