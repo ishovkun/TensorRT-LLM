@@ -14,6 +14,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -86,6 +87,14 @@ _start_coordinator_watchdog = start_coordinator_watchdog
 # Default cap on the size of the iteration-stats snapshot buffer used by the
 # /metrics endpoint.  Mirrors the LLM ``iter_stats_max_iterations`` default.
 _DEFAULT_ITER_STATS_MAX = 1000
+
+
+class _SessionExit(Enum):
+    """Why the session loop ends early: the client's close, or the executor's
+    shutdown signal, which the worker honors once the session is torn down."""
+
+    CLOSE = "close"
+    SHUTDOWN = "shutdown"
 
 
 def _reap_worker_process(process: mp.Process) -> bool:
@@ -512,9 +521,6 @@ class DiffusionExecutor:
         self.response_queue = queue.Queue()
         self.sender_thread = None
         self.session_config = getattr(visual_gen_args, "session_config", None)
-        # Requests that arrived while a session was open; served after it closes.
-        self._deferred: List[Any] = []
-        self._shutdown_requested = False
 
         # Only rank 0 handles IPC
         if self.rank == 0:
@@ -670,28 +676,33 @@ class DiffusionExecutor:
                 req = self._broadcast_request(req)
 
             if req is None:
-                logger.info(f"Worker {self.device_id}: Shutdown signal received")
-                if self.rank == 0 and self.sender_thread:
-                    self.response_queue.put(None)
-                    self.sender_thread.join()
+                self._stop_serving()
                 break
 
             if isinstance(req, SessionOpen):
                 logger.info(f"Worker {self.device_id}: Opening session {req.request.request_id}")
-                self._run_session(req.request)
-                if self._shutdown_requested and self.rank == 0:
-                    self._deferred.insert(0, None)
+                if self._serve_session(req.request):
+                    # The shutdown signal arrived during the session (rank 0 reads
+                    # it there); the peers are back at the broadcast and get it now.
+                    if self.world_size > 1:
+                        self._broadcast_request(None)
+                    self._stop_serving()
+                    break
                 continue
 
             logger.info(f"Worker {self.device_id}: Processing request {req.request_id}")
             self.process_request(req)
 
+    def _stop_serving(self) -> None:
+        logger.info(f"Worker {self.device_id}: Shutdown signal received")
+        if self.rank == 0 and self.sender_thread:
+            self.response_queue.put(None)
+            self.sender_thread.join()
+
     def _next_message(self) -> Any:
-        """Rank 0: the next message, serving anything deferred during a session
-        first. Controls that arrive with no session open are strays (a close
-        that crossed its SessionClosed): answered, never queued."""
-        if self._deferred:
-            return self._deferred.pop(0)
+        """Rank 0: the next message from the request socket. Controls that arrive
+        with no session open are strays (a close that crossed its SessionClosed):
+        answered, never queued."""
         while True:
             for command in self._drain_controls():
                 self._answer_stray_command(command)
@@ -893,18 +904,48 @@ class DiffusionExecutor:
         sys.stderr.flush()
         os._exit(1)
 
-    def _run_session(self, req: DiffusionRequest) -> None:
+    def _serve_session(self, req: DiffusionRequest) -> bool:
+        """Serve one session to its close on this rank. Returns whether the
+        executor's shutdown signal arrived meanwhile (rank 0 only)."""
         if self.rank == 0:
-            self._session_leader(req)
-        else:
-            self._session_follower(req)
+            return self._session_leader(req)
+        self._session_follower(req)
+        return False
 
-    def _session_leader(self, req: DiffusionRequest) -> None:
+    def _session_leader(self, req: DiffusionRequest) -> bool:
+        """Rank 0: open the session, run it, tear it down. Returns whether the
+        shutdown signal arrived during the session."""
+        opened = self._open_session(req)
+        if opened is None:
+            return False
+        state, pool, pipeline_state = opened
+        fatal = False
+        shutdown = False
+        try:
+            shutdown = self._run_session(state, pool, pipeline_state)
+        except FatalRankError:
+            fatal = True
+            raise
+        except Exception as e:
+            # Not from a pipeline call (a broadcast, a slot, the state); with
+            # peers it still cannot be followed by a CLOSE broadcast.
+            if self.world_size > 1:
+                fatal = True
+                self._fail_rank(f"session {state.session_id}", e)
+            raise
+        finally:
+            self._end_session(state, pool, pipeline_state, fatal=fatal)
+        return shutdown
+
+    def _open_session(self, req: DiffusionRequest) -> Optional[Tuple[SessionState, SlotPool, Any]]:
+        """The open handshake on rank 0. Answers ``SessionOpened``, with the
+        capabilities and slot handles or with the error, publishes the initial
+        result if the pipeline wrote one, and returns the session's state, pool
+        and pipeline state; ``None`` when the session was refused or failed to
+        open, with the reply already sent and nothing left to release."""
         session_id = req.request_id
         pipeline = self.pipeline
         pool = None
-        pipeline_state = None
-        state = None
         try:
             self._merge_defaults(req)
             pipeline.prepare_request(req)
@@ -923,6 +964,8 @@ class DiffusionExecutor:
                 f"{pool.num_slots} slots x {caps.max_result_bytes} bytes = {pool.nbytes} bytes"
             )
         except Exception as e:
+            # Refused before any rank did pipeline work: the peers are told to
+            # abort and the reply carries the failure class.
             logger.error(f"Worker {self.device_id}: session {session_id} refused: {e}")
             logger.error(traceback.format_exc())
             self._broadcast_session_tag(("open_abort",))
@@ -936,7 +979,7 @@ class DiffusionExecutor:
                 else pipeline.classify_request_failure(e)
             )
             self.response_queue.put(SessionOpened(session_id, error=str(e), error_type=error_type))
-            return
+            return None
 
         self._broadcast_session_tag(("open_go",))
         initial_index, initial_slot = pool.reserve() if caps.initial_result else (None, None)
@@ -946,6 +989,8 @@ class DiffusionExecutor:
             with torch.inference_mode():
                 pipeline_state, outcome = pipeline.open_session(req, initial_slot)
         except Exception as e:
+            # After the go broadcast the peers are inside their own open call:
+            # with peers this rank cannot be trusted to reach another collective.
             if self.world_size > 1:
                 pool.close()
                 self._fail_rank(f"session {session_id} open", e)
@@ -966,7 +1011,7 @@ class DiffusionExecutor:
                     ),
                 )
             )
-            return
+            return None
         self.response_queue.put(
             SessionOpened(session_id, capabilities=caps.public(), slots=pool.export_handles())
         )
@@ -978,77 +1023,73 @@ class DiffusionExecutor:
                 except ValueError as e:
                     pool.release(initial_index)
                     self.response_queue.put(state.terminal_result(error=str(e)))
-                    return
+                    return state, pool, pipeline_state
                 self.response_queue.put(message)
             else:
                 pool.release(initial_index)
         if outcome.done:
             self.response_queue.put(state.terminal_result())
+        return state, pool, pipeline_state
 
+    def _run_session(self, state: SessionState, pool: SlotPool, pipeline_state: Any) -> bool:
+        """The session loop on rank 0: advance whenever the advance condition
+        holds, otherwise wait for the client. Ends on the close command, on the
+        shutdown signal, or on the idle timeout. Returns whether it was the
+        shutdown signal."""
         idle_timeout = self._session_idle_timeout()
-        fatal = False
-        try:
-            while True:
-                if state.can_advance(pool.free_count):
-                    # Admissions that arrived during the last advance go first, so a
-                    # live value submitted before this dispatch is seen by it.
-                    _, close = self._service_session_commands(
-                        state, pool, pipeline_state, block=False
-                    )
-                    if close:
-                        break
-                    if not state.can_advance(pool.free_count):
-                        continue
-                    self._advance_once(state, pool, pipeline_state)
+        while True:
+            if state.can_advance(pool.free_count):
+                # Admissions that arrived during the last advance go first, so a
+                # live value submitted before this dispatch is seen by it.
+                _, exit = self._service_session_commands(state, pool, pipeline_state, block=False)
+                if exit is not None:
+                    return exit is _SessionExit.SHUTDOWN
+                if not state.can_advance(pool.free_count):
                     continue
-                if not state.ended and state.exhausted():
-                    self.response_queue.put(state.terminal_result())
-                    continue
-                # Only the client can make progress now; wait for it.
-                received, close = self._service_session_commands(
-                    state, pool, pipeline_state, block=True, timeout=idle_timeout
+                self._advance_once(state, pool, pipeline_state)
+                continue
+            if not state.ended and state.exhausted():
+                self.response_queue.put(state.terminal_result())
+                continue
+            # Only the client can make progress now; wait for it.
+            received, exit = self._service_session_commands(
+                state, pool, pipeline_state, block=True, timeout=idle_timeout
+            )
+            if exit is not None:
+                return exit is _SessionExit.SHUTDOWN
+            if not received:
+                logger.warning(
+                    f"Worker {self.device_id}: session {state.session_id} idle for "
+                    f"{idle_timeout:.0f}s; closing it"
                 )
-                if close:
-                    break
-                if not received:
-                    logger.warning(
-                        f"Worker {self.device_id}: session {session_id} idle for "
-                        f"{idle_timeout:.0f}s; closing it"
-                    )
-                    if not state.ended:
-                        self.response_queue.put(
-                            state.terminal_result(
-                                error=f"session idle timeout ({idle_timeout:.0f}s) expired"
-                            )
+                if not state.ended:
+                    self.response_queue.put(
+                        state.terminal_result(
+                            error=f"session idle timeout ({idle_timeout:.0f}s) expired"
                         )
-                    break
-        except FatalRankError:
-            fatal = True
-            raise
+                    )
+                return False
+
+    def _end_session(
+        self, state: SessionState, pool: SlotPool, pipeline_state: Any, *, fatal: bool
+    ) -> None:
+        """Tear the session down. ``fatal``: this rank is dying with peers possibly
+        stuck in a collective, so nothing shared is touched: no CLOSE broadcast,
+        no pipeline close, no ``SessionClosed``; the coordinator reports the dead
+        worker and tears the group down."""
+        if fatal:
+            pool.close()
+            return
+        state.discard_inputs()
+        self._broadcast_session_tag(("close",))
+        try:
+            with torch.inference_mode():
+                self.pipeline.close_session(pipeline_state)
         except Exception as e:
-            # Not from a pipeline call (a broadcast, a slot, the state); with
-            # peers it still cannot be followed by a CLOSE broadcast.
-            if self.world_size > 1:
-                fatal = True
-                self._fail_rank(f"session {session_id}", e)
-            raise
-        finally:
-            if fatal:
-                # Peers may be stuck in a collective: no CLOSE broadcast, no
-                # pipeline close, no SessionClosed. The coordinator reports the
-                # dead worker to the client and tears the group down.
-                pool.close()
-            else:
-                state.discard_inputs()
-                self._broadcast_session_tag(("close",))
-                try:
-                    with torch.inference_mode():
-                        pipeline.close_session(pipeline_state)
-                except Exception as e:
-                    logger.error(f"Worker {self.device_id}: session {session_id} close failed: {e}")
-                pool.close()
-                self.response_queue.put(SessionClosed(session_id))
-                logger.info(f"Worker {self.device_id}: session {session_id} closed")
+            logger.error(f"Worker {self.device_id}: session {state.session_id} close failed: {e}")
+        pool.close()
+        self.response_queue.put(SessionClosed(state.session_id))
+        logger.info(f"Worker {self.device_id}: session {state.session_id} closed")
 
     def _advance_once(self, state: SessionState, pool: SlotPool, pipeline_state: Any) -> None:
         slot_id, slot = pool.reserve()
@@ -1118,23 +1159,23 @@ class DiffusionExecutor:
         *,
         block: bool,
         timeout: Optional[float] = None,
-    ) -> Tuple[bool, bool]:
+    ) -> Tuple[bool, Optional[_SessionExit]]:
         """Handle every command currently on either socket, controls first. With
         ``block`` wait for the first one up to ``timeout`` seconds (``None``: no
-        limit). Returns (received, close): whether the wait produced anything, and
-        whether a close (or shutdown) arrived, in which case the session is to be
-        torn down now and the commands behind it were answered as strays. Both
-        sockets are watched while waiting, in slices of ``POLL_TIMEOUT``, so a slot
-        return or a close is seen whatever sits unread on the request socket."""
+        limit). Returns (received, exit): whether the wait produced anything, and
+        why the session is to end if a close or the shutdown signal arrived; the
+        commands behind it were answered as strays. Both sockets are watched while
+        waiting, in slices of ``POLL_TIMEOUT``, so a slot return or a close is
+        seen whatever sits unread on the request socket."""
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             commands = self._drain_controls() + self.requests_ipc.drain()
             if commands:
                 return True, self._handle_session_commands(commands, state, pool, pipeline_state)
             if not block:
-                return True, False
+                return True, None
             if deadline is not None and time.monotonic() >= deadline:
-                return False, False
+                return False, None
             try:
                 message = self.requests_ipc.get(timeout=POLL_TIMEOUT)
             except queue.Empty:
@@ -1144,28 +1185,28 @@ class DiffusionExecutor:
 
     def _handle_session_commands(
         self, commands: List[Any], state: SessionState, pool: SlotPool, pipeline_state: Any
-    ) -> bool:
-        """Handle commands in order until one closes the session; the rest are
-        answered as strays. Returns whether the session is to be closed."""
+    ) -> Optional[_SessionExit]:
+        """Handle commands in order until one ends the session; the rest are
+        answered as strays. Returns why the session ends, or ``None``."""
         for i, message in enumerate(commands):
-            if self._handle_session_command(message, state, pool, pipeline_state):
+            exit = self._handle_session_command(message, state, pool, pipeline_state)
+            if exit is not None:
                 for stray in commands[i + 1 :]:
                     self._answer_stray_command(stray)
-                return True
-        return False
+                return exit
+        return None
 
     def _handle_session_command(
         self, message: Any, state: SessionState, pool: SlotPool, pipeline_state: Any
-    ) -> bool:
-        """Handle one command. Returns True when it closes the session: the close
-        command, or a shutdown."""
+    ) -> Optional[_SessionExit]:
+        """Handle one command. Returns why the session ends when it does: the
+        close command, or the executor's shutdown signal."""
         if message is None:
-            self._shutdown_requested = True
-            return True
+            return _SessionExit.SHUTDOWN
         if isinstance(message, SessionSubmit):
             if message.session_id != state.session_id:
                 self._answer_stray_command(message)
-                return False
+                return None
             reply = SessionAdmitted(state.session_id)
             try:
                 # The pipeline's schema check first; ``admit`` mutates nothing
@@ -1179,21 +1220,21 @@ class DiffusionExecutor:
             except (ValueError, TypeError) as e:
                 reply.error, reply.failure = str(e), AdmissionFailure.INVALID
             self.response_queue.put(reply)
-            return False
+            return None
         if isinstance(message, SessionControl):
             if message.type is ControlType.ACTIVITY:
-                return False  # its arrival already restarted the idle wait
+                return None  # its arrival already restarted the idle wait
             if message.session_id != state.session_id:
                 self._answer_stray_command(message)
-                return False
+                return None
             if message.type is ControlType.CLOSE:
-                return True
+                return _SessionExit.CLOSE
             if message.type is ControlType.SLOT_RETURN:
                 try:
                     pool.release(message.slot_id)
                 except ValueError as e:
                     logger.warning(f"Worker {self.device_id}: {e}")
-            return False
+            return None
         if isinstance(message, SessionOpen):
             # The client refuses a second open itself; one that was already in
             # flight is refused here rather than queued behind an open-ended session.
@@ -1205,12 +1246,24 @@ class DiffusionExecutor:
                     error_type="capacity",
                 )
             )
-            return False
-        # A generate() arriving behind this session waits for it.
+            return None
         if isinstance(message, DiffusionRequest):
+            # The model instance accepts nothing else while a session is open: the
+            # same capacity refusal a second open gets. The payload is taken so its
+            # shared memory is released.
             message.refs_from_shm()
-        self._deferred.append(message)
-        return False
+            self.response_queue.put(
+                DiffusionResponse(
+                    request_id=message.request_id,
+                    error_msg=f"session {state.session_id} is open on this model instance",
+                    error_type="capacity",
+                )
+            )
+            return None
+        logger.warning(
+            f"Worker {self.device_id}: dropped {type(message).__name__} during a session"
+        )
+        return None
 
     def _session_follower(self, req: DiffusionRequest) -> None:
         """Ranks other than 0: run the same pipeline calls as rank 0, in the order

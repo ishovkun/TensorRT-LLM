@@ -39,6 +39,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionExecutor,
     DiffusionRemoteClient,
     DiffusionRequest,
+    DiffusionResponse,
     FatalRankError,
     SessionChannel,
     SessionResources,
@@ -61,6 +62,7 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionOpen,
     SessionOpened,
     SessionQueueFull,
+    SessionReply,
     SessionResultMessage,
     SessionSubmit,
 )
@@ -196,8 +198,6 @@ def _make_executor(pipeline, session_config=None, *, rank=0, world_size=1, in_cl
     ex.requests_ipc = FakeRequestSocket()
     ex.controls_ipc = FakeRequestSocket()
     ex.session_config = session_config
-    ex._deferred = []
-    ex._shutdown_requested = False
     return ex
 
 
@@ -229,6 +229,7 @@ class Harness:
         # and are routed when released; other kinds keep flowing. Lets a test
         # observe "accepted but not yet delivered" deterministically.
         self._held_kinds: set = set()
+        self.responses: list = []  # ordinary-request answers the worker sent
         self._held_replies: list = []
         self._hold_lock = threading.Lock()
         # Cleared by a test to keep the client's commands in pending_requests.
@@ -290,7 +291,10 @@ class Harness:
                 if self._held_kinds and isinstance(item, tuple(self._held_kinds)):
                     self._held_replies.append(item)  # released later, in order
                     continue
-            self.client._route_session_reply(item)
+            if isinstance(item, SessionReply):
+                self.client._route_session_reply(item)
+            else:
+                self.responses.append(item)  # an ordinary request's answer: kept for the test
 
     def hold(self, *kinds):
         with self._hold_lock:
@@ -318,8 +322,7 @@ class Harness:
                 if message is None:
                     return
                 if isinstance(message, SessionOpen):
-                    self.executor._run_session(message.request)
-                    if self.executor._shutdown_requested:
+                    if self.executor._serve_session(message.request):
                         return
                 else:
                     self.executor._answer_stray_command(message)
@@ -890,7 +893,7 @@ def _run_rank(rank, port, fail_rank, fail_phase, events, in_client_process, hold
     req = _session_request()
     if rank == 0:
         ex.requests_ipc.put_nowait(SessionSubmit(1, "controls", 1))
-    ex._run_session(req)
+    ex._serve_session(req)
 
 
 def _child_main(argv):
@@ -1867,7 +1870,6 @@ def test_second_open_is_refused_at_once_and_the_first_session_stays_usable(harne
                 h.client.open_session(_request(2))
             assert time.monotonic() - t0 < 1.0
             assert list(h.client._sessions) == [1]
-            assert h.executor._deferred == []
             assert s.advance(1).advance_index == 0
 
 
@@ -1958,7 +1960,7 @@ def test_rejected_open_releases_the_request_payload(harness):
             assert released == [req]
 
 
-def test_worker_refuses_an_open_already_in_flight_and_still_defers_a_generate(harness):
+def test_worker_refuses_an_open_and_a_generate_while_a_session_is_open(harness):
     with harness(CountingPipeline(initial=False)) as h:
         with h.open() as s:
             replies = []
@@ -1975,8 +1977,12 @@ def test_worker_refuses_an_open_already_in_flight_and_still_defers_a_generate(ha
             )
             refused = next(r for r in replies if isinstance(r, SessionOpened) and r.session_id == 7)
             assert refused.error_type == "capacity" and "is open" in refused.error
-            assert h.executor._deferred == [generate]  # a generate still waits its turn
-            assert not any(isinstance(m, SessionOpen) for m in h.executor._deferred)
+            _wait_until(
+                lambda: any(r.request_id == 8 for r in h.responses), what="the generate's refusal"
+            )
+            answer = next(r for r in h.responses if r.request_id == 8)
+            assert isinstance(answer, DiffusionResponse)
+            assert answer.error_type == "capacity" and "is open" in answer.error_msg
             h.client._route_session_reply = original
             assert next(s.results()).advance_index == 0
             assert h.pipeline.opened == 1
