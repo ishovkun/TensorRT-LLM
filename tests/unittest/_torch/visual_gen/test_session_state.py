@@ -115,7 +115,6 @@ def test_public_form_is_picklable_and_callable_free():
 
 def test_queued_admission_returns_consumption_index_and_bounds_the_queue():
     state = SessionState(7, lockstep_caps())
-    state.initialized = True
     assert state.admit("controls", 1) == 0
     assert state.admit("controls", 2) == 1
     with pytest.raises(SessionQueueFull):
@@ -128,13 +127,11 @@ def test_queued_admission_returns_consumption_index_and_bounds_the_queue():
 
 def test_live_admission_returns_next_dispatch_and_newest_wins():
     state = SessionState(1, steered_caps())
-    state.initialized = True
     assert state.admit("camera", (1.0, 0.0)) == 0
     assert state.admit("camera", (2.0, 0.0)) == 0
     state.admit("controls", "a")
     assert state.can_advance(free_slots=1)
-    inputs = state.take_inputs()
-    state.dispatch()
+    _, inputs = state.dispatch()
     assert inputs == {"controls": "a", "camera": (2.0, 0.0)}
     # Submitted while advance 0 is in flight: observed from advance 1 on.
     assert state.admit("camera", (3.0, 0.0)) == 1
@@ -143,16 +140,12 @@ def test_live_admission_returns_next_dispatch_and_newest_wins():
 def test_advance_condition():
     state = SessionState(1, steered_caps())
     assert not state.can_advance(free_slots=1)  # not initialized
-    state.initialized = True
     assert not state.can_advance(free_slots=1)  # queue empty
     state.admit("controls", "a")
     assert not state.can_advance(free_slots=0)  # no slot
     assert state.can_advance(free_slots=1)
-    state.take_inputs()
     state.dispatch()
     state.admit("controls", "b")
-    assert not state.can_advance(free_slots=1)  # in flight
-    state.in_flight = False
     assert state.can_advance(free_slots=1)
     state.closing = True
     assert not state.can_advance(free_slots=1)
@@ -160,28 +153,23 @@ def test_advance_condition():
 
 def test_finite_session_exhausts_and_refuses_extra_values():
     state = SessionState(1, lockstep_caps(initial=False, length=2))
-    state.initialized = True
     assert state.admit("controls", 1) == 0
     assert state.admit("controls", 2) == 1
     with pytest.raises(SessionEnded):
         state.admit("controls", 3)
     for _ in range(2):
         assert state.can_advance(1)
-        state.take_inputs()
         state.dispatch()
-        state.in_flight = False
     assert not state.can_advance(1)
     assert state.exhausted()
 
 
 def test_admission_refused_after_terminal_and_while_closing():
     state = SessionState(1, lockstep_caps())
-    state.initialized = True
     state.terminal_result()
     with pytest.raises(SessionEnded):
         state.admit("controls", 1)
     state = SessionState(2, lockstep_caps())
-    state.initialized = True
     state.closing = True
     with pytest.raises(SessionEnded):
         state.admit("controls", 1)
@@ -298,21 +286,19 @@ def test_valid_live_default_reaches_the_first_advance():
         streams=(_video_stream(),),
     )
     state = SessionState(1, caps)
-    state.initialized = True
     state.admit("controls", 1)
     assert state.can_advance(1)
-    assert state.take_inputs() == {"controls": 1, "camera": 3}
+    assert state.dispatch() == (0, {"controls": 1, "camera": 3})
 
 
 def test_queue_full_rejection_leaves_the_next_index_unchanged():
     state = SessionState(1, lockstep_caps(initial=False))
-    state.initialized = True
     assert state.admit("controls", 1) == 0
     assert state.admit("controls", 2) == 1
     with pytest.raises(SessionQueueFull):
         state.admit("controls", 3)
-    assert state.admitted["controls"] == 2 and list(state.queues["controls"]) == [1, 2]
-    state.take_inputs()
+    assert state.admitted_count("controls") == 2 and list(state.queue_values["controls"]) == [1, 2]
+    state.dispatch()
     assert state.admit("controls", 3) == 2  # the next index is the one after the admitted two
 
 
@@ -387,7 +373,6 @@ def test_slot_rejects_invalid_extents_before_recording_anything():
 
 def test_media_result_validates_everything_before_moving_any_cursor():
     state = SessionState(1, _two_stream_caps())
-    state.initialized = True
     with pytest.raises(ValueError, match="audio"):
         state.media_result(0, 0, {"video": ((2,), torch.float32), "audio": ((5,), torch.float32)})
     assert state.cursors == {"video": 0, "audio": 0} and state.next_sequence == 0

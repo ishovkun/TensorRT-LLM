@@ -32,24 +32,32 @@ from .session_protocol import ResultType, SessionEnded, SessionQueueFull, Sessio
 class SessionState:
     """Executor-side bookkeeping for one open session on rank 0.
 
-    Holds the queues, the live values, the counters and the terminal flag, and
-    answers the advance condition. It does not touch slots: the caller passes the
+    Holds the queues, the live values, the counters and the terminal result, and
+    answers the advance condition. The worker loop runs one advance at a time on
+    one thread, so "in flight" and "initialized" are positions in that loop, not
+    state kept here. It does not touch slots: the caller passes the
     free-slot count in, because the pool is a separate object with its own lifetime.
     """
 
     def __init__(self, session_id: int, capabilities: SessionCapabilities) -> None:
         self.session_id = session_id
         self.capabilities = capabilities
-        self.queues: Dict[str, Deque[Any]] = {s.name: deque() for s in capabilities.queued_inputs}
-        self.admitted: Dict[str, int] = {s.name: 0 for s in capabilities.queued_inputs}
-        self.live: Dict[str, Any] = {s.name: s.default for s in capabilities.live_inputs}
+        # Per queue input: admitted values not yet consumed, oldest first.
+        self.queue_values: Dict[str, Deque[Any]] = {
+            s.name: deque() for s in capabilities.queue_inputs
+        }
+        # Per live input: the newest admitted value, the default until the first submit.
+        self.live_values: Dict[str, Any] = {s.name: s.default for s in capabilities.live_inputs}
+        # Advances dispatched so far; the next one gets this index.
         self.next_advance = 0
+        # Results published so far, the terminal included; the next one gets this number.
         self.next_sequence = 0
+        # Per stream: units (frames, samples) published so far along its axis.
         self.cursors: Dict[str, int] = {s.name: 0 for s in capabilities.streams}
-        self.in_flight = False
+        # The terminal result once the session is done or failed; built once.
         self.terminal: Optional[SessionResultMessage] = None
+        # Set by the close command or the idle timeout; the loop ends at the next check.
         self.closing = False
-        self.initialized = False
 
     # ---- admission
 
@@ -67,51 +75,51 @@ class SessionState:
         if spec.validator is not None:
             spec.validator(value)
         if spec.policy == "live":
-            self.live[name] = value
+            self.live_values[name] = value
             return self.next_advance
         length = self.capabilities.length
-        if length is not None and self.admitted[name] >= length:
+        index = self.admitted_count(name)
+        if length is not None and index >= length:
             raise SessionEnded(
                 f"input {name!r}: all {length} values of a finite session are already queued"
             )
-        if len(self.queues[name]) >= spec.queue_depth:
+        if len(self.queue_values[name]) >= spec.queue_depth:
             raise SessionQueueFull(
                 f"input {name!r}: queue holds {spec.queue_depth} values; retry after the next advance"
             )
-        index = self.admitted[name]
-        self.queues[name].append(value)
-        self.admitted[name] = index + 1
+        self.queue_values[name].append(value)
         return index
+
+    def admitted_count(self, name: str) -> int:
+        """Values of a queued input admitted so far: every advance consumed one, the
+        rest are waiting. Also the advance index the next value gets."""
+        return self.next_advance + len(self.queue_values[name])
 
     # ---- advance
 
     def can_advance(self, free_slots: int) -> bool:
-        if not self.initialized or self.closing or self.terminal is not None or self.in_flight:
+        if self.closing or self.terminal is not None:
             return False
         if free_slots <= 0:
             return False
         length = self.capabilities.length
         if length is not None and self.next_advance >= length:
             return False
-        return all(self.queues[name] for name in self.queues)
+        return all(self.queue_values[name] for name in self.queue_values)
 
     def exhausted(self) -> bool:
         """A finite session has run every advance; the terminal result follows."""
         length = self.capabilities.length
-        return length is not None and self.next_advance >= length and not self.in_flight
+        return length is not None and self.next_advance >= length
 
-    def take_inputs(self) -> Dict[str, Any]:
-        """One value from every queue and the current value of every live input, as
-        the dispatched advance sees them."""
-        inputs = {name: queue.popleft() for name, queue in self.queues.items()}
-        inputs.update(self.live)
-        return inputs
-
-    def dispatch(self) -> int:
+    def dispatch(self) -> Tuple[int, Dict[str, Any]]:
+        """Start the next advance: its index, and its inputs, one value taken from
+        every queue plus the current value of every live input."""
         index = self.next_advance
         self.next_advance = index + 1
-        self.in_flight = True
-        return index
+        inputs = {name: queue.popleft() for name, queue in self.queue_values.items()}
+        inputs.update(self.live_values)
+        return index, inputs
 
     # ---- results
 
@@ -171,5 +179,5 @@ class SessionState:
         return self.terminal
 
     def discard_inputs(self) -> None:
-        for queue in self.queues.values():
+        for queue in self.queue_values.values():
             queue.clear()

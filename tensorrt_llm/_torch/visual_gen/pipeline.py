@@ -210,12 +210,12 @@ class SessionCapabilities(StrictBaseModel):
             raise ValueError(f"duplicate stream names: {stream_names}")
         if not self.streams:
             raise ValueError("a session must declare at least one stream")
-        if self.lockstep and len(self.queued_inputs) != 1:
+        if self.lockstep and len(self.queue_inputs) != 1:
             raise ValueError("a lockstep session has exactly one queued input")
         return self
 
     @property
-    def queued_inputs(self) -> Tuple[SessionInputSpec, ...]:
+    def queue_inputs(self) -> Tuple[SessionInputSpec, ...]:
         return tuple(s for s in self.inputs if s.policy == "queued")
 
     @property
@@ -270,16 +270,18 @@ class SessionCapabilities(StrictBaseModel):
 
 @dataclass
 class AdvanceOutcome:
-    """What ``advance`` and ``open_session`` hand back to the executor.
+    """The return type of ``advance`` and ``open_session``.
 
-    ``event`` is a CUDA event recorded behind this rank's work for the call, its
-    session-state updates and every write into the slot, or ``None`` when all of
-    it has completed on return. Every rank returns one, slot or no slot. ``done``
-    ends the session after this result. What was written is recorded by the slot
-    itself.
+    The pipeline ran one unit of work on the session's state and wrote its
+    streams into the slot it was given; this reports when that work is complete
+    and whether the session is over. The slot itself records what was written.
     """
 
+    # Recorded behind this rank's work for the call, its state updates and every
+    # write into the slot. None only when all of it had completed on return.
+    # Every rank returns one, slot or no slot.
     event: Optional[torch.cuda.Event] = None
+    # The session ends after this result; the executor appends the terminal.
     done: bool = False
 
 
@@ -289,6 +291,7 @@ class AdvanceOutcome:
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionPipelineConfig
+    from .executor import DiffusionRequest
     from .sleep import SleepRestoreMode
     from .slot_pool import DeliverySlot
 
@@ -607,7 +610,7 @@ class BasePipeline(nn.Module):
         """
         return {}
 
-    def prepare_request(self, req: Any) -> None:
+    def prepare_request(self, req: "DiffusionRequest") -> None:
         """Prepare model-specific inputs before warmup bookkeeping.
 
         Subclasses may mutate internal request state and resolve request
@@ -627,7 +630,7 @@ class BasePipeline(nn.Module):
         """
         return None
 
-    def infer(self, req: Any):
+    def infer(self, req: "DiffusionRequest"):
         raise NotImplementedError
 
     # ------------------------------------------------------------------ sessions
@@ -644,32 +647,36 @@ class BasePipeline(nn.Module):
     def supports_sessions(self) -> bool:
         return False
 
-    def session_capabilities(self, req: Any) -> SessionCapabilities:
+    def session_capabilities(self, req: "DiffusionRequest") -> SessionCapabilities:
         """Inputs, streams, geometry, length and profile for a session opened with
         ``req``. These determine admission, the slot pool and what the client may
         call. Raises ``ValueError`` when the request cannot be served as a session."""
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
     def open_session(
-        self, req: Any, initial_slot: Optional["DeliverySlot"]
-    ) -> Tuple[Any, AdvanceOutcome]:
+        self, req: "DiffusionRequest", initial_slot: Optional["DeliverySlot"]
+    ) -> Tuple[object, AdvanceOutcome]:
         """All expensive and allocating work for a session: prompt encode,
         conditioning, cache open, graph warmup, whole-clip denoise if that is the
-        model. Returns the session state (opaque to the executor) and the initial
-        outcome. ``initial_slot`` is the executor's reserved slot when the
-        capabilities declare an initial result, else ``None``; the slot records
-        what was put into it and the outcome's ``event`` covers this rank's work,
-        state and slot alike, so a rank given no slot still returns one. If
-        opening fails, release partial allocations and raise."""
+        model. Returns the session state, an object of the pipeline's choosing that
+        the executor only holds and hands back, and the initial outcome.
+        ``initial_slot`` is the executor's reserved slot when the capabilities
+        declare an initial result, else ``None``; the slot records what was put
+        into it and the outcome's ``event`` covers this rank's work, state and slot
+        alike, so a rank given no slot still returns one. If opening fails, release
+        partial allocations and raise.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
-    def validate_input(self, state: Any, name: str, value: Any) -> None:
+    def validate_input(self, state: object, name: str, value: Any) -> None:
         """Schema check on rank 0 before a value is enqueued or broadcast. Raises
         ``ValueError`` for a bad value. Must not change state. The default accepts
         anything the input's ``validator`` accepted."""
         del state, name, value
 
-    def advance(self, state: Any, inputs: Dict[str, Any], slot: "DeliverySlot") -> AdvanceOutcome:
+    def advance(
+        self, state: object, inputs: Dict[str, Any], slot: "DeliverySlot"
+    ) -> AdvanceOutcome:
         """One unit of work. ``inputs`` holds one value per queued input and the
         current value of every live input. Write each produced stream into
         ``slot.buffer(name, shape, dtype)``; the slot records what was written.
@@ -679,7 +686,7 @@ class BasePipeline(nn.Module):
         never overlap; a non-final advance must write at least one stream."""
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
-    def close_session(self, state: Any) -> None:
+    def close_session(self, state: object) -> None:
         """Release session state after work and transfers finish. Prompt-derived
         data may stay cached inside the pipeline so reopening with the same prompt
         skips the encode."""

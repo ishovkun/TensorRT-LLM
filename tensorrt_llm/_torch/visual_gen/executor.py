@@ -967,7 +967,6 @@ class DiffusionExecutor:
                 )
             )
             return
-        state.initialized = True
         self.response_queue.put(
             SessionOpened(session_id, capabilities=caps.public(), slots=pool.export_handles())
         )
@@ -1041,8 +1040,7 @@ class DiffusionExecutor:
 
     def _advance_once(self, state: SessionState, pool: SlotPool, pipeline_state: Any) -> None:
         slot = pool.reserve()
-        inputs = state.take_inputs()
-        index = state.dispatch()
+        index, inputs = state.dispatch()
         self._broadcast_session_tag(("advance", inputs))
         outcome = None
         error: Optional[str] = None
@@ -1058,7 +1056,6 @@ class DiffusionExecutor:
             logger.error(traceback.format_exc())
             error = str(e)
         all_ok = self._finish_advance(outcome, failed=error is not None)
-        state.in_flight = False
         if not all_ok:
             pool.release(slot.slot_id)
             self.response_queue.put(
