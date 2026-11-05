@@ -174,7 +174,7 @@ def test_admission_refused_after_the_terminal():
 # --------------------------------------------------------------------------- results
 
 
-def test_media_result_validates_and_advances_cursors():
+def test_media_result_advances_the_stream_positions():
     state = SessionState(3, steered_caps())
     written = {
         "video": ((1, 8, 4, 6, 3), torch.uint8),
@@ -186,13 +186,10 @@ def test_media_result_validates_and_advances_cursors():
     assert first.streams["video"] == ((1, 8, 4, 6, 3), torch.uint8)
     second = state.media_result(1, 1, {"video": written["video"]})
     assert second.sequence == 1
-    assert second.position == {"video": (8, 8)}  # audio omitted: its cursor stays
+    assert second.position == {"video": (8, 8)}  # audio omitted: its position stays
     with pytest.raises(ValueError):
-        state.media_result(2, 0, {"video": ((1, 9, 4, 6, 3), torch.uint8)})  # over max_shape
-    with pytest.raises(ValueError):
-        state.media_result(2, 0, {"video": ((1, 8, 4, 6, 3), torch.float32)})  # wrong dtype
-    with pytest.raises(ValueError):
-        state.media_result(2, 0, {})
+        state.media_result(2, 0, {"depth": ((1, 8, 4, 6), torch.uint8)})  # not declared
+    assert state.stream_positions == {"video": 16, "audio": 1000}  # nothing moved
     terminal = state.terminal_result()
     assert terminal.type is ResultType.TERMINAL and terminal.error is None
     assert terminal.sequence == 2
@@ -348,40 +345,18 @@ def _two_stream_caps(n=4):
     )
 
 
-def test_slot_rejects_invalid_extents():
+def test_buffer_views_fit_or_raise():
     pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"), local=True)
     _, slot = pool.reserve()
-    import numpy as np
-
-    video = slot["video"]
-    for bad in ((-1,), (0,), (5,), (2, 2), (1.5,), (torch.tensor(1.5),), (True,), ("2",)):
-        with pytest.raises(ValueError):
-            video.view(bad, torch.float32)
-    with pytest.raises(ValueError, match="declared"):
-        video.view((2,), torch.float16)
+    video = slot["video"]  # 4 float32 by _two_stream_caps: 16 bytes
+    assert video.nbytes == 16 and video.storage.is_contiguous()
+    with pytest.raises(ValueError, match="bytes"):
+        video.view((5,), torch.float32)
     view = video.view((3,), torch.float32)
     assert view.shape == (3,) and video.is_view_of(view)
+    assert video.view((2, 2), torch.float32).shape == (2, 2)  # any shape that fits
     assert not video.is_view_of(torch.zeros(3))  # someone else's memory
-    for ok in ((np.int64(2),), (torch.tensor(2),)):  # integer-like scalars index fine
-        assert video.view(ok, torch.float32).shape == (2,)
     pool.close()
-
-
-def test_media_result_validates_everything_before_moving_any_cursor():
-    state = SessionState(1, _two_stream_caps())
-    with pytest.raises(ValueError, match="audio"):
-        state.media_result(0, 0, {"video": ((2,), torch.float32), "audio": ((5,), torch.float32)})
-    assert state.stream_positions == {"video": 0, "audio": 0} and state.next_sequence == 0
-    for bad in ((-1,), (0,), (1, 1), (torch.tensor(1.5),), (True,), (1.5,)):
-        with pytest.raises(ValueError):
-            state.media_result(0, 0, {"video": (bad, torch.float32)})
-    assert state.stream_positions == {"video": 0, "audio": 0} and state.next_sequence == 0
-    first = state.media_result(
-        0, 0, {"video": ((1,), torch.float32), "audio": ((4,), torch.float32)}
-    )
-    assert first.position == {"video": (0, 1), "audio": (0, 4)} and first.sequence == 0
-    last = state.media_result(1, 1, {"video": ((4,), torch.float32)})
-    assert last.position == {"video": (1, 4)} and state.stream_positions == {"video": 5, "audio": 4}
 
 
 def test_partial_pool_construction_undoes_every_registration(monkeypatch):
@@ -389,9 +364,9 @@ def test_partial_pool_construction_undoes_every_registration(monkeypatch):
 
     registered, unregistered = [], []
 
-    def fake_lock(storage, bucket):
+    def fake_lock(storage):
         registered.append(storage.data_ptr())
-        bucket.append(storage)
+        return True
 
     def fake_unlock(storage):
         unregistered.append(storage.data_ptr())
@@ -437,7 +412,7 @@ def test_registered_pointer_is_the_exported_storage_pointer(monkeypatch):
     monkeypatch.setattr(
         pool_module,
         "_page_lock",
-        lambda storage, bucket: (registered.append(storage.data_ptr()), bucket.append(storage)),
+        lambda storage: bool(registered.append(storage.data_ptr())) or True,
     )
     monkeypatch.setattr(pool_module, "_page_unlock", lambda storage: None)
     pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"))

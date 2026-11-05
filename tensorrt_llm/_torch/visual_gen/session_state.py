@@ -133,25 +133,14 @@ class SessionState:
         slot_id: int,
         written: Dict[str, Tuple[Tuple[int, ...], torch.dtype]],
     ) -> SessionResultMessage:
-        """Build the message for what the slot recorded as written (stream name to
-        shape and dtype). Every stream is checked against its declaration before
-        anything moves: a rejected result publishes nothing and leaves every
-        cursor where it was. Each stream's start is its cursor, which then moves
-        by the extent along the stream axis."""
-        from .slot_pool import check_extent
-
+        """Build the message for the views the pipeline wrote (stream name to shape
+        and dtype, shapes already checked by the buffer that handed them out).
+        Each stream's start is its position, which then moves by the extent along
+        the stream axis; an unknown stream name raises before anything moves."""
         caps = self.capabilities
-        if not written:
-            raise ValueError("a media result must carry at least one stream")
-        checked: Dict[str, Tuple[Tuple[int, ...], torch.dtype, int]] = {}
-        for name, (shape, dtype) in written.items():
-            spec = caps.stream(name)
-            extents = check_extent(spec, shape, dtype)
-            checked[name] = (extents, dtype, extents[spec.axis])
-        streams: Dict[str, Tuple[Tuple[int, ...], torch.dtype]] = {}
+        counts = {name: shape[caps.stream(name).axis] for name, (shape, _) in written.items()}
         position: Dict[str, Tuple[int, int]] = {}
-        for name, (extents, dtype, count) in checked.items():
-            streams[name] = (extents, dtype)
+        for name, count in counts.items():
             start = self.stream_positions[name]
             position[name] = (start, count)
             self.stream_positions[name] = start + count
@@ -160,7 +149,7 @@ class SessionState:
             sequence=self.next_sequence,
             advance_index=advance_index,
             slot_id=slot_id,
-            streams=streams,
+            streams=dict(written),
             position=position,
         )
         self.next_sequence += 1

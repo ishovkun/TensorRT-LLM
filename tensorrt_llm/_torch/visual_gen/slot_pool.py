@@ -25,74 +25,58 @@ memory shared through CUDA IPC.
 from __future__ import annotations
 
 import math
-import operator
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.pipeline import SessionCapabilities, SessionStreamSpec
-from tensorrt_llm._torch.visual_gen.session_protocol import SlotHandles
+from tensorrt_llm._torch.visual_gen.session_protocol import SharedTensorHandle, SlotHandles
 from tensorrt_llm.logger import logger
 
 
-def check_extent(
-    spec: SessionStreamSpec, shape: Tuple[int, ...], dtype: torch.dtype
-) -> Tuple[int, ...]:
-    """The shape a stream may carry in one result, or ``ValueError``: the declared
-    dtype, the declared rank, every extent a positive integer no larger than the
-    declared maximum. Shared by the slot (before a view is handed out) and by
-    the worker's state (before a result is published)."""
-    if dtype != spec.dtype:
-        raise ValueError(f"stream {spec.name!r}: {dtype} written, {spec.dtype} declared")
-    if len(shape) != len(spec.max_shape):
-        raise ValueError(
-            f"stream {spec.name!r}: shape {tuple(shape)} has rank {len(shape)}, "
-            f"declared {len(spec.max_shape)}"
-        )
-    extents = []
-    for d, limit in zip(shape, spec.max_shape):
-        # The integer-index protocol: ints, NumPy and torch integer scalars pass,
-        # a fractional value is refused rather than truncated; bools are refused
-        # explicitly since they index too.
-        if isinstance(d, bool):
-            raise ValueError(f"stream {spec.name!r}: extent {d!r} is not an integer")
-        try:
-            d = operator.index(d)
-        except TypeError:
-            raise ValueError(f"stream {spec.name!r}: extent {d!r} is not an integer") from None
-        if d < 1 or d > int(limit):
-            raise ValueError(
-                f"stream {spec.name!r}: extent {d} outside 1..{int(limit)} in shape {tuple(shape)}"
-            )
-        extents.append(d)
-    return tuple(extents)
-
-
 class StreamBuffer:
-    """Fixed storage for one stream in one slot, sized for the stream's largest
-    result. Hands out views of a prefix in the shape of one result; a view is the
-    storage, no copy."""
+    """Fixed storage for one stream in one slot: a flat byte tensor allocated here,
+    sized for the stream's largest result, exported once so the client can map it,
+    page-locked when it lives on the host. Hands out views of a prefix in the
+    shape of one result; a view is the storage, no copy."""
 
-    def __init__(self, spec: SessionStreamSpec, storage: torch.Tensor, handle: Dict[str, Any]):
-        self.spec = spec
-        self.storage = storage  # flat uint8 of spec.max_bytes
-        self.handle = handle  # what the client maps it from; made once, at allocation
+    def __init__(self, nbytes: int, device: torch.device, *, local: bool) -> None:
+        self.storage = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        # The export comes first: sharing host memory moves it, and the client
+        # must map the address that is then page-locked.
+        self.handle: SharedTensorHandle = SharedTensorContainer.from_tensor(
+            self.storage, local=local
+        ).dump_to_dict()
+        # Host pages are pinned (cudaHostRegister) so device-to-host copies into
+        # them run as asynchronous DMA; undone in close(). Device memory needs none.
+        self._page_locked = device.type != "cuda" and _page_lock(self.storage)
 
     @property
     def device(self) -> torch.device:
         return self.storage.device
 
+    @property
+    def nbytes(self) -> int:
+        return self.storage.numel()
+
     def view(self, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         """A tensor of ``shape`` and ``dtype`` over the start of the storage. Raises
-        ``ValueError`` when the request exceeds what the stream declared."""
-        shape = check_extent(self.spec, shape, dtype)
+        ``ValueError`` when it does not fit."""
         nbytes = math.prod(shape) * dtype.itemsize
-        return self.storage[:nbytes].view(dtype).view(shape)
+        if nbytes > self.storage.numel():
+            raise ValueError(f"{nbytes} bytes requested, the buffer holds {self.storage.numel()}")
+        return self.storage[:nbytes].view(dtype).view(tuple(shape))
 
     def is_view_of(self, tensor: torch.Tensor) -> bool:
         """Whether ``tensor`` views this storage: what a pipeline may report as written."""
         return tensor.untyped_storage().data_ptr() == self.storage.untyped_storage().data_ptr()
+
+    def close(self) -> None:
+        """Undo the page lock before the storage is freed. Repeatable."""
+        if self._page_locked:
+            self._page_locked = False
+            _page_unlock(self.storage)
 
 
 class DeliverySlot:
@@ -139,32 +123,30 @@ class SlotPool:
         self.num_slots = num_slots
         self.device = device
         self.local = local
-        self._registered: List[torch.Tensor] = []
         self._slots: List[DeliverySlot] = []
         self._free: List[int] = []
+        made: List[StreamBuffer] = []
         try:
             for slot_id in range(num_slots):
-                buffers = {spec.name: self._allocate(spec) for spec in capabilities.streams}
+                buffers: Dict[str, StreamBuffer] = {}
+                for spec in capabilities.streams:
+                    buffers[spec.name] = self._allocate(spec)
+                    made.append(buffers[spec.name])
                 self._slots.append(DeliverySlot(buffers))
                 self._free.append(slot_id)
         except BaseException:
-            # A later allocation failed: every page-lock taken so far is undone
-            # before the original error reaches the caller, who never sees the pool.
-            self.close()
+            # A later allocation failed: every buffer made so far, a half-built
+            # slot's included, is closed before the error reaches the caller.
+            for buffer in made:
+                buffer.close()
+            self._slots.clear()
+            self._free.clear()
             raise
         self._free.reverse()  # reserve() pops from the end: slot 0 first
 
     def _allocate(self, spec: SessionStreamSpec) -> StreamBuffer:
-        if spec.placement == "device":
-            storage = torch.empty(spec.max_bytes, dtype=torch.uint8, device=self.device)
-            handle = SharedTensorContainer.from_tensor(storage, local=self.local).dump_to_dict()
-        else:
-            storage = torch.empty(spec.max_bytes, dtype=torch.uint8)
-            # Sharing moves the bytes into shared memory and changes the storage
-            # address, so the handle is made before the address is page-locked.
-            handle = SharedTensorContainer.from_tensor(storage, local=self.local).dump_to_dict()
-            _page_lock(storage, self._registered)
-        return StreamBuffer(spec, storage, handle)
+        device = self.device if spec.placement == "device" else torch.device("cpu")
+        return StreamBuffer(spec.max_bytes, device, local=self.local)
 
     @property
     def free_count(self) -> int:
@@ -200,30 +182,31 @@ class SlotPool:
         return [{name: slot[name].handle for name in slot.stream_names} for slot in self._slots]
 
     def close(self) -> None:
-        for storage in self._registered:
-            _page_unlock(storage)
-        self._registered.clear()
+        for slot in self._slots:
+            for name in slot.stream_names:
+                slot[name].close()
         self._slots.clear()
         self._free.clear()
 
 
-def _page_lock(storage: torch.Tensor, registered: List[torch.Tensor]) -> None:
+def _page_lock(storage: torch.Tensor) -> bool:
     """Pin an existing host allocation so device-to-host copies into it are
     asynchronous. Shared memory cannot be allocated pinned, so it is registered
-    after the fact; a failure leaves the copy synchronous and is logged once."""
+    after the fact; a failure leaves the copy synchronous and is logged once.
+    Returns whether the storage is now registered."""
     if not torch.cuda.is_available() or storage.numel() == 0:
-        return
+        return False
     try:
         rc = torch.cuda.cudart().cudaHostRegister(storage.data_ptr(), storage.numel(), 0)
     except Exception as exc:  # the runtime binding may be missing on some builds
         logger.warning(f"slot pool: cudaHostRegister unavailable ({exc}); copies stay synchronous")
-        return
+        return False
     if int(rc) != 0:
         logger.warning(
             f"slot pool: cudaHostRegister failed with {int(rc)}; copies stay synchronous"
         )
-        return
-    registered.append(storage)
+        return False
+    return True
 
 
 def _page_unlock(storage: torch.Tensor) -> None:
@@ -271,5 +254,4 @@ __all__ = [
     "DeliverySlot",
     "SlotPool",
     "StreamBuffer",
-    "check_extent",
 ]
