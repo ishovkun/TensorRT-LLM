@@ -87,7 +87,7 @@ class SessionSubmit(SessionCommand):
 
     session_id: int
     name: str
-    value: Any
+    value: object  # whatever the pipeline's validator accepts; opaque to the protocol
 
 
 class ControlType(Enum):

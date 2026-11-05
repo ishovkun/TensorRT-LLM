@@ -297,7 +297,7 @@ def test_queue_full_rejection_leaves_the_next_index_unchanged():
     assert state.admit("controls", 2) == 1
     with pytest.raises(SessionQueueFull):
         state.admit("controls", 3)
-    assert state.admitted_count("controls") == 2 and list(state.queue_values["controls"]) == [1, 2]
+    assert state.admitted_count("controls") == 2 and list(state.inputs["controls"]) == [1, 2]
     state.dispatch()
     assert state.admit("controls", 3) == 2  # the next index is the one after the admitted two
 

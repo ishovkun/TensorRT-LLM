@@ -21,7 +21,7 @@ only through the messages of ``session_protocol.py``.
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional, Tuple
 
 import torch
 
@@ -42,12 +42,15 @@ class SessionState:
     def __init__(self, session_id: int, capabilities: SessionCapabilities) -> None:
         self.session_id = session_id
         self.capabilities = capabilities
-        # Per queue input: admitted values not yet consumed, oldest first.
-        self.queue_values: Dict[str, Deque[Any]] = {
-            s.name: deque() for s in capabilities.queue_inputs
+        # Per input, the values waiting for an advance, oldest first. A queue input
+        # holds up to its queue depth and each advance consumes one; a live input
+        # always holds exactly one value, the default until the first submit, which
+        # later submits replace and every advance reads. A value is whatever the
+        # pipeline's validator accepted: opaque here, only carried to advance().
+        self.inputs: Dict[str, Deque[object]] = {
+            s.name: deque([s.default]) if s.policy == "live" else deque()
+            for s in capabilities.inputs
         }
-        # Per live input: the newest admitted value, the default until the first submit.
-        self.live_values: Dict[str, Any] = {s.name: s.default for s in capabilities.live_inputs}
         # Advances dispatched so far; the next one gets this index.
         self.next_advance = 0
         # Results published so far, the terminal included; the next one gets this number.
@@ -61,7 +64,7 @@ class SessionState:
 
     # ---- admission
 
-    def admit(self, name: str, value: Any) -> int:
+    def admit(self, name: str, value: object) -> int:
         """Validate and admit one value. Returns the advance index: for a queued input
         the advance that will consume the value; for a live input the next advance to
         be dispatched. Raises ``ValueError`` (the validator),
@@ -74,8 +77,9 @@ class SessionState:
         spec = self.capabilities.input(name)
         if spec.validator is not None:
             spec.validator(value)
+        buffer = self.inputs[name]
         if spec.policy == "live":
-            self.live_values[name] = value
+            buffer[0] = value
             return self.next_advance
         length = self.capabilities.length
         index = self.admitted_count(name)
@@ -83,17 +87,17 @@ class SessionState:
             raise SessionEnded(
                 f"input {name!r}: all {length} values of a finite session are already queued"
             )
-        if len(self.queue_values[name]) >= spec.queue_depth:
+        if len(buffer) >= spec.queue_depth:
             raise SessionQueueFull(
                 f"input {name!r}: queue holds {spec.queue_depth} values; retry after the next advance"
             )
-        self.queue_values[name].append(value)
+        buffer.append(value)
         return index
 
     def admitted_count(self, name: str) -> int:
         """Values of a queued input admitted so far: every advance consumed one, the
         rest are waiting. Also the advance index the next value gets."""
-        return self.next_advance + len(self.queue_values[name])
+        return self.next_advance + len(self.inputs[name])
 
     # ---- advance
 
@@ -105,20 +109,22 @@ class SessionState:
         length = self.capabilities.length
         if length is not None and self.next_advance >= length:
             return False
-        return all(self.queue_values[name] for name in self.queue_values)
+        return all(self.inputs[s.name] for s in self.capabilities.queue_inputs)
 
     def exhausted(self) -> bool:
         """A finite session has run every advance; the terminal result follows."""
         length = self.capabilities.length
         return length is not None and self.next_advance >= length
 
-    def dispatch(self) -> Tuple[int, Dict[str, Any]]:
-        """Start the next advance: its index, and its inputs, one value taken from
-        every queue plus the current value of every live input."""
+    def dispatch(self) -> Tuple[int, Dict[str, object]]:
+        """Start the next advance: its index, and its inputs, one value consumed from
+        every queue input and the current value of every live input."""
         index = self.next_advance
         self.next_advance = index + 1
-        inputs = {name: queue.popleft() for name, queue in self.queue_values.items()}
-        inputs.update(self.live_values)
+        inputs = {
+            s.name: self.inputs[s.name][0] if s.policy == "live" else self.inputs[s.name].popleft()
+            for s in self.capabilities.inputs
+        }
         return index, inputs
 
     # ---- results
@@ -179,5 +185,5 @@ class SessionState:
         return self.terminal
 
     def discard_inputs(self) -> None:
-        for queue in self.queue_values.values():
-            queue.clear()
+        for spec in self.capabilities.queue_inputs:
+            self.inputs[spec.name].clear()

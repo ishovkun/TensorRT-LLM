@@ -668,6 +668,9 @@ class BasePipeline(nn.Module):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support sessions")
 
+    # A submitted value has no type narrower than Any at this boundary: it is
+    # whatever this pipeline's own validator accepts (a tensor, an array, a list of
+    # rows), and only the pipeline knows which. The executor carries it as object.
     def validate_input(self, state: object, name: str, value: Any) -> None:
         """Schema check on rank 0 before a value is enqueued or broadcast. Raises
         ``ValueError`` for a bad value. Must not change state. The default accepts
