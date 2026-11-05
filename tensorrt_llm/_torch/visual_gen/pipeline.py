@@ -112,7 +112,7 @@ class RefSlotSpec(StrictBaseModel):
 # ``public()`` form, so the callables never leave the worker.
 
 
-class InputSpec(StrictBaseModel):
+class SessionInputSpec(StrictBaseModel):
     """One named input the pipeline accepts during a session.
 
     A ``queued`` input supplies one value per advance and the worker waits for it;
@@ -134,7 +134,7 @@ class InputSpec(StrictBaseModel):
     queue_depth: int = Field(default=8, ge=1)
 
     @model_validator(mode="after")
-    def _check_default(self) -> "InputSpec":
+    def _check_default(self) -> "SessionInputSpec":
         declared = "default" in self.model_fields_set
         if self.policy == "live" and not declared:
             raise ValueError(
@@ -151,7 +151,7 @@ class InputSpec(StrictBaseModel):
         return self
 
 
-class StreamSpec(StrictBaseModel):
+class SessionStreamSpec(StrictBaseModel):
     """One named output stream the pipeline produces.
 
     ``max_shape`` is the largest tensor one result may carry for this stream; the
@@ -171,7 +171,7 @@ class StreamSpec(StrictBaseModel):
     placement: Literal["host", "device"] = "host"
 
     @model_validator(mode="after")
-    def _check_geometry(self) -> "StreamSpec":
+    def _check_geometry(self) -> "SessionStreamSpec":
         if not self.max_shape or any(d <= 0 for d in self.max_shape):
             raise ValueError(f"stream {self.name!r}: max_shape must be non-empty and positive")
         if not 0 <= self.axis < len(self.max_shape):
@@ -194,8 +194,8 @@ class SessionCapabilities(StrictBaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    inputs: Tuple[InputSpec, ...] = ()
-    streams: Tuple[StreamSpec, ...]
+    inputs: Tuple[SessionInputSpec, ...] = ()
+    streams: Tuple[SessionStreamSpec, ...]
     initial_result: bool = False
     length: Optional[int] = None
     lockstep: bool = False
@@ -215,24 +215,24 @@ class SessionCapabilities(StrictBaseModel):
         return self
 
     @property
-    def queued_inputs(self) -> Tuple[InputSpec, ...]:
+    def queued_inputs(self) -> Tuple[SessionInputSpec, ...]:
         return tuple(s for s in self.inputs if s.policy == "queued")
 
     @property
-    def live_inputs(self) -> Tuple[InputSpec, ...]:
+    def live_inputs(self) -> Tuple[SessionInputSpec, ...]:
         return tuple(s for s in self.inputs if s.policy == "live")
 
     @property
     def max_result_bytes(self) -> int:
         return sum(s.max_bytes for s in self.streams)
 
-    def input(self, name: str) -> InputSpec:
+    def input(self, name: str) -> SessionInputSpec:
         for spec in self.inputs:
             if spec.name == name:
                 return spec
         raise ValueError(f"unknown input {name!r}; declared: {[s.name for s in self.inputs]}")
 
-    def stream(self, name: str) -> StreamSpec:
+    def stream(self, name: str) -> SessionStreamSpec:
         for spec in self.streams:
             if spec.name == name:
                 return spec

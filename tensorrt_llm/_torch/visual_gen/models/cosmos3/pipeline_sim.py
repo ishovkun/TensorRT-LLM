@@ -35,7 +35,7 @@ from tensorrt_llm.math_utils import ceil_div
 
 from ...cache import BlockCausalKVCacheManager, RolloutSpec
 from ...cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
-from ...pipeline import AdvanceOutcome, InputSpec, SessionCapabilities, StreamSpec
+from ...pipeline import AdvanceOutcome, SessionCapabilities, SessionInputSpec, SessionStreamSpec
 from ...pipeline_registry import register_pipeline
 from ...utils import make_noise_generator, postprocess_video_tensor
 from ..wan.vae_loader import load_wan_vae
@@ -998,9 +998,9 @@ class Cosmos3NanoSimBimanualPipeline(Cosmos3OmniMoTPipeline):
         max_generated = max(allowed) // sim.action_tokens_per_frame
         frames_per_advance = max_generated * self.vae_scale_factor_temporal
         return SessionCapabilities(
-            inputs=(InputSpec(name="actions", validator=validate_rows),),
+            inputs=(SessionInputSpec(name="actions", validator=validate_rows),),
             streams=(
-                StreamSpec(
+                SessionStreamSpec(
                     name="video",
                     kind="video",
                     dtype=torch.uint8,

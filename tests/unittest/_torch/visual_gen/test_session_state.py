@@ -20,9 +20,9 @@ import torch
 
 from tensorrt_llm._torch.visual_gen.pipeline import (
     AdvanceOutcome,
-    InputSpec,
     SessionCapabilities,
-    StreamSpec,
+    SessionInputSpec,
+    SessionStreamSpec,
 )
 from tensorrt_llm._torch.visual_gen.session_protocol import (
     ResultType,
@@ -36,7 +36,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 def _video_stream(frames=8, h=4, w=6):
-    return StreamSpec(
+    return SessionStreamSpec(
         name="video", kind="video", dtype=torch.uint8, max_shape=(1, frames, h, w, 3), rate=24.0
     )
 
@@ -48,7 +48,7 @@ def _positive(value):
 
 def lockstep_caps(initial=True, length=None):
     return SessionCapabilities(
-        inputs=(InputSpec(name="controls", validator=_positive, queue_depth=2),),
+        inputs=(SessionInputSpec(name="controls", validator=_positive, queue_depth=2),),
         streams=(_video_stream(),),
         initial_result=initial,
         length=length,
@@ -59,12 +59,12 @@ def lockstep_caps(initial=True, length=None):
 def steered_caps():
     return SessionCapabilities(
         inputs=(
-            InputSpec(name="controls", queue_depth=3),
-            InputSpec(name="camera", policy="live", default=(0.0, 0.0)),
+            SessionInputSpec(name="controls", queue_depth=3),
+            SessionInputSpec(name="camera", policy="live", default=(0.0, 0.0)),
         ),
         streams=(
             _video_stream(),
-            StreamSpec(
+            SessionStreamSpec(
                 name="audio", kind="audio", dtype=torch.float32, max_shape=(1, 2, 1024), axis=2
             ),
         ),
@@ -76,20 +76,22 @@ def steered_caps():
 
 def test_capabilities_reject_bad_declarations():
     with pytest.raises(ValueError):
-        InputSpec(name="x", policy="sometimes")
+        SessionInputSpec(name="x", policy="sometimes")
     with pytest.raises(ValueError):
-        InputSpec(name="x", queue_depth=0)
+        SessionInputSpec(name="x", queue_depth=0)
     with pytest.raises(ValueError):
-        StreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(1, 2), placement="pinned")
+        SessionStreamSpec(
+            name="v", kind="video", dtype=torch.uint8, max_shape=(1, 2), placement="pinned"
+        )
     with pytest.raises(ValueError):
-        StreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(0, 1))
+        SessionStreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(0, 1))
     with pytest.raises(ValueError):
-        StreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(1, 2), axis=5)
+        SessionStreamSpec(name="v", kind="video", dtype=torch.uint8, max_shape=(1, 2), axis=5)
     with pytest.raises(ValueError):
         SessionCapabilities(inputs=(), streams=())
     with pytest.raises(ValueError):
         SessionCapabilities(
-            inputs=(InputSpec(name="a"), InputSpec(name="a")),
+            inputs=(SessionInputSpec(name="a"), SessionInputSpec(name="a")),
             streams=(_video_stream(),),
         )
     with pytest.raises(ValueError):
@@ -263,9 +265,9 @@ def test_outcome_defaults():
 
 def test_live_input_must_declare_a_default():
     with pytest.raises(ValueError, match="needs a default"):
-        InputSpec(name="camera", policy="live")
+        SessionInputSpec(name="camera", policy="live")
     # A queued input reads no default, so it may leave it out.
-    assert InputSpec(name="controls").default is None
+    assert SessionInputSpec(name="controls").default is None
 
 
 def _nonnegative(value):
@@ -275,23 +277,23 @@ def _nonnegative(value):
 
 def test_declared_default_is_checked_like_a_submitted_value():
     with pytest.raises(ValueError, match="default is refused"):
-        InputSpec(name="camera", policy="live", validator=_nonnegative, default=-1)
+        SessionInputSpec(name="camera", policy="live", validator=_nonnegative, default=-1)
     with pytest.raises(ValueError, match="default is refused"):
-        InputSpec(name="camera", policy="live", validator=_nonnegative, default=None)
+        SessionInputSpec(name="camera", policy="live", validator=_nonnegative, default=None)
 
     def allows_none(value):
         if value is not None:
             _nonnegative(value)
 
-    spec = InputSpec(name="camera", policy="live", validator=allows_none, default=None)
+    spec = SessionInputSpec(name="camera", policy="live", validator=allows_none, default=None)
     assert spec.default is None
 
 
 def test_valid_live_default_reaches_the_first_advance():
     caps = SessionCapabilities(
         inputs=(
-            InputSpec(name="controls"),
-            InputSpec(name="camera", policy="live", validator=_nonnegative, default=3),
+            SessionInputSpec(name="controls"),
+            SessionInputSpec(name="camera", policy="live", validator=_nonnegative, default=3),
         ),
         streams=(_video_stream(),),
     )
@@ -354,8 +356,12 @@ def test_supported_input_forms_survive_the_wire_serialization():
 def _two_stream_caps(n=4):
     return SessionCapabilities(
         streams=(
-            StreamSpec(name="video", kind="video", dtype=torch.float32, max_shape=(n,), axis=0),
-            StreamSpec(name="audio", kind="audio", dtype=torch.float32, max_shape=(n,), axis=0),
+            SessionStreamSpec(
+                name="video", kind="video", dtype=torch.float32, max_shape=(n,), axis=0
+            ),
+            SessionStreamSpec(
+                name="audio", kind="audio", dtype=torch.float32, max_shape=(n,), axis=0
+            ),
         ),
     )
 

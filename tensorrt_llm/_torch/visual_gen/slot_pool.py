@@ -32,14 +32,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-from tensorrt_llm._torch.visual_gen.pipeline import SessionCapabilities, StreamSpec
+from tensorrt_llm._torch.visual_gen.pipeline import SessionCapabilities, SessionStreamSpec
 from tensorrt_llm._torch.visual_gen.session_protocol import SlotHandles
 from tensorrt_llm.logger import logger
 
 
 @dataclass
 class _StreamBuffer:
-    spec: StreamSpec
+    spec: SessionStreamSpec
     storage: torch.Tensor  # flat uint8 of spec.max_bytes
     handle: Dict[str, Any]  # what the client maps it from; made once, at allocation
     shape: Optional[Tuple[int, ...]] = None
@@ -47,7 +47,9 @@ class _StreamBuffer:
     nbytes: int = 0
 
 
-def check_extent(spec: StreamSpec, shape: Tuple[int, ...], dtype: torch.dtype) -> Tuple[int, ...]:
+def check_extent(
+    spec: SessionStreamSpec, shape: Tuple[int, ...], dtype: torch.dtype
+) -> Tuple[int, ...]:
     """The shape a stream may carry in one result, or ``ValueError``: the declared
     dtype, the declared rank, every extent a positive integer no larger than the
     declared maximum. Shared by the slot (before a view is made) and by the
@@ -160,7 +162,7 @@ class SlotPool:
             raise
         self._free.reverse()  # reserve() pops from the end: slot 0 first
 
-    def _allocate(self, spec: StreamSpec) -> _StreamBuffer:
+    def _allocate(self, spec: SessionStreamSpec) -> _StreamBuffer:
         if spec.placement == "device":
             storage = torch.empty(spec.max_bytes, dtype=torch.uint8, device=self.device)
             handle = SharedTensorContainer.from_tensor(storage, local=self.local).dump_to_dict()

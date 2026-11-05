@@ -45,9 +45,9 @@ from tensorrt_llm._torch.visual_gen.executor import (
 )
 from tensorrt_llm._torch.visual_gen.pipeline import (
     AdvanceOutcome,
-    InputSpec,
     SessionCapabilities,
-    StreamSpec,
+    SessionInputSpec,
+    SessionStreamSpec,
 )
 from tensorrt_llm._torch.visual_gen.session_protocol import (
     ControlType,
@@ -103,12 +103,12 @@ class CountingPipeline:
     def session_capabilities(self, req):
         inputs = []
         if self.queued:
-            inputs.append(InputSpec(name="controls", validator=_non_negative, queue_depth=2))
-        inputs.append(InputSpec(name="camera", policy="live", default=0))
+            inputs.append(SessionInputSpec(name="controls", validator=_non_negative, queue_depth=2))
+        inputs.append(SessionInputSpec(name="camera", policy="live", default=0))
         return SessionCapabilities(
             inputs=tuple(inputs),
             streams=(
-                StreamSpec(
+                SessionStreamSpec(
                     name="video", kind="video", dtype=torch.uint8, max_shape=(1, FRAMES, H, W, 3)
                 ),
             ),
