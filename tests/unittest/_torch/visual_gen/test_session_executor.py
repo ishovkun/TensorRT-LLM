@@ -43,6 +43,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     FatalRankError,
     SessionChannel,
     SessionResources,
+    _SessionExit,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import (
     AdvanceOutcome,
@@ -322,7 +323,7 @@ class Harness:
                 if message is None:
                     return
                 if isinstance(message, SessionOpen):
-                    if self.executor._serve_session(message.request):
+                    if self.executor._serve_session(message.request) is _SessionExit.SHUTDOWN:
                         return
                 else:
                     self.executor._answer_stray_command(message)

@@ -161,7 +161,7 @@ def test_finite_session_exhausts_and_refuses_extra_values():
         assert state.can_advance(1)
         state.dispatch()
     assert not state.can_advance(1)
-    assert state.exhausted()
+    assert state.complete()
 
 
 def test_admission_refused_after_the_terminal():

@@ -109,8 +109,9 @@ class SessionState:
             return False
         return all(self.inputs[s.name] for s in self.capabilities.queue_inputs)
 
-    def exhausted(self) -> bool:
-        """A finite session has run every advance; the terminal result follows."""
+    def complete(self) -> bool:
+        """A finite session has dispatched every advance it declared; the terminal
+        result follows."""
         length = self.capabilities.length
         return length is not None and self.next_advance >= length
 
