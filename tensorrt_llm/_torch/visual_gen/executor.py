@@ -99,6 +99,15 @@ class _SessionExit(Enum):
     IDLE_TIMEOUT = "idle_timeout"  # the client went quiet past the configured limit
 
 
+class _RankTag(Enum):
+    """What rank 0 tells the other ranks to do next, one collective per step."""
+
+    OPEN_GO = "open_go"  # every rank runs the pipeline's open
+    OPEN_ABORT = "open_abort"  # rank 0 refused the session before any pipeline work
+    ADVANCE = "advance"  # every rank runs one advance; the payload is the inputs
+    CLOSE = "close"  # every rank runs the pipeline's close
+
+
 def _reap_worker_process(process: mp.Process) -> bool:
     worker_pid = process.pid
     if worker_pid is None:
@@ -863,12 +872,78 @@ class DiffusionExecutor:
         value = getattr(cfg, "idle_timeout", None) if cfg is not None else None
         return float(value) if value else None
 
-    def _broadcast_session_tag(self, payload: Any) -> Any:
-        if self.world_size == 1:
-            return payload
-        obj = [payload]
+    def _send_tag(self, tag: _RankTag, payload: Any = None) -> None:
+        """Rank 0: the other ranks' next step. One collective that every rank
+        enters, the others through ``_recv_tag``; nothing to do alone."""
+        if self.world_size > 1:
+            dist.broadcast_object_list([(tag, payload)], src=0)
+
+    def _recv_tag(self) -> Tuple[_RankTag, Any]:
+        """Ranks other than 0: wait for rank 0's next step and its payload."""
+        obj = [None]
         dist.broadcast_object_list(obj, src=0)
         return obj[0]
+
+    def _open_pipeline(
+        self, req: DiffusionRequest, slot: Optional[DeliverySlot]
+    ) -> Tuple[Any, AdvanceOutcome]:
+        """The pipeline's part of opening, on every rank: its open call, then the
+        completion barrier. Returns the pipeline state and the open's outcome.
+        Raises what the pipeline
+        raised, or ``RuntimeError`` when another rank failed; either way nothing
+        stays open on this rank. With peers a failure here ends this rank
+        instead (``_fail_rank``)."""
+        what = f"session {req.request_id} open"
+        pipeline_state, outcome, error = None, None, None
+        try:
+            with torch.inference_mode():
+                pipeline_state, outcome = self.pipeline.open_session(req, slot)
+        except Exception as e:
+            self._fail_rank(what, e)
+            logger.error(f"Worker {self.device_id}: {what} failed: {e}")
+            logger.error(traceback.format_exc())
+            error = e
+        if self._finalize_advance(outcome):
+            return pipeline_state, outcome
+        if pipeline_state is not None:
+            self._close_pipeline(pipeline_state, what)
+        if error is not None:
+            raise error
+        raise RuntimeError(f"{what} failed on another rank")
+
+    def _advance_pipeline(
+        self,
+        pipeline_state: Any,
+        inputs: Dict[str, object],
+        slot: Optional[DeliverySlot],
+        what: str,
+    ) -> AdvanceOutcome:
+        """The pipeline's part of one step, on every rank: its advance call, then
+        the completion barrier. Raises what the pipeline raised, or
+        ``RuntimeError`` when another rank failed. With peers a failure here ends
+        this rank instead (``_fail_rank``)."""
+        outcome, error = None, None
+        try:
+            with torch.inference_mode():
+                outcome = self.pipeline.advance(pipeline_state, inputs, slot)
+        except Exception as e:
+            self._fail_rank(what, e)
+            logger.error(f"Worker {self.device_id}: {what} failed: {e}")
+            logger.error(traceback.format_exc())
+            error = e
+        if self._finalize_advance(outcome):
+            return outcome
+        if error is not None:
+            raise error
+        raise RuntimeError(f"{what} failed on another rank")
+
+    def _close_pipeline(self, pipeline_state: Any, what: str) -> None:
+        """The pipeline's close on this rank; a failure is logged, nothing else."""
+        try:
+            with torch.inference_mode():
+                self.pipeline.close_session(pipeline_state)
+        except Exception as e:
+            logger.error(f"Worker {self.device_id}: {what}: close failed: {e}")
 
     def _finalize_advance(self, outcome: Optional[AdvanceOutcome]) -> bool:
         """Wait for this rank's writes, then agree with every rank whether the
@@ -974,7 +1049,7 @@ class DiffusionExecutor:
             # abort and the reply carries the failure class.
             logger.error(f"Worker {self.device_id}: session {session_id} refused: {e}")
             logger.error(traceback.format_exc())
-            self._broadcast_session_tag(("open_abort",))
+            self._send_tag(_RankTag.OPEN_ABORT)
             # Asking an unsupported pipeline for a session is the caller's mistake;
             # what the pipeline itself raised is classified by the pipeline.
             error_type = (
@@ -985,31 +1060,14 @@ class DiffusionExecutor:
             self.response_queue.put(SessionOpened(session_id, error=str(e), error_type=error_type))
             return None
 
-        self._broadcast_session_tag(("open_go",))
+        self._send_tag(_RankTag.OPEN_GO)
         initial_index, initial_slot = pool.acquire() if caps.initial_result else (None, None)
-        outcome = None
-        open_error: Optional[Exception] = None
         try:
-            with torch.inference_mode():
-                pipeline_state, outcome = pipeline.open_session(req, initial_slot)
+            pipeline_state, outcome = self._open_pipeline(req, initial_slot)
         except Exception as e:
-            # After the go broadcast the peers are inside their own open call:
-            # with peers this rank cannot be trusted to reach another collective.
-            self._fail_rank(f"session {session_id} open", e)
-            logger.error(f"Worker {self.device_id}: session {session_id} open failed: {e}")
-            logger.error(traceback.format_exc())
-            open_error = e
-        if not self._finalize_advance(outcome):
-            message = str(open_error) if open_error is not None else "open failed on another rank"
             self.response_queue.put(
                 SessionOpened(
-                    session_id,
-                    error=message,
-                    error_type=(
-                        pipeline.classify_request_failure(open_error)
-                        if open_error is not None
-                        else None
-                    ),
+                    session_id, error=str(e), error_type=pipeline.classify_request_failure(e)
                 )
             )
             return None
@@ -1047,7 +1105,7 @@ class DiffusionExecutor:
             if ending is not None:
                 return ending
             if session.can_advance(pool.free_count):
-                self._advance(session, pool, pipeline_state)
+                self._advance_session(session, pool, pipeline_state)
                 continue
             # Only the client can make progress now; wait for it.
             ending = self._wait_for_commands(session, pool, pipeline_state, timeout=idle_timeout)
@@ -1074,37 +1132,25 @@ class DiffusionExecutor:
         if fatal:
             return
         session.discard_inputs()
-        self._broadcast_session_tag(("close",))
-        try:
-            with torch.inference_mode():
-                self.pipeline.close_session(pipeline_state)
-        except Exception as e:
-            logger.error(f"Worker {self.device_id}: session {session.session_id} close failed: {e}")
+        self._send_tag(_RankTag.CLOSE)
+        self._close_pipeline(pipeline_state, f"session {session.session_id}")
         self.response_queue.put(SessionClosed(session.session_id))
         logger.info(f"Worker {self.device_id}: session {session.session_id} closed")
 
-    def _advance(self, session: SessionState, pool: SlotPool, pipeline_state: Any) -> None:
+    def _advance_session(self, session: SessionState, pool: SlotPool, pipeline_state: Any) -> None:
+        """The session side of one step on rank 0: a slot and the next inputs,
+        the ADVANCE tag to the peers, ``_advance_pipeline``, then the result or
+        the terminal to the client."""
         slot_id, slot = pool.acquire()
         index, inputs = session.dispatch()
-        self._broadcast_session_tag(("advance", inputs))
-        outcome = None
-        error: Optional[str] = None
+        self._send_tag(_RankTag.ADVANCE, inputs)
         try:
-            with torch.inference_mode():
-                outcome = self.pipeline.advance(pipeline_state, inputs, slot)
+            outcome = self._advance_pipeline(
+                pipeline_state, inputs, slot, f"session {session.session_id} advance {index}"
+            )
         except Exception as e:
-            self._fail_rank(f"session {session.session_id} advance {index}", e)
-            logger.error(
-                f"Worker {self.device_id}: session {session.session_id} advance {index} failed: {e}"
-            )
-            logger.error(traceback.format_exc())
-            error = str(e)
-        all_ok = self._finalize_advance(outcome)
-        if not all_ok:
             pool.release(slot_id)
-            self.response_queue.put(
-                session.terminal_result(error=error or f"advance {index} failed on another rank")
-            )
+            self.response_queue.put(session.terminal_result(error=str(e)))
             return
         if outcome.written:
             try:
@@ -1265,44 +1311,25 @@ class DiffusionExecutor:
         """Ranks other than 0: run the same pipeline calls as rank 0, in the order
         rank 0 broadcasts them. They write no slot and answer no client."""
         self._merge_defaults(req)
-        self.pipeline.prepare_request(req)
-        tag = self._broadcast_session_tag(None)
-        if tag[0] != "open_go":
+        self.pipeline.prepare_request(req)  # as process_request does, on every rank
+        tag, _ = self._recv_tag()
+        if tag is not _RankTag.OPEN_GO:
             return
-        outcome = None
-        pipeline_state = None
         try:
-            with torch.inference_mode():
-                pipeline_state, outcome = self.pipeline.open_session(req, None)
-        except Exception as e:
-            self._fail_rank("session open", e)
-        if not self._finalize_advance(outcome):
-            # Rank 0 failed before its open call; nothing was opened here either
-            # way, release what this rank made.
-            if pipeline_state is not None:
-                try:
-                    self.pipeline.close_session(pipeline_state)
-                except Exception as e:
-                    logger.error(f"Worker {self.device_id}: session close failed: {e}")
-            return
+            pipeline_state, _ = self._open_pipeline(req, None)
+        except Exception:
+            return  # rank 0's open failed; this rank's own would have ended it
         while True:
-            tag = self._broadcast_session_tag(None)
-            if tag[0] == "close":
+            tag, inputs = self._recv_tag()
+            if tag is _RankTag.CLOSE:
                 break
-            if tag[0] != "advance":
-                raise RuntimeError(f"unexpected session tag {tag[0]!r}")
-            outcome = None
+            if tag is not _RankTag.ADVANCE:
+                raise RuntimeError(f"unexpected session tag {tag!r}")
             try:
-                with torch.inference_mode():
-                    outcome = self.pipeline.advance(pipeline_state, tag[1], None)
-            except Exception as e:
-                self._fail_rank("session advance", e)
-            self._finalize_advance(outcome)
-        try:
-            with torch.inference_mode():
-                self.pipeline.close_session(pipeline_state)
-        except Exception as e:
-            logger.error(f"Worker {self.device_id}: session close failed: {e}")
+                self._advance_pipeline(pipeline_state, inputs, None, "session advance")
+            except Exception:
+                continue  # rank 0 reports it; keep following its tags
+        self._close_pipeline(pipeline_state, "session")
 
 
 def run_diffusion_worker(
@@ -1416,11 +1443,13 @@ class SessionsUnsupported(ValueError):
     hooks. Refused by the worker before any pipeline work, as the caller's mistake."""
 
 
-class FatalRankError(RuntimeError):
+class FatalRankError(BaseException):
     """A rank hit an exception while its peers may be inside a collective. Raised
     only when the rank shares the client's process; a dedicated worker process
     exits instead. Either way the coordinator sees a dead worker and aborts the
-    group, so the client gets the failure raised, not a terminal result."""
+    group, so the client gets the failure raised, not a terminal result. Not an
+    ``Exception``: like ``SystemExit`` it ends the rank's thread, so no handler
+    on the way out mistakes it for a failure to report."""
 
 
 class PendingSubmit(NamedTuple):

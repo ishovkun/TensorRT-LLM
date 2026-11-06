@@ -837,18 +837,23 @@ class _EventLog(list):
 
 def _instrument(ex, events):
     """Record every status all-reduce and tag broadcast the rank performs."""
-    finalize, tag = ex._finalize_advance, ex._broadcast_session_tag
+    finalize, send, recv = ex._finalize_advance, ex._send_tag, ex._recv_tag
 
     def _finalize(outcome):
         events.append("status")
         return finalize(outcome)
 
-    def _tag(payload):
-        events.append("tag:" + (payload[0] if payload else "recv"))
-        return tag(payload)
+    def _send(tag, payload=None):
+        events.append("tag:" + tag.value)
+        return send(tag, payload)
+
+    def _recv():
+        events.append("tag:recv")
+        return recv()
 
     ex._finalize_advance = _finalize
-    ex._broadcast_session_tag = _tag
+    ex._send_tag = _send
+    ex._recv_tag = _recv
 
 
 def _session_request():
