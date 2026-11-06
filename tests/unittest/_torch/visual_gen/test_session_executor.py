@@ -42,7 +42,6 @@ from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionResponse,
     FatalRankError,
     SessionChannel,
-    SessionResources,
     _SessionExit,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import (
@@ -67,7 +66,6 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionResultMessage,
     SessionSubmit,
 )
-from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap
 from tensorrt_llm.visual_gen.session import VisualGenSession
 
 pytestmark = pytest.mark.cpu_only
@@ -767,7 +765,7 @@ def test_liveness_check_sees_a_dead_in_process_worker_thread():
 # Two ranks on the gloo backend with a short collective timeout. The pipeline's open
 # and advance each enter an all-reduce; a failing rank raises either before it (a
 # pipeline-call failure, phases ``open`` / ``advance``) or after it, from the
-# completion event in ``_finish_advance`` (an asynchronous device error, phases
+# completion event in ``_finalize_advance`` (an asynchronous device error, phases
 # ``open_event`` / ``advance_event``). Either way the other rank is inside a
 # collective the failing rank will never join. Required: the failing rank enters no
 # further collective (no status all-reduce after a pipeline failure, no CLOSE
@@ -839,17 +837,17 @@ class _EventLog(list):
 
 def _instrument(ex, events):
     """Record every status all-reduce and tag broadcast the rank performs."""
-    finish, tag = ex._finish_advance, ex._broadcast_session_tag
+    finalize, tag = ex._finalize_advance, ex._broadcast_session_tag
 
-    def _finish(outcome, failed):
+    def _finalize(outcome):
         events.append("status")
-        return finish(outcome, failed)
+        return finalize(outcome)
 
     def _tag(payload):
         events.append("tag:" + (payload[0] if payload else "recv"))
         return tag(payload)
 
-    ex._finish_advance = _finish
+    ex._finalize_advance = _finalize
     ex._broadcast_session_tag = _tag
 
 
@@ -1112,9 +1110,7 @@ def test_coordinator_contains_the_group_when_a_rank_dies(tmp_path):
     client.worker_processes = [rank0, rank1]
     channel = SessionChannel(1)
     client._sessions[1] = channel
-    channel.open_succeeded(
-        SessionResources(CountingPipeline().session_capabilities(None).public(), ClientSlotMap([]))
-    )
+    channel.open_succeeded(CountingPipeline().session_capabilities(None).public(), [])
     session = VisualGenSession(client, channel)
     results = session.results()
     waiter = {}
@@ -1268,7 +1264,7 @@ def test_idle_timeout_keeps_an_existing_terminal_and_adds_none(harness):
 
 
 def test_first_result_request_restarts_the_idle_clock(harness):
-    """A request that returns no slot still counts as activity: the first request
+    """A request that returns no slot still sends a keep-alive: the first request
     of a session, or one after the iterator was closed."""
     idle = 0.6
     with harness(
@@ -2243,13 +2239,7 @@ def _sending_client(exc):
 def _declared(client, session_id):
     channel = client.open_session(_request(session_id))
     channel.open_succeeded(
-        SessionResources(
-            {
-                "inputs": [{"name": "x", "policy": "queued"}],
-                "initial_result": False,
-            },
-            ClientSlotMap([]),
-        )
+        {"inputs": [{"name": "x", "policy": "queued"}], "initial_result": False}, []
     )
     return channel
 
@@ -2290,7 +2280,7 @@ def test_unserializable_open_fails_the_opener_and_releases_everything():
     assert isinstance(client.requests_ipc.sent[-1], SessionOpen)
 
 
-@pytest.mark.parametrize("command", ["submit", "close", "slot_return", "activity", "open"])
+@pytest.mark.parametrize("command", ["submit", "close", "slot_return", "keep_alive", "open"])
 def test_transport_failure_on_a_session_command_aborts_the_group(command):
     client = _sending_client(None)
     channel = _declared(client, 1)
@@ -2304,8 +2294,8 @@ def test_transport_failure_on_a_session_command_aborts_the_group(command):
         waiters.append(client.session_close(channel))
     elif command == "slot_return":
         client.session_return_slot(channel, 0)
-    elif command == "activity":
-        client.session_activity(channel)
+    elif command == "keep_alive":
+        client.session_keep_alive(channel)
     else:
         client.requests_ipc.exc = None
         with client._sessions_lock:
@@ -2375,7 +2365,7 @@ def test_transport_failure_releases_the_failing_open_and_the_queued_payload_once
 
 # --------------------------------------------------------------------------- the control path
 #
-# Slot returns, close and activity travel on their own socket with their own
+# Slot returns, close and keep-alive travel on their own socket with their own
 # send slot, so they are serviced however the request socket behaves, and the
 # worker watches both sockets while it waits.
 
@@ -2467,16 +2457,16 @@ def test_closed_session_retires_its_unsent_submits_in_the_dispatcher():
     assert new is client._sessions[2]
 
 
-def test_activity_notes_are_coalesced_and_close_is_sent_once():
+def test_keep_alives_are_coalesced_and_close_is_sent_once():
     client = _sending_client(None)
     channel = _declared(client, 1)
     client._process_requests()
     for _ in range(5):
-        client.session_activity(channel)
+        client.session_keep_alive(channel)
     assert len(client._controls) == 1  # one pending note per session
     client._process_controls()
-    assert sum(m.type is ControlType.ACTIVITY for m in client.controls_ipc.sent) == 1
-    client.session_activity(channel)  # after it was sent, a new one is accepted
+    assert sum(m.type is ControlType.KEEP_ALIVE for m in client.controls_ipc.sent) == 1
+    client.session_keep_alive(channel)  # after it was sent, a new one is accepted
     assert len(client._controls) == 1
     client._process_controls()
     client.session_close(channel)
@@ -2654,7 +2644,7 @@ def test_explicit_close_discards_a_queued_terminal(harness):
         assert channel.lockstep_due() == 0
 
 
-def test_channel_members_are_the_eight_and_the_session_the_three(harness):
+def test_channel_members_are_the_nine_and_the_session_the_three(harness):
     """The state model: one authoritative member per fact, nothing duplicated."""
     with harness(CountingPipeline(initial=False)) as h:
         with h.open() as s:
@@ -2664,6 +2654,7 @@ def test_channel_members_are_the_eight_and_the_session_the_three(harness):
                 "_opened",
                 "_closed",
                 "_lock",
+                "_slots",
                 "_submit",
                 "_reader",
                 "_results",
@@ -2672,7 +2663,7 @@ def test_channel_members_are_the_eight_and_the_session_the_three(harness):
             assert set(vars(s)) == {"_client", "_channel", "_held"}
 
 
-# --------------------------------------------------------------------------- transitions on the eight members
+# --------------------------------------------------------------------------- transitions on the nine members
 
 
 def _media(session_id, sequence, index):
@@ -2688,7 +2679,7 @@ def _open_channel(session_id=1, lockstep=True):
         "initial_result": False,
         "lockstep": lockstep,
     }
-    channel.open_succeeded(SessionResources(caps, ClientSlotMap([])))
+    channel.open_succeeded(caps, [])
     return channel
 
 

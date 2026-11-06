@@ -45,6 +45,7 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionQueueFull,
     SessionResultMessage,
 )
+from tensorrt_llm._torch.visual_gen.slot_pool import make_view
 from tensorrt_llm.llmapi.utils import set_api_status
 
 if TYPE_CHECKING:
@@ -318,7 +319,7 @@ class VisualGenSession:
         name = self._advance_input()
         self._channel.reserve_read()
         try:
-            self._note_activity_unless(self._release_held())
+            self._keep_alive()
             fut = self._submit_for_advance(name, value)
             index = None
             if fut is not None:
@@ -336,7 +337,7 @@ class VisualGenSession:
         name = self._advance_input()
         self._channel.reserve_read()
         try:
-            self._note_activity_unless(self._release_held())
+            self._keep_alive()
             fut = self._submit_for_advance(name, value)
             index = None
             if fut is not None:
@@ -394,7 +395,7 @@ class VisualGenSession:
         """
         self._channel.reserve_read()
         try:
-            self._note_activity_unless(self._release_held())
+            self._keep_alive()
             return self._take_result()
         finally:
             self._channel.release_read()
@@ -402,7 +403,7 @@ class VisualGenSession:
     async def _next_result_async(self) -> Optional[SessionResult]:
         self._channel.reserve_read()
         try:
-            self._note_activity_unless(self._release_held())
+            self._keep_alive()
             return await self._take_result_async()
         finally:
             self._channel.release_read()
@@ -473,14 +474,10 @@ class VisualGenSession:
 
     # ---- internals
 
-    def _note_activity_unless(self, slot_returned: bool) -> None:
-        """Count a result request as activity for the worker's idle clock.
-
-        When no slot goes back with the request, nothing else would tell the
-        worker the client is still there.
-        """
-        if not slot_returned:
-            self._client.session_activity(self._channel)
+    def _keep_alive(self) -> None:
+        """Reset the worker's idle clock with the held slot's return, or with a bare keep-alive."""
+        if not self._release_held():
+            self._client.session_keep_alive(self._channel)
 
     def _release_held(self) -> bool:
         """Expire the held result and give its slot back to the worker.
@@ -498,10 +495,10 @@ class VisualGenSession:
 
     def _build_result(self, message: SessionResultMessage) -> SessionResult:
         outputs: Dict[str, torch.Tensor] = {}
-        slots = self._channel.slots
         if message.slot_id is not None:
+            slot = self._channel.slots[message.slot_id]
             for name, (shape, dtype) in message.streams.items():
-                outputs[name] = slots.view(message.slot_id, name, tuple(shape), dtype)
+                outputs[name] = make_view(slot[name], tuple(shape), dtype)
         lease = None if message.slot_id is None else (self._channel, message.slot_id)
         return SessionResult(
             self.request_id,

@@ -94,7 +94,7 @@ class ControlType(Enum):
     """The three verbs of the control socket."""
 
     SLOT_RETURN = "slot_return"  # the client is done with slot_id; the worker may reuse it
-    ACTIVITY = "activity"  # a result was requested; its arrival restarts the idle clock
+    KEEP_ALIVE = "keep_alive"  # the client is still there; restarts the worker's idle clock
     CLOSE = "close"  # close the session; answered by SessionClosed
 
 

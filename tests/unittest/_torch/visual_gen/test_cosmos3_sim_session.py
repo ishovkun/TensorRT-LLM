@@ -150,7 +150,7 @@ def _session_video(model, prepared, seed, num_latent_frames):  # noqa: F811
         ro = pipe._rollout_begin(
             _request(), prepared, cond_ids=text_ids, cond_mask=text_mask, seed=seed
         )
-        slot_id, slot = pool.reserve()
+        slot_id, slot = pool.acquire()
         session, outcome = pipe._session_start(
             ro, prepared, slot, domain_id=2, use_guardrails=False, remaining=None
         )
@@ -164,7 +164,7 @@ def _session_video(model, prepared, seed, num_latent_frames):  # noqa: F811
             f0, f1 = session.peek_range()
             assert f0 == f
             chunk_rows = rows[0, (f0 - 1) * A : (f1 - 1) * A]
-            slot_id, slot = pool.reserve()
+            slot_id, slot = pool.acquire()
             outcome = pipe.advance(session, {"actions": chunk_rows}, slot)
             if outcome.event is not None:
                 outcome.event.synchronize()
@@ -174,7 +174,6 @@ def _session_video(model, prepared, seed, num_latent_frames):  # noqa: F811
             pool.release(slot_id)
             f = f1
         pipe.close_session(session)
-    pool.close()
     assert not pipe._kv_cache.is_open
     return torch.cat(frames, dim=1)
 

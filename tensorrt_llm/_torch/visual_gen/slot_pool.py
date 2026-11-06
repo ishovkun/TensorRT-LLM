@@ -14,8 +14,8 @@
 # limitations under the License.
 """Delivery slots: the storage a session result is written into and read from.
 
-The executor reserves one slot before an advance, the pipeline writes its streams
-into it, and the slot stays reserved until the client has moved past the result it
+The executor acquires one slot before an advance, the pipeline writes its streams
+into it, and the slot stays held until the client has moved past the result it
 carries. K slots form the pool. Host-placed streams live in shared host memory that
 the worker page-locks, so the pipeline's device-to-host copy is asynchronous and the
 client maps the same bytes without a copy. Device-placed streams live in device
@@ -25,7 +25,9 @@ memory shared through CUDA IPC.
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+import weakref
+from collections import deque
+from typing import Deque, Dict, List, Tuple
 
 import torch
 
@@ -49,8 +51,11 @@ class StreamBuffer:
             self.storage, local=local
         ).dump_to_dict()
         # Host pages are pinned (cudaHostRegister) so device-to-host copies into
-        # them run as asynchronous DMA; undone in close(). Device memory needs none.
-        self._page_locked = device.type != "cuda" and _page_lock(self.storage)
+        # them run as asynchronous DMA. The pin is undone when this object dies,
+        # before the storage it holds can be freed, and never at interpreter
+        # exit, where the process reclaims it anyway. Device memory needs none.
+        if device.type != "cuda" and _page_lock(self.storage):
+            weakref.finalize(self, _page_unlock, self.storage).atexit = False
 
     @property
     def device(self) -> torch.device:
@@ -63,50 +68,44 @@ class StreamBuffer:
     def view(self, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
         """A tensor of ``shape`` and ``dtype`` over the start of the storage. Raises
         ``ValueError`` when it does not fit."""
-        nbytes = math.prod(shape) * dtype.itemsize
-        if nbytes > self.storage.numel():
-            raise ValueError(f"{nbytes} bytes requested, the buffer holds {self.storage.numel()}")
-        return self.storage[:nbytes].view(dtype).view(tuple(shape))
+        return make_view(self.storage, shape, dtype)
 
     def is_view_of(self, tensor: torch.Tensor) -> bool:
         """Whether ``tensor`` views this storage: what a pipeline may report as written."""
         return tensor.untyped_storage().data_ptr() == self.storage.untyped_storage().data_ptr()
 
-    def close(self) -> None:
-        """Undo the page lock before the storage is freed. Repeatable."""
-        if self._page_locked:
-            self._page_locked = False
-            _page_unlock(self.storage)
+
+def make_view(storage: torch.Tensor, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A tensor of ``shape`` and ``dtype`` over the first bytes of a flat uint8
+    ``storage``; the same bytes, no copy. Raises ``ValueError`` when it does not fit."""
+    nbytes = math.prod(int(d) for d in shape) * dtype.itemsize
+    if nbytes > storage.numel():
+        raise ValueError(f"{nbytes} bytes requested, the buffer holds {storage.numel()}")
+    return storage[:nbytes].view(dtype).view(tuple(shape))
 
 
-class DeliverySlot:
-    """One slot: a ``StreamBuffer`` per declared stream, by name. ``slot["video"]``
-    is the buffer; the pipeline writes into a view of it and reports that view in
-    its outcome. The slot keeps no record of writes."""
+# One slot: a StreamBuffer per declared stream, by name. slot["video"] is the
+# buffer; the pipeline writes into a view of it and reports that view in its
+# outcome. A slot keeps no record of writes.
+DeliverySlot = Dict[str, StreamBuffer]
 
-    def __init__(self, buffers: Dict[str, StreamBuffer]) -> None:
-        self._buffers = buffers
 
-    def __getitem__(self, name: str) -> StreamBuffer:
-        return self._buffers[name]
-
-    def __contains__(self, name: str) -> bool:
-        return name in self._buffers
-
-    @property
-    def stream_names(self) -> Tuple[str, ...]:
-        return tuple(self._buffers)
+def _stream_buffer(spec: SessionStreamSpec, device: torch.device, *, local: bool) -> StreamBuffer:
+    """The buffer one slot holds for one declared stream: the declared byte size,
+    on the worker's device or on the host as the stream's placement says."""
+    where = device if spec.placement == "device" else torch.device("cpu")
+    return StreamBuffer(spec.max_bytes, where, local=local)
 
 
 class SlotPool:
     """K delivery slots for one session, allocated on the worker.
 
     ``export_handles()`` hands the client one shared-tensor handle per slot per
-    stream; the client maps them once for the session. ``reserve()`` returns a free
-    slot with its index, the name the client knows it by, or ``None``;
-    ``release(slot_id)`` returns it when the client has moved past its result.
-    ``close()`` drops the storage. A slot does not know its index: the pool is the
-    only owner of positions.
+    stream; the client maps them once for the session. A slot is handed out by
+    ``acquire()`` with its index, the name the client knows it by, after
+    ``free_count`` said one is free, and comes back through ``release(index)``
+    when the client has moved past its result. The pool is the only owner of
+    positions; the storage goes when the pool does.
     """
 
     def __init__(
@@ -119,34 +118,15 @@ class SlotPool:
     ) -> None:
         if num_slots < 1:
             raise ValueError("a session needs at least one delivery slot")
-        self.capabilities = capabilities
-        self.num_slots = num_slots
-        self.device = device
-        self.local = local
-        self._slots: List[DeliverySlot] = []
-        self._free: List[int] = []
-        made: List[StreamBuffer] = []
-        try:
-            for slot_id in range(num_slots):
-                buffers: Dict[str, StreamBuffer] = {}
-                for spec in capabilities.streams:
-                    buffers[spec.name] = self._allocate(spec)
-                    made.append(buffers[spec.name])
-                self._slots.append(DeliverySlot(buffers))
-                self._free.append(slot_id)
-        except BaseException:
-            # A later allocation failed: every buffer made so far, a half-built
-            # slot's included, is closed before the error reaches the caller.
-            for buffer in made:
-                buffer.close()
-            self._slots.clear()
-            self._free.clear()
-            raise
-        self._free.reverse()  # reserve() pops from the end: slot 0 first
+        self._slots: List[DeliverySlot] = [
+            {spec.name: _stream_buffer(spec, device, local=local) for spec in capabilities.streams}
+            for _ in range(num_slots)
+        ]
+        # Indices of the slots nobody holds, oldest return first.
+        self._free: Deque[int] = deque(range(num_slots))
 
-    def _allocate(self, spec: SessionStreamSpec) -> StreamBuffer:
-        device = self.device if spec.placement == "device" else torch.device("cpu")
-        return StreamBuffer(spec.max_bytes, device, local=self.local)
+    def __len__(self) -> int:
+        return len(self._slots)
 
     @property
     def free_count(self) -> int:
@@ -154,39 +134,28 @@ class SlotPool:
 
     @property
     def nbytes(self) -> int:
-        return self.num_slots * self.capabilities.max_result_bytes
+        """Bytes held by every buffer of every slot."""
+        return sum(buffer.nbytes for slot in self._slots for buffer in slot.values())
 
-    def slot(self, slot_id: int) -> DeliverySlot:
-        return self._slots[slot_id]
-
-    def reserve(self) -> Optional[Tuple[int, DeliverySlot]]:
-        """A free slot with its index; ``None`` when every slot is out."""
+    def acquire(self) -> Tuple[int, DeliverySlot]:
+        """A free slot with its index. Ask ``free_count`` first: an empty pool is
+        a programming error here, not a condition to wait on."""
         if not self._free:
-            return None
-        slot_id = self._free.pop()
+            raise RuntimeError("every delivery slot is held")
+        slot_id = self._free.popleft()
         return slot_id, self._slots[slot_id]
 
     def release(self, slot_id: int) -> None:
+        if not 0 <= slot_id < len(self._slots):
+            raise ValueError(f"slot {slot_id} does not exist")
         if slot_id in self._free:
             raise ValueError(f"slot {slot_id} returned twice")
-        if not 0 <= slot_id < self.num_slots:
-            raise ValueError(f"slot {slot_id} does not exist")
         self._free.append(slot_id)
-
-    def release_all(self) -> None:
-        self._free = list(range(self.num_slots))[::-1]
 
     def export_handles(self) -> List[SlotHandles]:
         """One handle dict per slot per stream, for ``SessionOpened``. Each handle is
         consumed exactly once by the client's mapping."""
-        return [{name: slot[name].handle for name in slot.stream_names} for slot in self._slots]
-
-    def close(self) -> None:
-        for slot in self._slots:
-            for name in slot.stream_names:
-                slot[name].close()
-        self._slots.clear()
-        self._free.clear()
+        return [{name: buffer.handle for name, buffer in slot.items()} for slot in self._slots]
 
 
 def _page_lock(storage: torch.Tensor) -> bool:
@@ -222,36 +191,23 @@ def _page_unlock(storage: torch.Tensor) -> None:
         logger.warning(f"slot pool: cudaHostUnregister failed with {int(rc)}")
 
 
-class ClientSlotMap:
-    """The client's mapping of a session's slot pool: one tensor per slot per stream,
-    mapped once from the handles in ``SessionOpened`` and kept for the session."""
-
-    def __init__(self, handles: List[SlotHandles]) -> None:
-        self._views: List[Dict[str, torch.Tensor]] = []
-        for per_stream in handles:
-            mapped = {}
-            for name, handle in per_stream.items():
-                mapped[name] = SharedTensorContainer.from_dict(handle).get_local_view()
-            self._views.append(mapped)
-
-    @property
-    def num_slots(self) -> int:
-        return len(self._views)
-
-    def view(
-        self, slot_id: int, name: str, shape: Tuple[int, ...], dtype: torch.dtype
-    ) -> torch.Tensor:
-        nbytes = math.prod(int(d) for d in shape) * dtype.itemsize
-        storage = self._views[slot_id][name]
-        return storage[:nbytes].view(dtype).view(tuple(shape))
-
-    def close(self) -> None:
-        self._views.clear()
+def map_slots(handles: List[SlotHandles]) -> List[Dict[str, torch.Tensor]]:
+    """The client's mapping of a session's slot pool from the handles in
+    ``SessionOpened``: ``mapped[slot_id][stream]`` is a flat tensor over the
+    worker's buffer. Each handle maps exactly once; call this once per session."""
+    return [
+        {
+            name: SharedTensorContainer.from_dict(handle).get_local_view()
+            for name, handle in slot.items()
+        }
+        for slot in handles
+    ]
 
 
 __all__ = [
-    "ClientSlotMap",
     "DeliverySlot",
     "SlotPool",
     "StreamBuffer",
+    "make_view",
+    "map_slots",
 ]

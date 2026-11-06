@@ -36,6 +36,7 @@ import zmq
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
+from tensorrt_llm._torch.visual_gen.pipeline import AdvanceOutcome
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.session_protocol import (
     AdmissionFailure,
@@ -55,7 +56,7 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionSubmit,
 )
 from tensorrt_llm._torch.visual_gen.session_state import SessionState
-from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, DeliverySlot, SlotPool
+from tensorrt_llm._torch.visual_gen.slot_pool import DeliverySlot, SlotPool, map_slots
 from tensorrt_llm.bindings.BuildInfo import check_cuda_architecture_supported
 from tensorrt_llm.bindings.internal import start_coordinator_watchdog
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -514,7 +515,7 @@ class DiffusionExecutor:
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
-        # Session control (slot returns, close, activity) arrives on its own
+        # Session control (slot returns, close, keep-alive) arrives on its own
         # socket, so it is serviced whatever the state of the request socket.
         self.controls_ipc = None
         self.rank = dist.get_rank()
@@ -869,13 +870,15 @@ class DiffusionExecutor:
         dist.broadcast_object_list(obj, src=0)
         return obj[0]
 
-    def _finish_advance(self, outcome, failed: bool) -> bool:
+    def _finalize_advance(self, outcome: Optional[AdvanceOutcome]) -> bool:
         """Wait for this rank's writes, then agree with every rank whether the
-        advance succeeded. Returns True when all ranks succeeded. With several
-        ranks a failed rank never gets here (see ``_fail_rank``), so the
-        all-reduce is the completion barrier every rank passes together."""
+        advance succeeded; ``None`` is this rank's pipeline call having raised.
+        Returns whether every rank succeeded. With several ranks a failed rank
+        never gets here (see ``_fail_rank``), so the all-reduce is the
+        completion barrier every rank passes together."""
+        failed = outcome is None
         try:
-            if not failed and outcome is not None and outcome.event is not None:
+            if outcome is not None and outcome.event is not None:
                 outcome.event.synchronize()
             if self.world_size == 1:
                 return not failed
@@ -885,8 +888,7 @@ class DiffusionExecutor:
         except Exception as e:
             # An asynchronous device error surfacing at the event, or the barrier
             # itself failing: peers may be inside it, so this is rank-local.
-            if self.world_size > 1:
-                self._fail_rank("completion barrier", e)
+            self._fail_rank("completion barrier", e)
             raise
 
     def _fail_rank(self, what: str, exc: BaseException) -> None:
@@ -896,7 +898,11 @@ class DiffusionExecutor:
         worker process exits with status 1, which the coordinator (or the
         external launcher) turns into an abort of the whole group; a worker
         thread inside the client's process raises ``FatalRankError`` instead, so
-        the thread ends and the application survives."""
+        the thread ends and the application survives. With a single rank this
+        returns and does nothing: there is no peer to fall out of step with, and
+        the caller reports the error at the boundary."""
+        if self.world_size == 1:
+            return
         logger.error(f"Worker {self.device_id}: {what}: {exc}; aborting this rank")
         logger.error(traceback.format_exc())
         if self.in_client_process:
@@ -930,12 +936,11 @@ class DiffusionExecutor:
         except Exception as e:
             # Not from a pipeline call (a broadcast, a slot, the state); with
             # peers it still cannot be followed by a CLOSE broadcast.
-            if self.world_size > 1:
-                fatal = True
-                self._fail_rank(f"session {session.session_id}", e)
+            fatal = self.world_size > 1
+            self._fail_rank(f"session {session.session_id}", e)
             raise
         finally:
-            self._end_session(session, pool, pipeline_state, fatal=fatal)
+            self._end_session(session, pipeline_state, fatal=fatal)
         return ending
 
     def _open_session(self, req: DiffusionRequest) -> Optional[Tuple[SessionState, SlotPool, Any]]:
@@ -962,7 +967,7 @@ class DiffusionExecutor:
             pool = SlotPool(caps, self._session_slot_count(), device, local=self.in_client_process)
             logger.info(
                 f"Worker {self.device_id}: session {session_id} slot pool: "
-                f"{pool.num_slots} slots x {caps.max_result_bytes} bytes = {pool.nbytes} bytes"
+                f"{len(pool)} slots x {caps.max_result_bytes} bytes = {pool.nbytes} bytes"
             )
         except Exception as e:
             # Refused before any rank did pipeline work: the peers are told to
@@ -970,8 +975,6 @@ class DiffusionExecutor:
             logger.error(f"Worker {self.device_id}: session {session_id} refused: {e}")
             logger.error(traceback.format_exc())
             self._broadcast_session_tag(("open_abort",))
-            if pool is not None:
-                pool.close()
             # Asking an unsupported pipeline for a session is the caller's mistake;
             # what the pipeline itself raised is classified by the pipeline.
             error_type = (
@@ -983,7 +986,7 @@ class DiffusionExecutor:
             return None
 
         self._broadcast_session_tag(("open_go",))
-        initial_index, initial_slot = pool.reserve() if caps.initial_result else (None, None)
+        initial_index, initial_slot = pool.acquire() if caps.initial_result else (None, None)
         outcome = None
         open_error: Optional[Exception] = None
         try:
@@ -992,14 +995,11 @@ class DiffusionExecutor:
         except Exception as e:
             # After the go broadcast the peers are inside their own open call:
             # with peers this rank cannot be trusted to reach another collective.
-            if self.world_size > 1:
-                pool.close()
-                self._fail_rank(f"session {session_id} open", e)
+            self._fail_rank(f"session {session_id} open", e)
             logger.error(f"Worker {self.device_id}: session {session_id} open failed: {e}")
             logger.error(traceback.format_exc())
             open_error = e
-        if not self._finish_advance(outcome, failed=open_error is not None):
-            pool.close()
+        if not self._finalize_advance(outcome):
             message = str(open_error) if open_error is not None else "open failed on another rank"
             self.response_queue.put(
                 SessionOpened(
@@ -1066,15 +1066,12 @@ class DiffusionExecutor:
             if ending is not None:
                 return ending
 
-    def _end_session(
-        self, session: SessionState, pool: SlotPool, pipeline_state: Any, *, fatal: bool
-    ) -> None:
+    def _end_session(self, session: SessionState, pipeline_state: Any, *, fatal: bool) -> None:
         """Tear the session down. ``fatal``: this rank is dying with peers possibly
         stuck in a collective, so nothing shared is touched: no CLOSE broadcast,
         no pipeline close, no ``SessionClosed``; the coordinator reports the dead
         worker and tears the group down."""
         if fatal:
-            pool.close()
             return
         session.discard_inputs()
         self._broadcast_session_tag(("close",))
@@ -1083,12 +1080,11 @@ class DiffusionExecutor:
                 self.pipeline.close_session(pipeline_state)
         except Exception as e:
             logger.error(f"Worker {self.device_id}: session {session.session_id} close failed: {e}")
-        pool.close()
         self.response_queue.put(SessionClosed(session.session_id))
         logger.info(f"Worker {self.device_id}: session {session.session_id} closed")
 
     def _advance(self, session: SessionState, pool: SlotPool, pipeline_state: Any) -> None:
-        slot_id, slot = pool.reserve()
+        slot_id, slot = pool.acquire()
         index, inputs = session.dispatch()
         self._broadcast_session_tag(("advance", inputs))
         outcome = None
@@ -1097,14 +1093,13 @@ class DiffusionExecutor:
             with torch.inference_mode():
                 outcome = self.pipeline.advance(pipeline_state, inputs, slot)
         except Exception as e:
-            if self.world_size > 1:
-                self._fail_rank(f"session {session.session_id} advance {index}", e)
+            self._fail_rank(f"session {session.session_id} advance {index}", e)
             logger.error(
                 f"Worker {self.device_id}: session {session.session_id} advance {index} failed: {e}"
             )
             logger.error(traceback.format_exc())
             error = str(e)
-        all_ok = self._finish_advance(outcome, failed=error is not None)
+        all_ok = self._finalize_advance(outcome)
         if not all_ok:
             pool.release(slot_id)
             self.response_queue.put(
@@ -1223,7 +1218,7 @@ class DiffusionExecutor:
             self.response_queue.put(reply)
             return None
         if isinstance(message, SessionControl):
-            if message.type is ControlType.ACTIVITY:
+            if message.type is ControlType.KEEP_ALIVE:
                 return None  # its arrival already restarted the idle wait
             if message.session_id != session.session_id:
                 self._answer_stray_command(message)
@@ -1281,7 +1276,7 @@ class DiffusionExecutor:
                 pipeline_state, outcome = self.pipeline.open_session(req, None)
         except Exception as e:
             self._fail_rank("session open", e)
-        if not self._finish_advance(outcome, failed=False):
+        if not self._finalize_advance(outcome):
             # Rank 0 failed before its open call; nothing was opened here either
             # way, release what this rank made.
             if pipeline_state is not None:
@@ -1302,7 +1297,7 @@ class DiffusionExecutor:
                     outcome = self.pipeline.advance(pipeline_state, tag[1], None)
             except Exception as e:
                 self._fail_rank("session advance", e)
-            self._finish_advance(outcome, failed=False)
+            self._finalize_advance(outcome)
         try:
             with torch.inference_mode():
                 self.pipeline.close_session(pipeline_state)
@@ -1428,15 +1423,6 @@ class FatalRankError(RuntimeError):
     group, so the client gets the failure raised, not a terminal result."""
 
 
-class SessionResources(NamedTuple):
-    """What the worker handed over at open: the declared capabilities and the
-    client's mapping of the delivery slots. Immutable; the mapping is closed in
-    place when the session ends."""
-
-    capabilities: Dict[str, Any]
-    slots: ClientSlotMap
-
-
 class PendingSubmit(NamedTuple):
     """The one submit operation in progress: its input and the admission future
     the caller waits on (result: advance index; exception: rejection;
@@ -1449,17 +1435,20 @@ class PendingSubmit(NamedTuple):
 class SessionChannel:
     """Coordinator side of one session: the hand-off point between the main
     thread (the public ``VisualGenSession`` calls) and the client's background
-    thread (which routes the worker's replies here). Eight members, one per
+    thread (which routes the worker's replies here). Nine members, one per
     fact, each described at its field below.
     """
 
     def __init__(self, session_id: int):
         self.session_id = session_id
-        # The open reply: resources on success, the open error otherwise. Set once,
-        # never replaced, so it is read without the lock; its own state is atomic.
-        self._opened: Future[SessionResources] = Future()
+        # The open reply: the capabilities on success, the open error otherwise. Set
+        # once, never replaced, so it is read without the lock; its own state is atomic.
+        self._opened: Future[Dict[str, Any]] = Future()
         # Guards every member below: which operations exist and that they agree.
         self._lock = threading.Lock()
+        # The client's mapping of the delivery slots, slots[slot_id][stream], from a
+        # successful open until the session ends; dropping it unmaps the storage.
+        self._slots: Optional[List[Dict[str, torch.Tensor]]] = None
         # None until a close begins; then the close operation. Completes on the
         # worker's confirmation, or with the sticky failure if the worker group died.
         self._closed: Optional[Future] = None
@@ -1480,25 +1469,23 @@ class SessionChannel:
 
     @property
     def capabilities(self) -> Optional[Dict[str, Any]]:
-        resources = self._resources()
-        return None if resources is None else resources.capabilities
-
-    def _resources(self) -> Optional[SessionResources]:
         fut = self._opened
         if fut.done() and not fut.cancelled() and fut.exception() is None:
             return fut.result()
         return None
 
     @property
-    def slots(self) -> ClientSlotMap:
-        """The client's mapping of the delivery slots. Only after a successful open."""
-        resources = self._resources()
-        if resources is None:
+    def slots(self) -> List[Dict[str, torch.Tensor]]:
+        """The client's mapping of the delivery slots, ``slots[slot_id][stream]``.
+        Only while the session is open. Read from a result builder, which ``take``
+        runs inside its critical section, so no lock is taken here."""
+        slots = self._slots
+        if slots is None:
             raise RuntimeError(f"session {self.session_id} is not open")
-        return resources.slots
+        return slots
 
-    def wait_open(self, timeout: Optional[float] = None) -> SessionResources:
-        """Block until the worker answered the open; the resources, or the open
+    def wait_open(self, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Block until the worker answered the open; the capabilities, or the open
         error raised."""
         return self._opened.result(timeout)
 
@@ -1559,12 +1546,14 @@ class SessionChannel:
 
     # ---- opening (background thread)
 
-    def open_succeeded(self, resources: SessionResources) -> None:
+    def open_succeeded(
+        self, capabilities: Dict[str, Any], slots: List[Dict[str, torch.Tensor]]
+    ) -> None:
         with self._lock:
-            caps = resources.capabilities
-            if caps.get("lockstep") and caps.get("initial_result"):
+            self._slots = slots
+            if capabilities.get("lockstep") and capabilities.get("initial_result"):
                 self._lockstep_due = 1
-        self._complete(self._opened, resources)
+        self._complete(self._opened, capabilities)
 
     def open_failed(self, error: Exception) -> None:
         self._complete(self._opened, error=error)
@@ -1792,9 +1781,7 @@ class SessionChannel:
             self._lockstep_due = 0
             pending, self._submit = self._submit, None
             reader = self._reader
-            resources = self._resources()
-            if resources is not None:
-                resources.slots.close()
+            self._slots = None
             close = self._closed
         if pending is not None:
             self._complete(pending.admission, error=SessionEnded("session closed"))
@@ -1818,9 +1805,7 @@ class SessionChannel:
             self._lockstep_due = 0
             pending, self._submit = self._submit, None
             reader = self._reader
-            resources = self._resources()
-            if resources is not None:
-                resources.slots.close()
+            self._slots = None
         # The opening completes after the close outcome: a close callback that
         # fires on it finds the failure already recorded and cannot soften it.
         self._complete(self._opened, error=error)
@@ -1930,11 +1915,14 @@ class DiffusionRemoteClient:
         self.responses_ipc = None
         self.controls_ipc = None
         self.pending_requests = queue.Queue()
-        # Session control commands (slot returns, close, activity): their own
+        # Session control commands (slot returns, close, keep-alive): their own
         # outbox and socket, so a request parked on a non-writable request socket
-        # never holds them up. Keyed, so repeats coalesce; an entry stays until
-        # its send succeeded, so it also stands for a command being retried.
-        self._controls: "OrderedDict[Tuple[Any, ...], Any]" = OrderedDict()
+        # never holds them up. Keyed by (session_id, type, slot_id), so repeats
+        # coalesce; an entry stays until its send succeeded, so it also stands
+        # for a command being retried.
+        self._controls: "OrderedDict[Tuple[int, ControlType, Optional[int]], SessionControl]" = (
+            OrderedDict()
+        )
         self._controls_lock = threading.Lock()
         self.completed_responses: Dict[int, DiffusionResponse] = {}
         self._sessions: Dict[int, SessionChannel] = {}
@@ -2283,7 +2271,8 @@ class DiffusionRemoteClient:
             for key in [k for k in self._controls if k[0] == session_id]:
                 del self._controls[key]
 
-    def _enqueue_control(self, key: Tuple[Any, ...], command: Any) -> None:
+    def _enqueue_control(self, command: SessionControl) -> None:
+        key = (command.session_id, command.type, command.slot_id)
         with self._controls_lock:
             if key not in self._controls:
                 self._controls[key] = command
@@ -2406,7 +2395,7 @@ class DiffusionRemoteClient:
 
     def open_session(self, request: DiffusionRequest) -> SessionChannel:
         """Send ``SessionOpen``; the caller waits through ``channel.wait_open`` (or
-        its async form) for the session's resources once the worker has opened it.
+        its async form) until the worker has opened it.
 
         One session per model instance: while another session is opening or open
         (its entry stays in ``_sessions`` until its close is confirmed or its open
@@ -2492,18 +2481,14 @@ class DiffusionRemoteClient:
     def session_return_slot(self, channel: SessionChannel, slot_id: int) -> None:
         if self._worker_failure is None:
             self._enqueue_control(
-                (channel.session_id, ControlType.SLOT_RETURN, slot_id),
-                SessionControl(channel.session_id, ControlType.SLOT_RETURN, slot_id),
+                SessionControl(channel.session_id, ControlType.SLOT_RETURN, slot_id)
             )
 
-    def session_activity(self, channel: SessionChannel) -> None:
-        """Tell the worker the client asked for a result (restarts its idle clock);
+    def session_keep_alive(self, channel: SessionChannel) -> None:
+        """Tell the worker the client is still there (restarts its idle clock);
         repeats coalesce in the outbox while one is pending."""
         if self._worker_failure is None and channel.lease_lost is None:
-            self._enqueue_control(
-                (channel.session_id, ControlType.ACTIVITY),
-                SessionControl(channel.session_id, ControlType.ACTIVITY),
-            )
+            self._enqueue_control(SessionControl(channel.session_id, ControlType.KEEP_ALIVE))
 
     def session_close(self, channel: SessionChannel) -> Future:
         """Close the session; the future completes on the worker's confirmation.
@@ -2519,10 +2504,7 @@ class DiffusionRemoteClient:
                     channel.open_failed(error)
                     return
                 if self._worker_failure is None:
-                    self._enqueue_control(
-                        (channel.session_id, ControlType.CLOSE),
-                        SessionControl(channel.session_id, ControlType.CLOSE),
-                    )
+                    self._enqueue_control(SessionControl(channel.session_id, ControlType.CLOSE))
 
             channel.on_open(after_open)
         return close
@@ -2549,9 +2531,7 @@ class DiffusionRemoteClient:
                 )
                 channel.open_failed(exc)
                 return
-            channel.open_succeeded(
-                SessionResources(reply.capabilities or {}, ClientSlotMap(reply.slots or []))
-            )
+            channel.open_succeeded(reply.capabilities or {}, map_slots(reply.slots or []))
         elif isinstance(reply, SessionAdmitted):
             error: Optional[Exception] = None
             if reply.error is not None:

@@ -15,6 +15,8 @@
 """Session bookkeeping on the worker: admission, the advance condition, result
 assembly and the slot pool. No pipeline, no processes."""
 
+import gc
+
 import pytest
 import torch
 
@@ -30,7 +32,7 @@ from tensorrt_llm._torch.visual_gen.session_protocol import (
     SessionQueueFull,
 )
 from tensorrt_llm._torch.visual_gen.session_state import SessionState
-from tensorrt_llm._torch.visual_gen.slot_pool import ClientSlotMap, SlotPool
+from tensorrt_llm._torch.visual_gen.slot_pool import SlotPool, make_view, map_slots
 
 pytestmark = pytest.mark.cpu_only
 
@@ -200,14 +202,15 @@ def test_media_result_advances_the_stream_positions():
 # --------------------------------------------------------------------------- slot pool
 
 
-def test_slot_pool_reserve_release_and_views():
+def test_slot_pool_acquire_release_and_views():
     caps = steered_caps()
     pool = SlotPool(caps, num_slots=2, device=torch.device("cpu"))
     assert pool.free_count == 2
-    a_id, a = pool.reserve()
-    b_id, b = pool.reserve()
+    a_id, a = pool.acquire()
+    b_id, b = pool.acquire()
     assert (a_id, b_id) == (0, 1)
-    assert pool.reserve() is None
+    with pytest.raises(RuntimeError):
+        pool.acquire()  # ask free_count first
     view = a["video"].view((1, 8, 4, 6, 3), torch.uint8)
     view.fill_(7)
     assert a["video"].is_view_of(view) and not b["video"].is_view_of(view)
@@ -218,25 +221,22 @@ def test_slot_pool_reserve_release_and_views():
     pool.release(0)
     with pytest.raises(ValueError):
         pool.release(0)
-    assert pool.reserve()[0] == 0
-    pool.close()
+    assert pool.acquire()[0] == 0
 
 
 def test_client_map_sees_the_worker_write_without_a_copy():
     caps = lockstep_caps()
     pool = SlotPool(caps, num_slots=1, device=torch.device("cpu"))
     handles = pool.export_handles()
-    client = ClientSlotMap(handles)
-    _, slot = pool.reserve()
+    client = map_slots(handles)
+    _, slot = pool.acquire()
     worker_view = slot["video"].view((1, 2, 4, 6, 3), torch.uint8)
     worker_view.fill_(0)
     worker_view[0, 1] = 9
-    client_view = client.view(0, "video", tuple(worker_view.shape), worker_view.dtype)
+    client_view = make_view(client[0]["video"], tuple(worker_view.shape), worker_view.dtype)
     assert client_view.shape == (1, 2, 4, 6, 3)
     assert int(client_view[0, 1, 0, 0, 0]) == 9 and int(client_view[0, 0, 0, 0, 0]) == 0
     assert client_view.data_ptr() == worker_view.data_ptr()  # same process, same bytes
-    client.close()
-    pool.close()
 
 
 def test_outcome_defaults():
@@ -347,7 +347,7 @@ def _two_stream_caps(n=4):
 
 def test_buffer_views_fit_or_raise():
     pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"), local=True)
-    _, slot = pool.reserve()
+    _, slot = pool.acquire()
     video = slot["video"]  # 4 float32 by _two_stream_caps: 16 bytes
     assert video.nbytes == 16 and video.storage.is_contiguous()
     with pytest.raises(ValueError, match="bytes"):
@@ -356,7 +356,6 @@ def test_buffer_views_fit_or_raise():
     assert view.shape == (3,) and video.is_view_of(view)
     assert video.view((2, 2), torch.float32).shape == (2, 2)  # any shape that fits
     assert not video.is_view_of(torch.zeros(3))  # someone else's memory
-    pool.close()
 
 
 def test_partial_pool_construction_undoes_every_registration(monkeypatch):
@@ -373,33 +372,35 @@ def test_partial_pool_construction_undoes_every_registration(monkeypatch):
 
     monkeypatch.setattr(pool_module, "_page_lock", fake_lock)
     monkeypatch.setattr(pool_module, "_page_unlock", fake_unlock)
-    original_allocate = pool_module.SlotPool._allocate
+    original_allocate = pool_module._stream_buffer
     calls = {"n": 0}
 
-    def failing_allocate(self, spec):
+    def failing_allocate(spec, device, *, local):
         calls["n"] += 1
         if calls["n"] == 3:  # second slot, first stream: mid-way through the pool
             raise MemoryError("probe: out of memory")
-        return original_allocate(self, spec)
+        return original_allocate(spec, device, local=local)
 
-    monkeypatch.setattr(pool_module.SlotPool, "_allocate", failing_allocate)
+    monkeypatch.setattr(pool_module, "_stream_buffer", failing_allocate)
     with pytest.raises(MemoryError, match="probe"):
         SlotPool(_two_stream_caps(), num_slots=2, device=torch.device("cpu"))
+    gc.collect()  # the traceback kept the half-built pool alive
     assert len(registered) == 2 and sorted(unregistered) == sorted(registered)  # each undone once
     # and a failure inside one slot's streams behaves the same
     registered.clear()
     unregistered.clear()
     calls["n"] = 0
 
-    def failing_second_stream(self, spec):
+    def failing_second_stream(spec, device, *, local):
         calls["n"] += 1
         if calls["n"] == 2:
             raise MemoryError("probe: out of memory")
-        return original_allocate(self, spec)
+        return original_allocate(spec, device, local=local)
 
-    monkeypatch.setattr(pool_module.SlotPool, "_allocate", failing_second_stream)
+    monkeypatch.setattr(pool_module, "_stream_buffer", failing_second_stream)
     with pytest.raises(MemoryError, match="probe"):
         SlotPool(_two_stream_caps(), num_slots=2, device=torch.device("cpu"))
+    gc.collect()
     assert registered and sorted(unregistered) == sorted(registered)
 
 
@@ -416,11 +417,8 @@ def test_registered_pointer_is_the_exported_storage_pointer(monkeypatch):
     )
     monkeypatch.setattr(pool_module, "_page_unlock", lambda storage: None)
     pool = SlotPool(_two_stream_caps(), num_slots=1, device=torch.device("cpu"))
-    exported = [buf.storage.data_ptr() for slot in pool._slots for buf in slot._buffers.values()]
+    exported = [buf.storage.data_ptr() for slot in pool._slots for buf in slot.values()]
     assert sorted(registered) == sorted(exported)
-    client = ClientSlotMap(pool.export_handles())
-    view = client.view(0, "video", (4,), torch.float32)
+    client = map_slots(pool.export_handles())
+    view = make_view(client[0]["video"], (4,), torch.float32)
     assert view.data_ptr() == pool._slots[0]["video"].storage.data_ptr()
-    client.close()
-    pool.close()
-    pool.close()  # repeated close is harmless
